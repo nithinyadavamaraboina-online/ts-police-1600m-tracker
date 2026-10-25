@@ -43,6 +43,7 @@ import com.tspolice.runtracker.domain.LapSplit
 import com.tspolice.runtracker.domain.LiveTelemetry
 import com.tspolice.runtracker.domain.MotionSignalProcessor
 import com.tspolice.runtracker.domain.MotionState
+import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.MotionStateAudioCue
 import com.tspolice.runtracker.domain.PtTrialPhase
 import com.tspolice.runtracker.domain.RunMode
@@ -324,6 +325,11 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     fun syncThresholdsFromPrefs() {
         gaitClassifier.runningSpeedThresholdMps = repository.runningThresholdMps
         gaitClassifier.targetSpeedThresholdMps = TsPoliceBenchmark.targetSpeedMps(repository.targetTimeSec)
+        gaitClassifier.strideScaleFactor = if (repository.autoCalibrateFromSamsung) {
+            repository.strideCalibrationScale
+        } else {
+            1.0
+        }
     }
 
     fun refreshPermissionsAndSensors() {
@@ -389,6 +395,49 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         dailyMaxSpeedMps = 0.0
         dailyMaxCadenceSpm = 0.0
         resetOpenBout()
+        persistDailySummaryNow()
+        broadcastTelemetry()
+    }
+
+    /**
+     * Raises today's All-Day counters to match Samsung Health whenever Samsung Health captured
+     * earlier steps/distance/walks/runs (e.g. from a Galaxy Watch or while phone was off-body),
+     * without ever reducing locally recorded movement.
+     */
+    fun alignTodayWithSamsungHealth(samsung: SamsungDailySnapshot) {
+        ensureDailyLoadedForToday()
+        if (samsung.dateIso.isNotBlank() && samsung.dateIso != dailyDateIso) return
+
+        if (samsung.steps > dailyTotalSteps) {
+            dailyTotalSteps = samsung.steps
+        }
+        if (samsung.walkingSec > dailyWalkSec) {
+            dailyWalkSec = samsung.walkingSec
+        }
+        val localJogRunSec = dailyJogSec + dailyRunSec
+        if (samsung.jogRunSec > localJogRunSec) {
+            val extraJogRunSec = samsung.jogRunSec - localJogRunSec
+            dailyRunSec += extraJogRunSec * 0.55
+            dailyJogSec += extraJogRunSec * 0.45
+        }
+        val localTotalDist = dailyWalkMeters + dailyJogMeters + dailyRunMeters
+        if (samsung.distanceMeters > localTotalDist) {
+            val missingDist = samsung.distanceMeters - localTotalDist
+            val samActive = samsung.walkingSec + samsung.jogRunSec
+            val runShare = if (samActive > 10.0) (samsung.jogRunSec / samActive).coerceIn(0.0, 1.0) else 0.0
+            dailyWalkMeters += missingDist * (1.0 - runShare)
+            dailyRunMeters += missingDist * runShare * 0.55
+            dailyJogMeters += missingDist * runShare * 0.45
+        }
+        if (samsung.maxSpeedMps in 0.55..GaitClassifier.MAX_HUMAN_RUNNING_SPEED_MPS &&
+            samsung.maxSpeedMps > dailyMaxSpeedMps
+        ) {
+            dailyMaxSpeedMps = samsung.maxSpeedMps
+        }
+        if (samsung.maxCadenceSpm in 68.0..235.0 && samsung.maxCadenceSpm > dailyMaxCadenceSpm) {
+            dailyMaxCadenceSpm = samsung.maxCadenceSpm
+        }
+        dailyDirty = true
         persistDailySummaryNow()
         broadcastTelemetry()
     }

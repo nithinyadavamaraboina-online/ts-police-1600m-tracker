@@ -29,28 +29,39 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.tspolice.runtracker.data.RunRepository
 import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.ForecastStatus
+import com.tspolice.runtracker.domain.HealthSyncStatus
 import com.tspolice.runtracker.domain.LiveTelemetry
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.ProgressionForecaster
 import com.tspolice.runtracker.domain.PtTrialPhase
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
+import com.tspolice.runtracker.domain.SamsungDailySnapshot
+import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
+import com.tspolice.runtracker.health.SamsungHealthSyncManager
 import com.tspolice.runtracker.service.RunTrackingService
 import com.tspolice.runtracker.update.AppUpdater
 import com.tspolice.runtracker.update.UpdateCheckResult
 import com.tspolice.runtracker.update.UpdateReleaseInfo
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import java.time.ZoneId
+import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var repository: RunRepository
     private lateinit var appUpdater: AppUpdater
+    private lateinit var healthSyncManager: SamsungHealthSyncManager
     private var trackingService: RunTrackingService? = null
     private var serviceBound = false
     private var lastHandledFinishId: Long? = null
@@ -59,6 +70,14 @@ class MainActivity : AppCompatActivity() {
     private var activityVisible = false
     private var lastAutoUpdateCheckElapsedMs = -10_000_000L
     private var activeUpdateDialog: AlertDialog? = null
+
+    // Samsung Health Sync & Calibration state
+    private var healthSyncStatus: HealthSyncStatus = HealthSyncStatus.PERMISSION_REQUIRED
+    private var latestSamsungSnapshot: SamsungDailySnapshot? = null
+    private var latestDailySummaryForCompare: DailyActivitySummary = DailyActivitySummary()
+    private var isHealthSyncInFlight = false
+    private var lastHealthSyncElapsedMs = -120_000L
+    private var lastSamsungRenderKey = ""
 
     // Tracker sub-tab state: 0 = Always-On All-Day Open Mode (default), 1 = 1.6 km PT Trial
     private var activeTrackerSubTab = 0
@@ -106,6 +125,27 @@ class MainActivity : AppCompatActivity() {
     private lateinit var openGpsStatusSub: TextView
     private lateinit var dailyGaitBar: GaitBreakdownBarView
     private lateinit var dailyGaitLegendText: TextView
+    private lateinit var samsungSyncBadge: TextView
+    private lateinit var samsungHeadlineText: TextView
+    private lateinit var samsungDetailText: TextView
+    private lateinit var samsungCompareTable: LinearLayout
+    private lateinit var samRowStepsTracker: TextView
+    private lateinit var samRowStepsSamsung: TextView
+    private lateinit var samRowStepsDelta: TextView
+    private lateinit var samRowDistTracker: TextView
+    private lateinit var samRowDistSamsung: TextView
+    private lateinit var samRowDistDelta: TextView
+    private lateinit var samRowWalkTracker: TextView
+    private lateinit var samRowWalkSamsung: TextView
+    private lateinit var samRowWalkDelta: TextView
+    private lateinit var samRowRunTracker: TextView
+    private lateinit var samRowRunSamsung: TextView
+    private lateinit var samRowRunDelta: TextView
+    private lateinit var samRowStrideTracker: TextView
+    private lateinit var samRowStrideSamsung: TextView
+    private lateinit var samRowStrideDelta: TextView
+    private lateinit var samsungPrimaryBtn: Button
+    private lateinit var samsungSecondaryBtn: Button
     private lateinit var launchPtFromOpenBtn: Button
     private lateinit var dailyHistoryListLayout: LinearLayout
 
@@ -141,13 +181,22 @@ class MainActivity : AppCompatActivity() {
     // Tab 3: Benchmark & Sensor Diagnostics views
     private lateinit var allDayAutoSwitch: Switch
     private lateinit var stateAudioSwitch: Switch
+    private lateinit var autoCalibrateSamsungSwitch: Switch
+    private lateinit var autoImportSamsungRunsSwitch: Switch
     private lateinit var diagGpsText: TextView
     private lateinit var diagStepText: TextView
+    private lateinit var diagStrideCalText: TextView
     private lateinit var diagStateText: TextView
     private lateinit var updateStatusText: TextView
     private lateinit var checkUpdateBtn: Button
     private lateinit var targetPresetButtons: List<Pair<Double, TextView>>
     private lateinit var thresholdPresetButtons: List<Pair<Double, TextView>>
+
+    private val healthPermissionLauncher = registerForActivityResult(
+        SamsungHealthSyncManager.createPermissionRequestContract()
+    ) {
+        triggerSamsungHealthSync(userTriggered = true)
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -183,11 +232,17 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         repository = RunRepository(this)
         appUpdater = AppUpdater(this)
+        healthSyncManager = SamsungHealthSyncManager(this, repository)
+        latestSamsungSnapshot = repository.getCachedSamsungSnapshot(LocalDate.now().toString())
+        if (latestSamsungSnapshot != null) {
+            healthSyncStatus = HealthSyncStatus.SYNCED
+        }
 
         setContentView(buildRootLayout())
         selectTab(0)
         selectTrackerSubTab(0)
         refreshCachedDailyHistory(forceRender = true)
+        renderSamsungComparisonCard(force = true)
         refreshProgressDashboard()
         updatePermissionBanner()
 
@@ -196,6 +251,7 @@ class MainActivity : AppCompatActivity() {
 
         requestNeededPermissionsIfMissing(silentCheckOnly = false)
         appUpdater.syncBackgroundUpdateSchedule()
+        maybeShowHealthPrivacyRationale(intent)
     }
 
     private fun startTrackingServiceSafely(): Intent {
@@ -216,6 +272,7 @@ class MainActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         consumeInstallFromNotificationIntent(intent)
+        maybeShowHealthPrivacyRationale(intent)
     }
 
     override fun onStart() {
@@ -234,6 +291,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val nowElapsed = SystemClock.elapsedRealtime()
+        if (!currentlyRecording && (nowElapsed - lastHealthSyncElapsedMs) >= 45_000L) {
+            triggerSamsungHealthSync(userTriggered = false)
+        }
         if (appUpdater.autoCheckOnLaunch && !currentlyRecording && (nowElapsed - lastAutoUpdateCheckElapsedMs) >= 120_000L) {
             lastAutoUpdateCheckElapsedMs = nowElapsed
             window.decorView.postDelayed({
@@ -412,6 +472,9 @@ class MainActivity : AppCompatActivity() {
         }
         if (index == 0) {
             refreshCachedDailyHistory(forceRender = true)
+            if (!currentlyRecording && (SystemClock.elapsedRealtime() - lastHealthSyncElapsedMs) >= 45_000L) {
+                triggerSamsungHealthSync(userTriggered = false)
+            }
         } else if (index == 1) {
             refreshProgressDashboard()
         }
@@ -731,7 +794,10 @@ class MainActivity : AppCompatActivity() {
         dayGaitCard.addView(dailyGaitLegendText)
         box.addView(dayGaitCard)
 
-        // 5. 1-Tap CTA to Arm & Launch 1.6 km PT Trial
+        // 5. Samsung Health Sync, Side-by-Side Comparison & Personal Stride Auto-Calibration Card
+        box.addView(buildSamsungComparisonCard())
+
+        // 6. 1-Tap CTA to Arm & Launch 1.6 km PT Trial
         launchPtFromOpenBtn = Button(this).apply {
             text = "START 1.6 KM PT TRIAL (Starts Only When You Jog/Run) →"
             textSize = 13.5f
@@ -754,7 +820,7 @@ class MainActivity : AppCompatActivity() {
         }
         box.addView(launchPtFromOpenBtn)
 
-        // 6. Recent Whole-Day Activity Log Card
+        // 7. Recent Whole-Day Activity Log Card
         val dailyLogCard = cardContainer()
         dailyLogCard.addView(sectionHeader("DAILY WHOLE-DAY ACTIVITY LOG"))
         dailyHistoryListLayout = LinearLayout(this).apply {
@@ -765,6 +831,186 @@ class MainActivity : AppCompatActivity() {
         box.addView(dailyLogCard)
 
         return box
+    }
+
+    private fun buildSamsungComparisonCard(): LinearLayout {
+        val card = cardContainer().apply {
+            background = roundedBox(0xFF0E172A.toInt(), 0xFF38BDF8.toInt(), dp(14))
+        }
+
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        headerRow.addView(TextView(this).apply {
+            text = "SAMSUNG HEALTH SYNC & ACCURACY"
+            textSize = 11.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFF38BDF8.toInt())
+            letterSpacing = 0.04f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        samsungSyncBadge = TextView(this).apply {
+            text = "CONNECT"
+            textSize = 10.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFF04130D.toInt())
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(10))
+        }
+        headerRow.addView(samsungSyncBadge)
+        card.addView(headerRow)
+
+        samsungHeadlineText = TextView(this).apply {
+            text = "Sync Samsung Health for Side-by-Side Calibration"
+            textSize = 14.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFFF8FAFC.toInt())
+            setPadding(0, dp(6), 0, dp(3))
+        }
+        samsungDetailText = TextView(this).apply {
+            text = "Compares Steps, Distance, Walk & Jog+Run time via Android Health Connect and calibrates your personal stride length."
+            textSize = 12f
+            setTextColor(0xFF94A3B8.toInt())
+            setPadding(0, 0, 0, dp(8))
+        }
+        card.addView(samsungHeadlineText)
+        card.addView(samsungDetailText)
+
+        // Side-by-side comparison table (Metric | TS Tracker | Samsung | Delta / Match)
+        samsungCompareTable = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            background = roundedBox(0xFF090F1D.toInt(), 0xFF1E293B.toInt(), dp(10))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
+        }
+
+        val tblHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 0, 0, dp(5))
+        }
+        fun hdrCell(txt: String, weight: Float, alignEnd: Boolean = false) = TextView(this).apply {
+            text = txt
+            textSize = 10f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = if (alignEnd) Gravity.END else Gravity.START
+            setTextColor(0xFF64748B.toInt())
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, weight)
+        }
+        tblHeader.addView(hdrCell("METRIC", 1.05f))
+        tblHeader.addView(hdrCell("TS APP", 0.95f, alignEnd = true))
+        tblHeader.addView(hdrCell("SAMSUNG", 0.95f, alignEnd = true))
+        tblHeader.addView(hdrCell("ACCURACY", 1.15f, alignEnd = true))
+        samsungCompareTable.addView(tblHeader)
+
+        fun buildCompareRow(label: String): Triple<TextView, TextView, TextView> {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(4), 0, dp(4))
+            }
+            val lblTv = TextView(this).apply {
+                text = label
+                textSize = 11.5f
+                setTextColor(0xFFCBD5E1.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.05f)
+            }
+            val trkTv = TextView(this).apply {
+                text = "--"
+                textSize = 12f
+                gravity = Gravity.END
+                typeface = Typeface.MONOSPACE
+                setTextColor(0xFFF8FAFC.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f)
+            }
+            val samTv = TextView(this).apply {
+                text = "--"
+                textSize = 12f
+                gravity = Gravity.END
+                typeface = Typeface.MONOSPACE
+                setTextColor(0xFF7DD3FC.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f)
+            }
+            val dltTv = TextView(this).apply {
+                text = "--"
+                textSize = 11f
+                gravity = Gravity.END
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(0xFF10B981.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.15f)
+            }
+            row.addView(lblTv)
+            row.addView(trkTv)
+            row.addView(samTv)
+            row.addView(dltTv)
+            samsungCompareTable.addView(row)
+            return Triple(trkTv, samTv, dltTv)
+        }
+
+        val rSteps = buildCompareRow("Steps")
+        samRowStepsTracker = rSteps.first
+        samRowStepsSamsung = rSteps.second
+        samRowStepsDelta = rSteps.third
+
+        val rDist = buildCompareRow("Distance")
+        samRowDistTracker = rDist.first
+        samRowDistSamsung = rDist.second
+        samRowDistDelta = rDist.third
+
+        val rWalk = buildCompareRow("Walk Time")
+        samRowWalkTracker = rWalk.first
+        samRowWalkSamsung = rWalk.second
+        samRowWalkDelta = rWalk.third
+
+        val rRun = buildCompareRow("Jog + Run")
+        samRowRunTracker = rRun.first
+        samRowRunSamsung = rRun.second
+        samRowRunDelta = rRun.third
+
+        val rStride = buildCompareRow("Stride")
+        samRowStrideTracker = rStride.first
+        samRowStrideSamsung = rStride.second
+        samRowStrideDelta = rStride.third
+
+        card.addView(samsungCompareTable)
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        samsungPrimaryBtn = Button(this).apply {
+            text = "Connect Samsung Health"
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            isAllCaps = false
+            setTextColor(0xFF04130D.toInt())
+            background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(10))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.15f).apply {
+                marginEnd = dp(5)
+            }
+        }
+        samsungSecondaryBtn = Button(this).apply {
+            text = "Samsung Settings"
+            textSize = 12f
+            isAllCaps = false
+            setTextColor(0xFFCBD5E1.toInt())
+            background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(10))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f).apply {
+                marginStart = dp(5)
+            }
+        }
+        btnRow.addView(samsungPrimaryBtn)
+        btnRow.addView(samsungSecondaryBtn)
+        card.addView(btnRow)
+
+        return card
     }
 
     /**
@@ -1245,8 +1491,28 @@ class MainActivity : AppCompatActivity() {
             setTextColor(0xFFE2E8F0.toInt())
             textSize = 13f
             isChecked = repository.indoorStepFallbackEnabled
-            setPadding(0, dp(6), 0, dp(8))
+            setPadding(0, dp(6), 0, dp(6))
             setOnCheckedChangeListener { _, checked -> repository.indoorStepFallbackEnabled = checked }
+        }
+        autoCalibrateSamsungSwitch = Switch(this).apply {
+            text = "Auto-Calibrate Personal Stride Length from Samsung Health"
+            setTextColor(0xFFE2E8F0.toInt())
+            textSize = 13f
+            isChecked = repository.autoCalibrateFromSamsung
+            setPadding(0, dp(6), 0, dp(6))
+            setOnCheckedChangeListener { _, checked ->
+                repository.autoCalibrateFromSamsung = checked
+                trackingService?.syncThresholdsFromPrefs()
+                renderSamsungComparisonCard(force = true)
+            }
+        }
+        autoImportSamsungRunsSwitch = Switch(this).apply {
+            text = "Auto-Import Samsung Health / Watch Runs (>= 600m) to 7:15 ETA"
+            setTextColor(0xFFE2E8F0.toInt())
+            textSize = 13f
+            isChecked = repository.autoImportSamsungRuns
+            setPadding(0, dp(6), 0, dp(8))
+            setOnCheckedChangeListener { _, checked -> repository.autoImportSamsungRuns = checked }
         }
         val testStateAudioBtn = Button(this).apply {
             text = "Test State Change Audio Cue"
@@ -1269,6 +1535,10 @@ class MainActivity : AppCompatActivity() {
             isAllCaps = false
             setTextColor(0xFF94A3B8.toInt())
             background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(10))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
             setOnClickListener {
                 AlertDialog.Builder(this@MainActivity)
                     .setTitle("Reset today's whole-day counters?")
@@ -1281,13 +1551,29 @@ class MainActivity : AppCompatActivity() {
                     .show()
             }
         }
+        val resetStrideCalBtn = Button(this).apply {
+            text = "Reset Personal Stride Calibration (1.00x)"
+            textSize = 12f
+            isAllCaps = false
+            setTextColor(0xFF94A3B8.toInt())
+            background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(10))
+            setOnClickListener {
+                repository.strideCalibrationScale = 1.0
+                trackingService?.syncThresholdsFromPrefs()
+                renderSamsungComparisonCard(force = true)
+                Toast.makeText(this@MainActivity, "Stride calibration reset to 1.00x", Toast.LENGTH_SHORT).show()
+            }
+        }
 
         settingsCard.addView(allDayAutoSwitch)
         settingsCard.addView(stateAudioSwitch)
         settingsCard.addView(voiceSwitch)
         settingsCard.addView(stepFallbackSwitch)
+        settingsCard.addView(autoCalibrateSamsungSwitch)
+        settingsCard.addView(autoImportSamsungRunsSwitch)
         settingsCard.addView(testStateAudioBtn)
         settingsCard.addView(resetTodayDailyBtn)
+        settingsCard.addView(resetStrideCalBtn)
         col.addView(settingsCard)
 
         // Live Sensor Diagnostics Card
@@ -1305,6 +1591,12 @@ class MainActivity : AppCompatActivity() {
             setTextColor(0xFFCBD5E1.toInt())
             setPadding(0, dp(2), 0, dp(4))
         }
+        diagStrideCalText = TextView(this).apply {
+            text = String.format("Samsung Health Stride Scale: %.2fx", repository.strideCalibrationScale)
+            textSize = 12.5f
+            setTextColor(0xFF38BDF8.toInt())
+            setPadding(0, dp(2), 0, dp(4))
+        }
         diagStateText = TextView(this).apply {
             text = "Classifier Verdict: STANDING"
             textSize = 12.5f
@@ -1313,6 +1605,7 @@ class MainActivity : AppCompatActivity() {
         }
         diagCard.addView(diagGpsText)
         diagCard.addView(diagStepText)
+        diagCard.addView(diagStrideCalText)
         diagCard.addView(diagStateText)
         col.addView(diagCard)
 
@@ -1536,6 +1829,8 @@ class MainActivity : AppCompatActivity() {
             PtTrialPhase.RUNNING_TRIAL -> "VIEW LIVE 1.6 KM PT TRIAL (${snap.distanceMeters.toInt()}m) →"
         }
 
+        latestDailySummaryForCompare = daily
+        renderSamsungComparisonCard(force = false)
         renderDailyHistoryCards(daily)
 
         // =====================================================================
@@ -1720,8 +2015,260 @@ class MainActivity : AppCompatActivity() {
         } else {
             "Step Sensor: 3-Axis Accelerometer Peak Detector active (${snap.cadenceSpm.roundToInt()} spm)"
         }
+        val activeScale = if (repository.autoCalibrateFromSamsung) repository.strideCalibrationScale else 1.0
+        diagStrideCalText.text = String.format(
+            "Personal Stride Calibration: %.2fx (%s)",
+            activeScale,
+            if (latestSamsungSnapshot != null) "Calibrated via ${latestSamsungSnapshot!!.sourceLabel}" else "Default biomechanical curve"
+        )
         diagStateText.text = "Live Auto-Detected Gait: ${snap.motionState.badgeText}"
         diagStateText.setTextColor(snap.motionState.colorArgb)
+    }
+
+    // =========================================================================
+    // SAMSUNG HEALTH SYNC, SIDE-BY-SIDE COMPARISON & STRIDE AUTO-CALIBRATION
+    // =========================================================================
+    private fun formatSignedSeconds(deltaSec: Double): String {
+        val rounded = deltaSec.roundToInt()
+        if (abs(rounded) <= 3) return "Exact"
+        val sign = if (rounded > 0) "+" else "-"
+        val a = abs(rounded)
+        return String.format("%s%d:%02d", sign, a / 60, a % 60)
+    }
+
+    private fun renderSamsungComparisonCard(force: Boolean) {
+        if (!::samsungHeadlineText.isInitialized) return
+        val daily = latestDailySummaryForCompare
+        val sam = latestSamsungSnapshot
+        val scale = if (repository.autoCalibrateFromSamsung) repository.strideCalibrationScale else 1.0
+
+        val key = "${healthSyncStatus}:${isHealthSyncInFlight}:${daily.totalSteps}:${daily.totalDistanceMeters.toInt()}:" +
+            "${daily.walkingSec.toInt()}:${daily.jogRunCombinedSec.toInt()}:${sam?.steps}:${sam?.distanceMeters?.toInt()}:${String.format("%.3f", scale)}"
+        if (!force && key == lastSamsungRenderKey) return
+        lastSamsungRenderKey = key
+
+        if (isHealthSyncInFlight) {
+            samsungSyncBadge.text = "SYNCING..."
+            samsungSyncBadge.setTextColor(0xFF04130D.toInt())
+            samsungSyncBadge.background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(10))
+            samsungPrimaryBtn.isEnabled = false
+            samsungPrimaryBtn.text = "Syncing Health Connect..."
+            return
+        }
+        samsungPrimaryBtn.isEnabled = true
+
+        when (healthSyncStatus) {
+            HealthSyncStatus.NOT_INSTALLED -> {
+                samsungCompareTable.visibility = View.GONE
+                samsungSyncBadge.text = "INSTALL HC"
+                samsungSyncBadge.setTextColor(0xFF04130D.toInt())
+                samsungSyncBadge.background = roundedBox(0xFFF59E0B.toInt(), 0xFFF59E0B.toInt(), dp(10))
+                samsungHeadlineText.text = "Android Health Connect Needed"
+                samsungDetailText.text = "Install or update Android Health Connect so Samsung Health can share live steps, distance & runs."
+                samsungPrimaryBtn.text = "Get Health Connect"
+                samsungPrimaryBtn.setOnClickListener { healthSyncManager.openSamsungHealthOrHealthConnectSettings() }
+                samsungSecondaryBtn.visibility = View.VISIBLE
+                samsungSecondaryBtn.text = "Retry Check"
+                samsungSecondaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
+            }
+
+            HealthSyncStatus.PERMISSION_REQUIRED -> {
+                samsungCompareTable.visibility = View.GONE
+                samsungSyncBadge.text = "CONNECT"
+                samsungSyncBadge.setTextColor(0xFF04130D.toInt())
+                samsungSyncBadge.background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(10))
+                samsungHeadlineText.text = "Connect Samsung Health for Better Accuracy"
+                samsungDetailText.text =
+                    "Grant Health Connect read access to compare TS Tracker vs Samsung Health side-by-side and auto-calibrate your personal stride."
+                samsungPrimaryBtn.text = "Connect Samsung Health"
+                samsungPrimaryBtn.setOnClickListener { requestSamsungPermissionsSafely() }
+                samsungSecondaryBtn.visibility = View.VISIBLE
+                samsungSecondaryBtn.text = "Samsung Settings"
+                samsungSecondaryBtn.setOnClickListener {
+                    if (!healthSyncManager.openSamsungHealthAppDirectly()) {
+                        healthSyncManager.openSamsungHealthOrHealthConnectSettings()
+                    }
+                }
+            }
+
+            HealthSyncStatus.WAITING_FOR_SAMSUNG_SYNC -> {
+                samsungCompareTable.visibility = View.GONE
+                samsungSyncBadge.text = "ENABLE IN SAMSUNG"
+                samsungSyncBadge.setTextColor(0xFF04130D.toInt())
+                samsungSyncBadge.background = roundedBox(0xFFF59E0B.toInt(), 0xFFF59E0B.toInt(), dp(10))
+                samsungHeadlineText.text = "Turn ON Health Connect inside Samsung Health"
+                samsungDetailText.text =
+                    "In Samsung Health → ⋮ → Settings → Health Connect → Turn ON Allow all, then return here and tap 'Sync Now'."
+                samsungPrimaryBtn.text = "Open Samsung Health"
+                samsungPrimaryBtn.setOnClickListener {
+                    if (!healthSyncManager.openSamsungHealthAppDirectly()) {
+                        healthSyncManager.openSamsungHealthOrHealthConnectSettings()
+                    }
+                }
+                samsungSecondaryBtn.visibility = View.VISIBLE
+                samsungSecondaryBtn.text = "Sync Now"
+                samsungSecondaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
+            }
+
+            HealthSyncStatus.SYNCED, HealthSyncStatus.ERROR -> {
+                if (sam == null) {
+                    samsungCompareTable.visibility = View.GONE
+                    samsungSyncBadge.text = "RETRY"
+                    samsungSyncBadge.setTextColor(0xFF04130D.toInt())
+                    samsungSyncBadge.background = roundedBox(0xFFF59E0B.toInt(), 0xFFF59E0B.toInt(), dp(10))
+                    samsungHeadlineText.text = "Tap Sync Now to Pull Samsung Health Data"
+                    samsungDetailText.text = "Make sure Health Connect permissions are enabled for both Samsung Health and TS Police 1.6K."
+                    samsungPrimaryBtn.text = "Sync & Calibrate Now"
+                    samsungPrimaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
+                    samsungSecondaryBtn.visibility = View.VISIBLE
+                    samsungSecondaryBtn.text = "Health Connect"
+                    samsungSecondaryBtn.setOnClickListener { healthSyncManager.openSamsungHealthOrHealthConnectSettings() }
+                    return
+                }
+
+                val report = SamsungHealthComparator.compare(
+                    tracker = daily,
+                    samsung = sam,
+                    currentStrideScale = scale
+                )
+                samsungCompareTable.visibility = View.VISIBLE
+
+                val matchBadge = report.overallMatchPercent?.let { String.format("%.0f%% MATCH", it) }
+                    ?: String.format("STRIDE %.2fx", scale)
+                val highMatch = (report.overallMatchPercent ?: 100.0) >= 88.0
+                samsungSyncBadge.text = matchBadge
+                samsungSyncBadge.setTextColor(0xFF04130D.toInt())
+                samsungSyncBadge.background = roundedBox(
+                    if (highMatch) 0xFF10B981.toInt() else 0xFFF59E0B.toInt(),
+                    if (highMatch) 0xFF10B981.toInt() else 0xFFF59E0B.toInt(),
+                    dp(10)
+                )
+
+                samsungHeadlineText.text = report.headline
+                samsungDetailText.text = report.detailAdvice
+
+                // Populate 5 side-by-side comparison rows
+                samRowStepsTracker.text = "${daily.totalSteps}"
+                samRowStepsSamsung.text = "${sam.steps}"
+                val stSign = if (report.stepsDelta > 0) "+${report.stepsDelta}" else "${report.stepsDelta}"
+                samRowStepsDelta.text = if (report.stepsMatchPercent != null) {
+                    String.format("%.0f%% (%s)", report.stepsMatchPercent, if (report.stepsDelta == 0) "0" else stSign)
+                } else stSign
+                samRowStepsDelta.setTextColor(
+                    if ((report.stepsMatchPercent ?: 100.0) >= 88.0) 0xFF10B981.toInt() else 0xFFFBBF24.toInt()
+                )
+
+                samRowDistTracker.text = formatDistanceShort(daily.totalDistanceMeters)
+                samRowDistSamsung.text = formatDistanceShort(sam.distanceMeters)
+                val dMeters = report.distanceDeltaMeters.roundToInt()
+                val dSign = if (dMeters > 0) "+${dMeters}m" else "${dMeters}m"
+                samRowDistDelta.text = if (report.distanceMatchPercent != null) {
+                    String.format("%.0f%% (%s)", report.distanceMatchPercent, if (abs(dMeters) <= 3) "0m" else dSign)
+                } else dSign
+                samRowDistDelta.setTextColor(
+                    if ((report.distanceMatchPercent ?: 100.0) >= 88.0) 0xFF10B981.toInt() else 0xFFFBBF24.toInt()
+                )
+
+                samRowWalkTracker.text = TsPoliceBenchmark.formatDuration(daily.walkingSec)
+                samRowWalkSamsung.text = TsPoliceBenchmark.formatDuration(sam.walkingSec)
+                samRowWalkDelta.text = formatSignedSeconds(report.walkSecDelta)
+                samRowWalkDelta.setTextColor(0xFFCBD5E1.toInt())
+
+                samRowRunTracker.text = TsPoliceBenchmark.formatDuration(daily.jogRunCombinedSec)
+                samRowRunSamsung.text = TsPoliceBenchmark.formatDuration(sam.jogRunSec)
+                samRowRunDelta.text = formatSignedSeconds(report.jogRunSecDelta)
+                samRowRunDelta.setTextColor(0xFF34D399.toInt())
+
+                samRowStrideTracker.text = report.trackerStrideM?.let { String.format("%.2f m", it) } ?: "--"
+                samRowStrideSamsung.text = report.samsungStrideM?.let { String.format("%.2f m", it) } ?: "--"
+                samRowStrideDelta.text = String.format("Cal %.2fx", scale)
+                samRowStrideDelta.setTextColor(0xFF38BDF8.toInt())
+
+                samsungPrimaryBtn.text = "Sync & Calibrate Now"
+                samsungPrimaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
+
+                val samsungHasHigherTotals = sam.steps > daily.totalSteps + 25 ||
+                    sam.distanceMeters > daily.totalDistanceMeters + 25.0
+                samsungSecondaryBtn.visibility = View.VISIBLE
+                if (samsungHasHigherTotals) {
+                    val extraSteps = max(0, sam.steps - daily.totalSteps)
+                    samsungSecondaryBtn.text = if (extraSteps > 0) "Align Today (+$extraSteps)" else "Align Today"
+                    samsungSecondaryBtn.setTextColor(0xFF38BDF8.toInt())
+                    samsungSecondaryBtn.setOnClickListener {
+                        trackingService?.alignTodayWithSamsungHealth(sam)
+                        refreshCachedDailyHistory(forceRender = true)
+                        renderSamsungComparisonCard(force = true)
+                        Toast.makeText(
+                            this,
+                            "Aligned today's floor with ${sam.sourceLabel}!",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                } else {
+                    samsungSecondaryBtn.text = "Health Connect"
+                    samsungSecondaryBtn.setTextColor(0xFFCBD5E1.toInt())
+                    samsungSecondaryBtn.setOnClickListener {
+                        healthSyncManager.openSamsungHealthOrHealthConnectSettings()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun requestSamsungPermissionsSafely() {
+        runCatching {
+            healthPermissionLauncher.launch(SamsungHealthSyncManager.ALL_PERMISSIONS)
+        }.onFailure {
+            healthSyncManager.openSamsungHealthOrHealthConnectSettings()
+        }
+    }
+
+    private fun triggerSamsungHealthSync(userTriggered: Boolean) {
+        if (isHealthSyncInFlight || !::healthSyncManager.isInitialized) return
+        isHealthSyncInFlight = true
+        lastHealthSyncElapsedMs = SystemClock.elapsedRealtime()
+        renderSamsungComparisonCard(force = true)
+
+        lifecycleScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                healthSyncManager.syncTodayAndCalibrate()
+            }
+            isHealthSyncInFlight = false
+            healthSyncStatus = outcome.status
+            if (outcome.snapshot != null) {
+                latestSamsungSnapshot = outcome.snapshot
+            }
+            trackingService?.syncThresholdsFromPrefs()
+            if (outcome.importedRunCount > 0) {
+                refreshProgressDashboard()
+                Toast.makeText(
+                    this@MainActivity,
+                    "Synced ${outcome.importedRunCount} Samsung Health run(s) into 7:15 Progress!",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else if (userTriggered) {
+                Toast.makeText(this@MainActivity, outcome.statusMessage, Toast.LENGTH_SHORT).show()
+            }
+            renderSamsungComparisonCard(force = true)
+        }
+    }
+
+    private fun maybeShowHealthPrivacyRationale(incomingIntent: Intent?) {
+        val action = incomingIntent?.action ?: return
+        if (action == "androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" ||
+            action == Intent.ACTION_VIEW_PERMISSION_USAGE
+        ) {
+            AlertDialog.Builder(this)
+                .setTitle("Samsung Health & Health Connect Privacy")
+                .setMessage(
+                    "TS Police 1.6 KM Tracker reads Steps, Distance, Exercise Sessions, Speed, and Cadence from Android Health Connect strictly on-device to:\n\n" +
+                        "1. Compare your daily steps, distance, walk time, and jog/run time side-by-side with Samsung Health.\n" +
+                        "2. Auto-calibrate your personal stride length for higher 1.6 km PET pace & indoor accuracy.\n\n" +
+                        "Your health data stays 100% locally on your phone and is never uploaded to any external server."
+                )
+                .setPositiveButton("Got It", null)
+                .show()
+        }
     }
 
     // =========================================================================

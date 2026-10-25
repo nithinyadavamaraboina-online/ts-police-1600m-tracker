@@ -1,8 +1,8 @@
 {
-    "versionCode":  8,
-    "versionName":  "1.0.7",
+    "versionCode":  9,
+    "versionName":  "1.0.8",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "ddb7b3ca0be7a5aeaa1cb08160ae179916cd8629fe987e11c4c43b6cef3ca343",
-    "changelog":  "Added Always-On All-Day Auto Mode (whole-day Walk time, combined Jog+Run time, Max Pace, Max Cadence, Distance \u0026 Steps) and 1.6km PT Trial that waits and starts automatically only when you begin Jogging or Running.",
-    "publishedAt":  "2026-10-25T17:57:26Z"
+    "sha256":  "806d4d6b8303d464d0a29d742a32460be873356fce42e688de3d7264d065a53b",
+    "changelog":  "Added Samsung Health sync via Android Health Connect: live side-by-side accuracy comparison (Steps, Distance, Walk \u0026 Jog+Run time), automatic personal stride calibration for higher indoor/pocket pace accuracy, 1-tap Watch/pre-app floor alignment, and auto-import of Samsung Health runs (\u003e=600m).",
+    "publishedAt":  "2026-10-25T23:52:01Z"
 }

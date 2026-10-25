@@ -10,6 +10,8 @@ import com.tspolice.runtracker.domain.LapSplit
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
+import com.tspolice.runtracker.domain.SamsungDailySnapshot
+import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import org.json.JSONArray
 import org.json.JSONObject
@@ -35,6 +37,11 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_STATE_CHANGE_AUDIO = "state_change_audio_enabled"
         private const val KEY_STEP_FALLBACK = "indoor_step_distance_fallback"
         private const val KEY_ALL_DAY_AUTO = "all_day_auto_tracking_enabled"
+        private const val KEY_STRIDE_SCALE = "samsung_stride_scale_factor"
+        private const val KEY_AUTO_CALIBRATE_SAMSUNG = "auto_calibrate_from_samsung"
+        private const val KEY_AUTO_IMPORT_SAMSUNG_RUNS = "auto_import_samsung_runs"
+        private const val KEY_CACHED_SAMSUNG_JSON = "cached_samsung_snapshot_json"
+        private const val KEY_IMPORTED_EXT_WORKOUTS = "imported_external_workout_ids"
     }
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -117,6 +124,80 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     var allDayTrackingEnabled: Boolean
         get() = prefs.getBoolean(KEY_ALL_DAY_AUTO, true)
         set(value) = prefs.edit().putBoolean(KEY_ALL_DAY_AUTO, value).apply()
+
+    var strideCalibrationScale: Double
+        get() = prefs.getFloat(KEY_STRIDE_SCALE, 1.0f).toDouble()
+            .coerceIn(SamsungHealthComparator.MIN_STRIDE_SCALE, SamsungHealthComparator.MAX_STRIDE_SCALE)
+        set(value) = prefs.edit().putFloat(
+            KEY_STRIDE_SCALE,
+            value.coerceIn(SamsungHealthComparator.MIN_STRIDE_SCALE, SamsungHealthComparator.MAX_STRIDE_SCALE).toFloat()
+        ).apply()
+
+    var autoCalibrateFromSamsung: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_CALIBRATE_SAMSUNG, true)
+        set(value) = prefs.edit().putBoolean(KEY_AUTO_CALIBRATE_SAMSUNG, value).apply()
+
+    var autoImportSamsungRuns: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_IMPORT_SAMSUNG_RUNS, true)
+        set(value) = prefs.edit().putBoolean(KEY_AUTO_IMPORT_SAMSUNG_RUNS, value).apply()
+
+    fun saveSamsungSnapshot(snapshot: SamsungDailySnapshot) {
+        val obj = JSONObject().apply {
+            put("dateIso", snapshot.dateIso)
+            put("steps", snapshot.steps)
+            put("distanceMeters", snapshot.distanceMeters)
+            put("walkingSec", snapshot.walkingSec)
+            put("jogRunSec", snapshot.jogRunSec)
+            put("maxSpeedMps", snapshot.maxSpeedMps)
+            put("maxCadenceSpm", snapshot.maxCadenceSpm)
+            put("sourcePackage", snapshot.sourcePackage)
+            put("sourceLabel", snapshot.sourceLabel)
+            put("syncedAtEpochMs", snapshot.syncedAtEpochMs)
+        }
+        prefs.edit().putString(KEY_CACHED_SAMSUNG_JSON, obj.toString()).apply()
+    }
+
+    fun getCachedSamsungSnapshot(dateIso: String): SamsungDailySnapshot? {
+        val raw = prefs.getString(KEY_CACHED_SAMSUNG_JSON, null) ?: return null
+        return runCatching {
+            val o = JSONObject(raw)
+            if (o.optString("dateIso") != dateIso) return null
+            SamsungDailySnapshot(
+                dateIso = o.optString("dateIso"),
+                steps = o.optInt("steps", 0),
+                distanceMeters = o.optDouble("distanceMeters", 0.0),
+                walkingSec = o.optDouble("walkingSec", 0.0),
+                jogRunSec = o.optDouble("jogRunSec", 0.0),
+                maxSpeedMps = o.optDouble("maxSpeedMps", 0.0),
+                maxCadenceSpm = o.optDouble("maxCadenceSpm", 0.0),
+                sourcePackage = o.optString("sourcePackage", SamsungHealthComparator.SAMSUNG_HEALTH_PACKAGE),
+                sourceLabel = o.optString("sourceLabel", "Samsung Health"),
+                syncedAtEpochMs = o.optLong("syncedAtEpochMs", 0L)
+            )
+        }.getOrNull()
+    }
+
+    fun hasSessionNear(startedAtMs: Long, windowMs: Long = 15L * 60_000L): Boolean {
+        val low = (startedAtMs - windowMs).toString()
+        val high = (startedAtMs + windowMs).toString()
+        readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM $TABLE_RUNS WHERE started_at_ms BETWEEN ? AND ?",
+            arrayOf(low, high)
+        ).use { c ->
+            return c.moveToFirst() && c.getInt(0) > 0
+        }
+    }
+
+    fun isExternalWorkoutImported(externalId: String): Boolean {
+        val current = prefs.getStringSet(KEY_IMPORTED_EXT_WORKOUTS, emptySet()) ?: emptySet()
+        return externalId in current
+    }
+
+    fun markExternalWorkoutImported(externalId: String) {
+        val updated = LinkedHashSet(prefs.getStringSet(KEY_IMPORTED_EXT_WORKOUTS, emptySet()) ?: emptySet())
+        updated.add(externalId)
+        prefs.edit().putStringSet(KEY_IMPORTED_EXT_WORKOUTS, updated).apply()
+    }
 
     fun getDailyActivity(dateIso: String): DailyActivitySummary {
         readableDatabase.query(

@@ -14,7 +14,8 @@ import kotlin.math.sqrt
  */
 class GaitClassifier(
     var runningSpeedThresholdMps: Double = DEFAULT_RUNNING_SPEED_MPS,
-    var targetSpeedThresholdMps: Double = TsPoliceBenchmark.targetSpeedMps()
+    var targetSpeedThresholdMps: Double = TsPoliceBenchmark.targetSpeedMps(),
+    var strideScaleFactor: Double = 1.0
 ) {
     companion object {
         const val DEFAULT_WALKING_SPEED_MPS = 0.75   // ~2.7 km/h real walking speed
@@ -203,7 +204,11 @@ class GaitClassifier(
             dynamicAccelRms >= 6.0 -> 1.02
             else -> 1.00
         }
-        return (baseStride * impulseBoost).coerceIn(0.55, 1.52)
+        val personalScale = strideScaleFactor.coerceIn(
+            SamsungHealthComparator.MIN_STRIDE_SCALE,
+            SamsungHealthComparator.MAX_STRIDE_SCALE
+        )
+        return (baseStride * impulseBoost * personalScale).coerceIn(0.50, 1.72)
     }
 
     fun estimateSpeedFromStepsMps(cadenceSpm: Double, dynamicAccelRms: Double): Double {

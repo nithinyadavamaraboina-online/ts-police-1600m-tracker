@@ -10,6 +10,8 @@ import com.tspolice.runtracker.domain.ProgressionForecaster
 import com.tspolice.runtracker.domain.PtTrialPhase
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
+import com.tspolice.runtracker.domain.SamsungDailySnapshot
+import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import com.tspolice.runtracker.update.VersionComparator
 import org.junit.Assert.assertEquals
@@ -437,6 +439,51 @@ class TrackerDomainTest {
 
         assertEquals(PtTrialPhase.RUNNING_TRIAL, phase)
         assertTrue("Expected launch stride time credited (~2.0..3.0s), got $activeTrialSec", activeTrialSec >= 1.75)
+    }
+
+    @Test
+    fun `samsung health comparator computes accuracy match and calibrates personal stride safely`() {
+        val trackerToday = DailyActivitySummary(
+            dateIso = "2026-10-26",
+            walkingSec = 1800.0,
+            joggingSec = 300.0,
+            runningSec = 300.0,
+            walkingMeters = 1950.0,
+            joggingMeters = 720.0,
+            runningMeters = 980.0, // total 3650m across 4350 steps (~0.839 m/step)
+            totalSteps = 4350
+        )
+        val samsungToday = SamsungDailySnapshot(
+            dateIso = "2026-10-26",
+            steps = 4480,
+            distanceMeters = 4032.0, // 0.90 m/step (taller runner calibrated in Samsung Health / Watch!)
+            walkingSec = 1860.0,
+            jogRunSec = 615.0,
+            maxSpeedMps = 3.78,
+            maxCadenceSpm = 176.0
+        )
+
+        val report = SamsungHealthComparator.compare(trackerToday, samsungToday, currentStrideScale = 1.0)
+        assertEquals(-130, report.stepsDelta)
+        assertTrue((report.stepsMatchPercent ?: 0.0) > 96.0)
+        assertTrue((report.distanceMatchPercent ?: 0.0) > 89.0)
+        assertTrue("Expected stride scale > 1.03 for longer-stride runner, got ${report.recommendedStrideScale}",
+            report.recommendedStrideScale in 1.03..1.15)
+
+        // Verify GaitClassifier applies calibrated stride scale to live indoor/pocket step estimation
+        val uncalibrated = GaitClassifier(strideScaleFactor = 1.0)
+        val calibrated = GaitClassifier(strideScaleFactor = report.recommendedStrideScale)
+        val baseStride = uncalibrated.estimateStrideLengthMeters(cadenceSpm = 170.0, dynamicAccelRms = 7.2)
+        val tunedStride = calibrated.estimateStrideLengthMeters(cadenceSpm = 170.0, dynamicAccelRms = 7.2)
+        assertEquals(baseStride * report.recommendedStrideScale, tunedStride, 0.005)
+
+        // Even when user wore Galaxy Watch without phone (Samsung has 5x more steps!), per-step stride
+        // normalization prevents stride scale from blowing up!
+        val partialPhoneDay = DailyActivitySummary(dateIso = "2026-10-26", walkingSec = 400.0, walkingMeters = 620.0, totalSteps = 800)
+        val fullWatchDay = SamsungDailySnapshot(dateIso = "2026-10-26", steps = 5000, distanceMeters = 4000.0, walkingSec = 2900.0)
+        val watchScale = SamsungHealthComparator.computeCalibratedStrideScale(partialPhoneDay, fullWatchDay, currentStrideScale = 1.0)
+        assertTrue("Watch-only extra steps must keep per-step stride scale near ~1.02x, got $watchScale",
+            watchScale in 0.98..1.08)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
