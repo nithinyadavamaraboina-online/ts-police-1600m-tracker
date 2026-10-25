@@ -320,6 +320,46 @@ class TrackerDomainTest {
         )
     }
 
+    @Test
+    fun `steps and stride distance count reliably even when oem hardware step detector emits zero events`() {
+        // Reproduces OEM Android phones where TYPE_STEP_DETECTOR registers non-null (hardwareStepSensorAvailable = true)
+        // yet never delivers sensor callbacks, while the user walks holding the phone in hand (+/- 1.35 m/s^2 at 105 spm)!
+        val dsp = MotionSignalProcessor().apply { hardwareStepSensorAvailable = true }
+        val classifier = GaitClassifier()
+        var accumulatedDistanceM = 0.0
+        var lastSteps = 0
+
+        val stepFreqHz = 1.75 // 105 steps/min normal walk
+        for (i in 0..350) {
+            val tMs = i * 20L
+            val tSec = tMs / 1000.0
+            val ay = (9.81 + 1.35 * sin(2.0 * Math.PI * stepFreqHz * tSec)).toFloat()
+            dsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
+
+            val cadence = dsp.getCadenceSpm(tMs)
+            val rms = dsp.getDynamicAccelRms(tMs)
+            val state = classifier.update(
+                nowMs = tMs,
+                gpsSpeedMps = 0.0, // stationary indoor FUSED_PROVIDER Wi-Fi fix!
+                cadenceSpm = cadence,
+                dynamicAccelRms = rms,
+                minRawNorm = dsp.getMinRawNorm(tMs),
+                peakToTroughNorm = dsp.getPeakToTroughNorm(tMs)
+            )
+            val newSteps = dsp.totalSteps - lastSteps
+            lastSteps = dsp.totalSteps
+            if (newSteps > 0 && state != MotionState.VEHICLE && (state.countsAsActiveMovement || cadence >= GaitClassifier.MIN_WALKING_CADENCE_SPM)) {
+                accumulatedDistanceM += newSteps * classifier.estimateStrideLengthMeters(cadence.coerceAtLeast(85.0), rms)
+            }
+        }
+
+        assertTrue("Expected >= 10 steps counted on silent-HW-sensor phone, got ${dsp.totalSteps}", dsp.totalSteps >= 10)
+        val endCadence = dsp.getCadenceSpm(7000L)
+        assertTrue("Expected walking cadence ~105 spm, got $endCadence", endCadence in 92.0..118.0)
+        assertEquals(MotionState.WALKING, classifier.currentState())
+        assertTrue("Expected >= 7.0m indoor stride distance, got $accumulatedDistanceM", accumulatedDistanceM >= 7.0)
+    }
+
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
         val is1600 = mode == RunMode.TIMED_1600M
         return RunSessionRecord(

@@ -1,8 +1,8 @@
 {
-    "versionCode":  6,
-    "versionName":  "1.0.5",
+    "versionCode":  7,
+    "versionName":  "1.0.6",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "167f3d8fc82e1b5f346be1b50ffe594b6aa6438a9e52abd84cdfd6700a347ee5",
-    "changelog":  "Added 4-layer Bike \u0026 Vehicle rejection: riding a bike, scooter, or car is now detected and ignored instead of counting as Running.",
-    "publishedAt":  "2026-10-25T17:23:11Z"
+    "sha256":  "4daecb4f0d94020d8b9a7bb194af249385cf226391f383df4130c6454908341d",
+    "changelog":  "Fixed step \u0026 distance counting across all Android phones: added TYPE_STEP_COUNTER + automatic bipolar accelerometer pedometer fallback when TYPE_STEP_DETECTOR is silent, and fixed step-stride distance when indoor/FUSED_PROVIDER GPS is stationary.",
+    "publishedAt":  "2026-10-25T17:36:01Z"
 }

@@ -96,8 +96,11 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
     private var accelRegistered = false
     private var stepDetectorRegistered = false
+    private var stepCounterRegistered = false
     private var locationRegistered = false
     private var hasHardwareStepDetector = false
+    private var lastStepCounterHwValue: Double? = null
+    private var stepsAtLastStepCounter: Int = 0
     private var uiForegroundVisible = false
     private var isInForeground = false
 
@@ -135,6 +138,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var lastValidLocation: Location? = null
     private var lastValidLocationElapsedMs: Long = 0L
     private var lastLocationElapsedMs: Long = 0L
+    private var lastGpsDistanceContributionMs: Long = -100_000L
     private var smoothedGpsSpeedMps: Double = 0.0
     private var latestGpsAccuracyM: Float? = null
     private var lastStepCountForFallback: Int = 0
@@ -336,6 +340,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         lapSplits.clear()
         nextLapBoundaryM = TsPoliceBenchmark.LAP_DISTANCE_M
         prevLapCumulativeSec = 0.0
+        lastGpsDistanceContributionMs = -100_000L
         lastStepCountForFallback = signalProcessor.totalSteps
         lastAnnouncedState = gaitClassifier.currentState()
 
@@ -439,6 +444,19 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             }
         }
 
+        if (canReadSteps && !stepCounterRegistered) {
+            val stepCounter = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+            if (stepCounter != null) {
+                lastStepCounterHwValue = null
+                stepCounterRegistered = sensorManager.registerListener(
+                    this,
+                    stepCounter,
+                    SensorManager.SENSOR_DELAY_FASTEST,
+                    0
+                )
+            }
+        }
+
         // Use physical hardware TYPE_ACCELEROMETER (with maxReportLatencyUs = 0) so events continue
         // uninterrupted when the screen turns off in a pocket (virtual TYPE_LINEAR_ACCELERATION uses
         // gyroscope on many OEMs and can pause on screen-off).
@@ -493,6 +511,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         runCatching { locationManager.removeUpdates(this) }
         accelRegistered = false
         stepDetectorRegistered = false
+        stepCounterRegistered = false
+        lastStepCounterHwValue = null
         locationRegistered = false
     }
 
@@ -502,6 +522,17 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             Sensor.TYPE_STEP_DETECTOR -> {
                 val steps = event.values.firstOrNull()?.toInt()?.coerceAtLeast(1) ?: 1
                 signalProcessor.onHardwareStepDetected(nowMs, steps)
+            }
+            Sensor.TYPE_STEP_COUNTER -> {
+                val cumulative = event.values.firstOrNull()?.toDouble() ?: return
+                val prevHw = lastStepCounterHwValue
+                if (prevHw != null && cumulative > prevHw) {
+                    val hwDelta = (cumulative - prevHw).toInt()
+                    val alreadyCounted = (signalProcessor.totalSteps - stepsAtLastStepCounter).coerceAtLeast(0)
+                    signalProcessor.reconcileStepCounterDelta(nowMs, hwDelta, alreadyCounted)
+                }
+                lastStepCounterHwValue = cumulative
+                stepsAtLastStepCounter = signalProcessor.totalSteps
             }
             Sensor.TYPE_LINEAR_ACCELERATION -> {
                 signalProcessor.onAccelerationSample(
@@ -553,11 +584,14 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
             lastLocationElapsedMs = nowElapsed
 
-            // Accumulate GPS distance ONLY when recording AND in genuine human movement (never Bike/Vehicle or Standing)
+            // Accumulate GPS distance when recording and genuinely moving on foot (never Bike/Vehicle)
             val minMoveFloor = max(1.2, (location.accuracy * 0.22).toDouble())
             if (isRecording && deltaMeters >= minMoveFloor) {
-                if (gaitClassifier.currentState().countsAsActiveMovement) {
-                    addDistanceDelta(deltaMeters)
+                val curState = gaitClassifier.currentState()
+                val activeCadence = signalProcessor.getCadenceSpm(nowElapsed) >= GaitClassifier.MIN_WALKING_CADENCE_SPM
+                if (curState != MotionState.VEHICLE && (curState.countsAsActiveMovement || activeCadence)) {
+                    addDistanceDelta(deltaMeters, allowDuringWarmup = activeCadence)
+                    lastGpsDistanceContributionMs = nowElapsed
                 }
                 lastValidLocation = location
                 lastValidLocationElapsedMs = nowElapsed
@@ -620,10 +654,13 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             onMotionStateChanged(previousState, state, nowMs)
         }
 
+        val gpsActivelyMeasuringDistance =
+            lastGpsDistanceContributionMs > 0L && (nowMs - lastGpsDistanceContributionMs) <= 4000L
         val stepSpeedMps = gaitClassifier.estimateSpeedFromStepsMps(cadenceSpm, accelRms)
         val effectiveSpeedMps = when {
             !state.countsAsActiveMovement -> 0.0
-            gpsFresh && smoothedGpsSpeedMps > 0.25 -> smoothedGpsSpeedMps
+            gpsActivelyMeasuringDistance && smoothedGpsSpeedMps > 0.55 -> smoothedGpsSpeedMps
+            gpsFresh && smoothedGpsSpeedMps > stepSpeedMps -> smoothedGpsSpeedMps
             else -> stepSpeedMps
         }
 
@@ -641,14 +678,17 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         }
 
         if (isRecording) {
-            // Indoor / pre-GPS-lock step-stride distance fallback
+            // Hybrid Step-Stride Distance: counts every real step whenever GPS hasn't actively contributed
+            // outdoor displacement in the last 4s (handles indoor testing, weak GPS, and stationary Wi-Fi FUSED_PROVIDER!)
             val currentSteps = signalProcessor.totalSteps
             val newSteps = (currentSteps - lastStepCountForFallback).coerceAtLeast(0)
             lastStepCountForFallback = currentSteps
 
-            if (!gpsFresh && repository.indoorStepFallbackEnabled && newSteps > 0 && state.countsAsActiveMovement) {
-                val strideM = gaitClassifier.estimateStrideLengthMeters(cadenceSpm, accelRms)
-                addDistanceDelta(newSteps * strideM)
+            val onFootNow = state != MotionState.VEHICLE &&
+                (state.countsAsActiveMovement || cadenceSpm >= GaitClassifier.MIN_WALKING_CADENCE_SPM)
+            if (!gpsActivelyMeasuringDistance && repository.indoorStepFallbackEnabled && newSteps > 0 && onFootNow) {
+                val strideM = gaitClassifier.estimateStrideLengthMeters(cadenceSpm.coerceAtLeast(85.0), accelRms)
+                addDistanceDelta(newSteps * strideM, allowDuringWarmup = true)
             }
 
             if (state.countsAsActiveMovement) {
@@ -678,16 +718,18 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         broadcastTelemetry(effectiveSpeedMps, gpsFresh, cadenceSpm, accelRms)
     }
 
-    private fun addDistanceDelta(deltaM: Double) {
+    private fun addDistanceDelta(deltaM: Double, allowDuringWarmup: Boolean = false) {
         if (deltaM <= 0.0 || !isRecording) return
         val state = gaitClassifier.currentState()
-        if (!state.countsAsActiveMovement) return
+        if (state == MotionState.VEHICLE) return
+        if (!state.countsAsActiveMovement && !allowDuringWarmup) return
         distanceMeters += deltaM
         when (state) {
             MotionState.RUNNING, MotionState.TARGET_PACE -> runningMeters += deltaM
             MotionState.JOGGING -> joggingMeters += deltaM
             MotionState.WALKING -> walkingMeters += deltaM
-            MotionState.STANDING, MotionState.VEHICLE -> Unit
+            MotionState.STANDING -> walkingMeters += deltaM
+            MotionState.VEHICLE -> Unit
         }
 
         // Record 400m splits
@@ -977,7 +1019,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         totalSteps = signalProcessor.totalSteps,
         gpsAccuracyMeters = latestGpsAccuracyM,
         isGpsLocked = gpsFresh,
-        hasHardwareStepSensor = hasHardwareStepDetector,
+        hasHardwareStepSensor = signalProcessor.isReceivingHardwareSteps(SystemClock.elapsedRealtime()),
         runningSec = runningSec,
         joggingSec = joggingSec,
         walkingSec = walkingSec,

@@ -24,8 +24,8 @@ class GaitClassifier(
         const val MAX_HUMAN_RUNNING_SPEED_MPS = 7.50 // ~27.0 km/h — faster than this is unconditionally a bike/vehicle!
         const val MIN_WALKING_CADENCE_SPM = 68.0     // rejects random hand movement / chair shifting
 
-        const val STANDING_TO_WALK_DEBOUNCE_MS = 2200L
-        const val VEHICLE_DEBOUNCE_MS = 1800L
+        const val STANDING_TO_WALK_DEBOUNCE_MS = 1800L
+        const val VEHICLE_DEBOUNCE_MS = 3000L
         const val UPGRADE_DEBOUNCE_MS = 1400L
         const val DOWNGRADE_DEBOUNCE_MS = 2000L
     }
@@ -102,9 +102,9 @@ class GaitClassifier(
             // Fuse GPS ground speed with cadence-implied speed; never let a stationary indoor/lagging GPS
             // fix (0.0 m/s) crush unmistakable active footstrikes in a pocket.
             val fusedSpeed = when {
-                gps < 0.85 && dynamicAccelRms >= 0.85 ->
+                gps < 0.85 && dynamicAccelRms >= 0.55 ->
                     maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.94 * impliedStepSpeed)
-                impliedStepSpeed > gps * 1.45 && dynamicAccelRms >= 3.5 ->
+                impliedStepSpeed > gps * 1.45 && dynamicAccelRms >= 3.2 ->
                     maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.88 * impliedStepSpeed)
                 else ->
                     0.78 * gps + 0.22 * impliedStepSpeed
@@ -122,11 +122,11 @@ class GaitClassifier(
         }
 
         // Indoor / pre-GPS-lock path: require genuine rhythmic step cadence (>= 68 spm) + footstrike impact
-        if (!hasRhythmicSteps || dynamicAccelRms < 0.75) {
+        if (!hasRhythmicSteps || dynamicAccelRms < 0.55) {
             return MotionState.STANDING
         }
-        // Reject pure high-frequency engine/table buzz that lacks < 4 Hz vertical body oscillation
-        if (peakToTroughNorm != null && peakToTroughNorm < 2.0) {
+        // Reject pure high-frequency engine/table buzz that lacks < 5 Hz vertical body oscillation
+        if (peakToTroughNorm != null && peakToTroughNorm < 1.55) {
             return MotionState.STANDING
         }
         // Without GPS, prevent seated bike vibration (no <= 6.4 m/s^2 flight unloading) from faking Jogging/Running
@@ -210,8 +210,12 @@ class GaitClassifier(
 }
 
 /**
- * Sliding-window step cadence tracker + 3-axis accelerometer step peak fallback
- * for devices without a dedicated hardware TYPE_STEP_DETECTOR sensor.
+ * Sliding-window step cadence tracker + hybrid hardware/software pedometer:
+ *  - Uses hardware TYPE_STEP_DETECTOR / TYPE_STEP_COUNTER whenever real hardware step events arrive.
+ *  - Automatically falls back within 2.8s to an orientation-invariant bipolar gait-band accelerometer
+ *    pedometer whenever a device lacks TYPE_STEP_DETECTOR or its OEM sensor hub emits 0 events!
+ *  - Uses a 3-step rhythmic confirmation buffer on software steps so sitting/tilting/bumping the phone
+ *    produces 0 false steps, while real walking/jogging/running counts every step cleanly.
  */
 class MotionSignalProcessor {
     private data class AccelFrame(
@@ -222,46 +226,69 @@ class MotionSignalProcessor {
 
     private val stepTimestampsMs = ArrayDeque<Long>()
     private val accelSamples = ArrayDeque<AccelFrame>()
+    private val pendingSoftwareStepMs = ArrayDeque<Long>()
 
     /**
-     * When true, Android's dedicated hardware TYPE_STEP_DETECTOR sensor is active, so software
-     * accelerometer peak step synthesis is disabled to prevent hand/phone gestures while sitting
-     * or bike vibration from registering as fake steps.
+     * Kept for diagnostic compatibility; software step detection is NEVER permanently disabled by registration
+     * alone — it only yields while real hardware step events were actually received in the last 2.8 seconds!
      */
     var hardwareStepSensorAvailable: Boolean = false
 
-    // Orientation-invariant scalar gravity norm (immune to tilting/rotating the phone in hand!)
-    private var gravityNorm = 9.81
+    private var lastActualHardwareStepMs: Long = -100_000L
+
+    // Orientation-invariant scalar baseline + 2-pole ~4.8 Hz gait-band filter
+    private var baselineNorm = 9.81
     private var gaitNorm1 = 9.81
     private var gaitNorm2 = 9.81
-    private var gravityInitialized = false
+    private var filterInitialized = false
 
-    // 5 Hz gait-band low-pass filter to attenuate 15-50 Hz motorcycle engine & road buzz
-    private var filteredDynamicMag = 0.0
-    private var prevDynamicMag = 0.0
-    private var rising = false
-    private var lastAccelStepMs = -10_000L
+    // Bipolar peak-and-trough cycle state for accurate software pedometer
+    private var awaitingTrough = false
+    private var cyclePeakDelta = 0.0
+    private var cyclePeakTimeMs = -10_000L
+    private var lastConfirmedSwStepMs = -10_000L
 
     var totalSteps: Int = 0
         private set
 
+    fun isReceivingHardwareSteps(nowMs: Long): Boolean =
+        (nowMs - lastActualHardwareStepMs) in 0L..5000L
+
     fun reset() {
         stepTimestampsMs.clear()
         accelSamples.clear()
-        gravityNorm = 9.81
+        pendingSoftwareStepMs.clear()
+        lastActualHardwareStepMs = -100_000L
+        baselineNorm = 9.81
         gaitNorm1 = 9.81
         gaitNorm2 = 9.81
-        gravityInitialized = false
-        filteredDynamicMag = 0.0
-        prevDynamicMag = 0.0
-        rising = false
-        lastAccelStepMs = -10_000L
+        filterInitialized = false
+        awaitingTrough = false
+        cyclePeakDelta = 0.0
+        cyclePeakTimeMs = -10_000L
+        lastConfirmedSwStepMs = -10_000L
         totalSteps = 0
     }
 
     fun onHardwareStepDetected(nowMs: Long, count: Int = 1) {
-        totalSteps += count.coerceIn(1, 6)
+        lastActualHardwareStepMs = nowMs
+        pendingSoftwareStepMs.clear()
+        totalSteps += count.coerceIn(1, 12)
         recordStepTimestamp(nowMs)
+        pruneOld(nowMs)
+    }
+
+    /**
+     * Reconciles cumulative Sensor.TYPE_STEP_COUNTER deltas without double-counting steps already
+     * captured by TYPE_STEP_DETECTOR or the accelerometer pedometer.
+     */
+    fun reconcileStepCounterDelta(nowMs: Long, hwDeltaSteps: Int, stepsCountedSinceLastCounter: Int) {
+        if (hwDeltaSteps <= 0) return
+        val missing = (hwDeltaSteps - stepsCountedSinceLastCounter).coerceIn(0, 12)
+        if (missing > 0) {
+            totalSteps += missing
+            recordStepTimestamp(nowMs)
+        }
         pruneOld(nowMs)
     }
 
@@ -270,8 +297,8 @@ class MotionSignalProcessor {
         if (prev != null) {
             val gap = nowMs - prev
             if (gap < 220L) return // ignore duplicate burst event on same footstrike
-            if (gap > 1500L) {
-                // Gap > 1.5s (< 40 spm) breaks any continuous stride — start fresh burst from step 1
+            if (gap > 1650L) {
+                // Gap > 1.65s (< 36 spm) breaks any continuous stride — start fresh burst from step 1
                 stepTimestampsMs.clear()
             }
         }
@@ -280,9 +307,10 @@ class MotionSignalProcessor {
 
     /**
      * Feeds either linear acceleration (already gravity-free) or raw accelerometer (with gravity).
-     * Uses orientation-invariant scalar magnitude | ||a||_gait - g | when gravity is included so:
-     *  - tilting/rotating/scrolling the phone while sitting produces ~0 dynamic impulse, and
-     *  - 15-50 Hz motorcycle engine & asphalt buzz cancels out BEFORE rectification instead of faking running RMS!
+     * Uses orientation-invariant scalar norm filtered through a 2-pole ~4.8 Hz gait filter so:
+     *  - tilting/rotating/scrolling the phone while sitting produces ~0 dynamic impulse (0 steps),
+     *  - 20-40 Hz motorcycle engine & asphalt buzz cancels out BEFORE rectification, and
+     *  - walking (even holding the phone in hand), jogging, and running detect every bipolar step!
      */
     fun onAccelerationSample(
         nowMs: Long,
@@ -296,24 +324,22 @@ class MotionSignalProcessor {
                 ay.toDouble() * ay.toDouble() +
                 az.toDouble() * az.toDouble()
         )
-        val mag = if (includesGravity) {
-            if (!gravityInitialized) {
-                gravityNorm = rawNorm
-                gaitNorm1 = rawNorm
-                gaitNorm2 = rawNorm
-                gravityInitialized = true
-            } else {
-                gravityNorm = 0.94 * gravityNorm + 0.06 * rawNorm
-                // 2-pole ~3.8 Hz gait-band filter: passes 1.5-3.5 Hz footsteps while rejecting >90% of 20 Hz engine buzz
-                gaitNorm1 = 0.58 * gaitNorm1 + 0.42 * rawNorm
-                gaitNorm2 = 0.58 * gaitNorm2 + 0.42 * gaitNorm1
-            }
-            abs(gaitNorm2 - gravityNorm)
+
+        if (!filterInitialized) {
+            baselineNorm = rawNorm
+            gaitNorm1 = rawNorm
+            gaitNorm2 = rawNorm
+            filterInitialized = true
         } else {
-            rawNorm
+            baselineNorm = 0.94 * baselineNorm + 0.06 * rawNorm
+            // 2-pole ~4.8 Hz gait filter: passes >90% of walking/running steps while rejecting ~89% of 25 Hz bike buzz
+            gaitNorm1 = 0.50 * gaitNorm1 + 0.50 * rawNorm
+            gaitNorm2 = 0.50 * gaitNorm2 + 0.50 * gaitNorm1
         }
 
-        filteredDynamicMag = 0.52 * filteredDynamicMag + 0.48 * mag
+        val gaitDelta = gaitNorm2 - baselineNorm
+        val mag = if (includesGravity) abs(gaitDelta) else gaitNorm2.coerceAtLeast(0.0)
+
         accelSamples.addLast(
             AccelFrame(
                 timestampMs = nowMs,
@@ -323,37 +349,85 @@ class MotionSignalProcessor {
         )
         pruneOld(nowMs)
 
-        // Software step peak detector ONLY runs on devices that lack a hardware TYPE_STEP_DETECTOR sensor
+        // Software pedometer runs automatically whenever hardware TYPE_STEP_DETECTOR hasn't delivered
+        // a real step in the last 2.8 seconds (fixes OEM phones where TYPE_STEP_DETECTOR is silent!).
         var detectedStep = false
-        if (!hardwareStepSensorAvailable) {
-            val minStepIntervalMs = 280L // max ~214 steps/min
-            val peakThreshold = 2.45     // m/s^2 gait-band vertical impact peak
-            if (filteredDynamicMag > prevDynamicMag) {
-                rising = true
-            } else if (rising && prevDynamicMag >= peakThreshold && (nowMs - lastAccelStepMs) >= minStepIntervalMs) {
-                rising = false
-                lastAccelStepMs = nowMs
-                recordStepTimestamp(nowMs)
-                totalSteps++
-                detectedStep = true
-            } else if (filteredDynamicMag < prevDynamicMag) {
-                rising = false
+        val hardwareActivelyFiring = (nowMs - lastActualHardwareStepMs) in 0L..2800L
+        if (!hardwareActivelyFiring) {
+            val minStepIntervalMs = 250L // up to 240 spm sprint
+            val peakArmThreshold = 0.92  // m/s^2 upward footstrike compression above baseline
+            val troughConfirmThreshold = -0.42 // m/s^2 unloading dip below baseline
+            val minPeakToTroughSwing = 1.60    // m/s^2 total bipolar step swing
+
+            if (!awaitingTrough) {
+                if (gaitDelta >= peakArmThreshold) {
+                    awaitingTrough = true
+                    cyclePeakDelta = gaitDelta
+                    cyclePeakTimeMs = nowMs
+                }
+            } else {
+                if (gaitDelta > cyclePeakDelta) {
+                    cyclePeakDelta = gaitDelta
+                    cyclePeakTimeMs = nowMs
+                } else if (nowMs - cyclePeakTimeMs > 900L) {
+                    // Timed out without an unloading trough (e.g., slow one-way hand lift) -> disarm
+                    awaitingTrough = false
+                    cyclePeakDelta = 0.0
+                } else if (
+                    gaitDelta <= troughConfirmThreshold &&
+                    (cyclePeakDelta - gaitDelta) >= minPeakToTroughSwing &&
+                    (nowMs - lastConfirmedSwStepMs) >= minStepIntervalMs
+                ) {
+                    awaitingTrough = false
+                    cyclePeakDelta = 0.0
+                    lastConfirmedSwStepMs = nowMs
+                    detectedStep = registerSoftwareStepCandidate(nowMs)
+                }
             }
         }
-        prevDynamicMag = filteredDynamicMag
         return detectedStep
+    }
+
+    private fun registerSoftwareStepCandidate(nowMs: Long): Boolean {
+        val prevPending = pendingSoftwareStepMs.lastOrNull()
+        if (prevPending != null && (nowMs - prevPending) > 1550L) {
+            // Isolated bump > 1.55s ago was not part of a walk -> discard it!
+            pendingSoftwareStepMs.clear()
+        }
+
+        // If already in an active confirmed stride (last confirmed step <= 1550ms ago and >= 3 steps in window),
+        // count every subsequent step immediately with zero lag!
+        val lastConfirmed = stepTimestampsMs.lastOrNull()
+        if (lastConfirmed != null && (nowMs - lastConfirmed) <= 1550L && stepTimestampsMs.size >= 3) {
+            pendingSoftwareStepMs.clear()
+            recordStepTimestamp(nowMs)
+            totalSteps++
+            return true
+        }
+
+        pendingSoftwareStepMs.addLast(nowMs)
+        if (pendingSoftwareStepMs.size >= 3) {
+            // 3 consecutive rhythmic footsteps confirmed -> flush all 3 steps into totalSteps!
+            while (pendingSoftwareStepMs.isNotEmpty()) {
+                val ts = pendingSoftwareStepMs.removeFirst()
+                recordStepTimestamp(ts)
+                totalSteps++
+            }
+            return true
+        }
+        return false
     }
 
     fun getCadenceSpm(nowMs: Long): Double {
         pruneOld(nowMs)
         val totalCount = stepTimestampsMs.size
-        // Require at least 4 consecutive unbroken footsteps before reporting any walking/running cadence!
-        if (totalCount < 4) return 0.0
+        // Require at least 3 consecutive rhythmic footsteps before reporting cadence
+        if (totalCount < 3) return 0.0
 
         val lastMs = stepTimestampsMs.last()
         val silenceMs = nowMs - lastMs
         val recentRms = getDynamicAccelRms(nowMs)
-        if (silenceMs > 1900L || (silenceMs > 1400L && recentRms < 0.75)) {
+        if (silenceMs > 2400L || (silenceMs > 1600L && recentRms < 0.55)) {
             return 0.0
         }
 
@@ -377,7 +451,7 @@ class MotionSignalProcessor {
         }
         val stdDevMs = sqrt(varianceSum / intervalsMs.size)
         val coeffOfVariation = stdDevMs / meanPeriodMs
-        if (coeffOfVariation > 0.36) {
+        if (coeffOfVariation > 0.38) {
             return 0.0
         }
 
