@@ -1,8 +1,8 @@
 {
-    "versionCode":  5,
-    "versionName":  "1.0.4",
+    "versionCode":  6,
+    "versionName":  "1.0.5",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "d23f1c613db29d5a5b6725b68066dc4ec635447689e6958e897928fb8b7bb3b6",
-    "changelog":  "Fixed Standing-to-Walking oversensitivity: uses rotation-invariant gravity filtering, disables software step synthesis when hardware step sensor is active, requires \u003e=4 rhythmic footsteps (\u003e=68 spm), and rejects indoor GPS drift while sitting/holding phone.",
-    "publishedAt":  "2026-10-25T17:08:14Z"
+    "sha256":  "167f3d8fc82e1b5f346be1b50ffe594b6aa6438a9e52abd84cdfd6700a347ee5",
+    "changelog":  "Added 4-layer Bike \u0026 Vehicle rejection: riding a bike, scooter, or car is now detected and ignored instead of counting as Running.",
+    "publishedAt":  "2026-10-25T17:23:11Z"
 }

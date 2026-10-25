@@ -20,9 +20,12 @@ class GaitClassifier(
         const val DEFAULT_WALKING_SPEED_MPS = 0.75   // ~2.7 km/h real walking speed
         const val DEFAULT_JOGGING_SPEED_MPS = 1.85   // ~6.66 km/h (9:00 /km)
         const val DEFAULT_RUNNING_SPEED_MPS = 3.05   // ~10.98 km/h (5:28 /km)
+        const val SPRINT_VERIFICATION_SPEED_MPS = 5.60 // ~20.2 km/h — requires true sprint cadence & impact
+        const val MAX_HUMAN_RUNNING_SPEED_MPS = 7.50 // ~27.0 km/h — faster than this is unconditionally a bike/vehicle!
         const val MIN_WALKING_CADENCE_SPM = 68.0     // rejects random hand movement / chair shifting
 
         const val STANDING_TO_WALK_DEBOUNCE_MS = 2200L
+        const val VEHICLE_DEBOUNCE_MS = 1800L
         const val UPGRADE_DEBOUNCE_MS = 1400L
         const val DOWNGRADE_DEBOUNCE_MS = 2000L
     }
@@ -41,11 +44,19 @@ class GaitClassifier(
 
     /**
      * Stateless instant classification from physical metrics before temporal debounce.
+     * Distinguishes human gait (Standing / Walking / Jogging / Running / Target Pace) from
+     * riding a Bike / Scooter / Vehicle using 4 biomechanical invariants:
+     *  1. Speed ceiling (> 6.6 m/s = 23.8 km/h -> VEHICLE)
+     *  2. Moving GPS speed (>= 2.1 m/s) with zero rhythmic footsteps -> VEHICLE
+     *  3. Implied GPS stride length > 1.95 m/step (or >= 2.6 m/s with cadence < 122 spm) -> VEHICLE
+     *  4. Seated saddle gravity profile (no < 6.4 m/s^2 aerial unloading trough while moving >= 2.6 m/s) -> VEHICLE
      */
     fun classifyInstant(
         gpsSpeedMps: Double?,
         cadenceSpm: Double,
-        dynamicAccelRms: Double
+        dynamicAccelRms: Double,
+        minRawNorm: Double? = null,
+        peakToTroughNorm: Double? = null
     ): MotionState {
         val hasValidGps = gpsSpeedMps != null && gpsSpeedMps.isFinite() && gpsSpeedMps >= 0.0
         val hasRhythmicSteps = cadenceSpm >= MIN_WALKING_CADENCE_SPM
@@ -53,11 +64,37 @@ class GaitClassifier(
 
         if (hasValidGps) {
             val gps = gpsSpeedMps!!
-            // Sitting / hand-use / indoor GPS multipath rejection:
-            // Without rhythmic footsteps (>= 68 spm), ignore indoor GPS wander (< 2.2 m/s) and phone handling!
-            if (!hasRhythmicSteps && (gps < 2.20 || dynamicAccelRms < 2.20)) {
-                return MotionState.STANDING
+
+            // Layer 1: Above human distance-running speed ceiling -> Bike / Vehicle
+            if (gps > MAX_HUMAN_RUNNING_SPEED_MPS) {
+                return MotionState.VEHICLE
             }
+            if (gps > SPRINT_VERIFICATION_SPEED_MPS && (cadenceSpm < 170.0 || dynamicAccelRms < 7.0)) {
+                return MotionState.VEHICLE
+            }
+
+            // Layer 2: Moving without rhythmic footsteps:
+            //  - >= 2.10 m/s (7.6 km/h+) without footsteps = Bike / Scooter / Car
+            //  - < 2.10 m/s without footsteps = Sitting / Standing / Indoor GPS wander
+            if (!hasRhythmicSteps) {
+                return if (gps >= 2.10) MotionState.VEHICLE else MotionState.STANDING
+            }
+
+            // Layer 3: Biomechanical stride-length check (catches bumpy roads faking occasional steps on a bike)
+            val impliedGpsStrideM = gps / (cadenceSpm / 60.0)
+            if (gps >= 2.50 && (impliedGpsStrideM > 1.95 || cadenceSpm < 122.0)) {
+                return MotionState.VEHICLE
+            }
+
+            // Layer 4: Seated saddle vs airborne human running check when gait-band 1g gravity norm is available:
+            // Human jogging/running (>= 2.3 m/s) unloads the body into aerial flight (||a|| dips <= 6.4 m/s^2
+            // with peak-to-trough swing >= 9.2 m/s^2), whereas riding a bike stays seated around ~9.8 m/s^2.
+            if (gps >= 2.30 && minRawNorm != null && peakToTroughNorm != null) {
+                if (minRawNorm > 6.4 && peakToTroughNorm < 9.2) {
+                    return MotionState.VEHICLE
+                }
+            }
+
             if (gps < DEFAULT_WALKING_SPEED_MPS && cadenceSpm < 74.0 && dynamicAccelRms < 0.85) {
                 return MotionState.STANDING
             }
@@ -65,13 +102,12 @@ class GaitClassifier(
             // Fuse GPS ground speed with cadence-implied speed; never let a stationary indoor/lagging GPS
             // fix (0.0 m/s) crush unmistakable active footstrikes in a pocket.
             val fusedSpeed = when {
-                hasRhythmicSteps && gps < 0.85 && dynamicAccelRms >= 0.85 ->
+                gps < 0.85 && dynamicAccelRms >= 0.85 ->
                     maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.94 * impliedStepSpeed)
-                hasRhythmicSteps && impliedStepSpeed > gps * 1.45 && dynamicAccelRms >= 3.5 ->
+                impliedStepSpeed > gps * 1.45 && dynamicAccelRms >= 3.5 ->
                     maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.88 * impliedStepSpeed)
-                hasRhythmicSteps ->
+                else ->
                     0.78 * gps + 0.22 * impliedStepSpeed
-                else -> gps
             }
 
             return when {
@@ -86,8 +122,18 @@ class GaitClassifier(
         }
 
         // Indoor / pre-GPS-lock path: require genuine rhythmic step cadence (>= 68 spm) + footstrike impact
-        // so holding, tilting, or moving the phone while sitting never triggers WALKING.
         if (!hasRhythmicSteps || dynamicAccelRms < 0.75) {
+            return MotionState.STANDING
+        }
+        // Reject pure high-frequency engine/table buzz that lacks < 4 Hz vertical body oscillation
+        if (peakToTroughNorm != null && peakToTroughNorm < 2.0) {
+            return MotionState.STANDING
+        }
+        // Without GPS, prevent seated bike vibration (no <= 6.4 m/s^2 flight unloading) from faking Jogging/Running
+        // while preserving normal indoor walking (which naturally stays > 6.4 m/s^2 at 68..127 spm).
+        val seatedVibrationWithoutFlight = minRawNorm != null && peakToTroughNorm != null &&
+            minRawNorm > 6.4 && peakToTroughNorm < 9.0
+        if (seatedVibrationWithoutFlight && cadenceSpm >= 128.0) {
             return MotionState.STANDING
         }
         return when {
@@ -106,9 +152,11 @@ class GaitClassifier(
         nowMs: Long,
         gpsSpeedMps: Double?,
         cadenceSpm: Double,
-        dynamicAccelRms: Double
+        dynamicAccelRms: Double,
+        minRawNorm: Double? = null,
+        peakToTroughNorm: Double? = null
     ): MotionState {
-        val raw = classifyInstant(gpsSpeedMps, cadenceSpm, dynamicAccelRms)
+        val raw = classifyInstant(gpsSpeedMps, cadenceSpm, dynamicAccelRms, minRawNorm, peakToTroughNorm)
         if (raw == committedState) {
             candidateState = raw
             candidateSinceMs = nowMs
@@ -122,8 +170,9 @@ class GaitClassifier(
         }
 
         val requiredHoldMs = when {
+            raw == MotionState.VEHICLE -> VEHICLE_DEBOUNCE_MS
             committedState == MotionState.STANDING && raw == MotionState.WALKING -> STANDING_TO_WALK_DEBOUNCE_MS
-            raw.ordinal > committedState.ordinal -> UPGRADE_DEBOUNCE_MS
+            raw.intensityRank > committedState.intensityRank -> UPGRADE_DEBOUNCE_MS
             else -> DOWNGRADE_DEBOUNCE_MS
         }
 
@@ -165,20 +214,30 @@ class GaitClassifier(
  * for devices without a dedicated hardware TYPE_STEP_DETECTOR sensor.
  */
 class MotionSignalProcessor {
+    private data class AccelFrame(
+        val timestampMs: Long,
+        val dynamicMag: Double,
+        val rawGravityNorm: Double?
+    )
+
     private val stepTimestampsMs = ArrayDeque<Long>()
-    private val accelSamples = ArrayDeque<Pair<Long, Double>>()
+    private val accelSamples = ArrayDeque<AccelFrame>()
 
     /**
      * When true, Android's dedicated hardware TYPE_STEP_DETECTOR sensor is active, so software
      * accelerometer peak step synthesis is disabled to prevent hand/phone gestures while sitting
-     * from registering as fake steps.
+     * or bike vibration from registering as fake steps.
      */
     var hardwareStepSensorAvailable: Boolean = false
 
     // Orientation-invariant scalar gravity norm (immune to tilting/rotating the phone in hand!)
     private var gravityNorm = 9.81
+    private var gaitNorm1 = 9.81
+    private var gaitNorm2 = 9.81
     private var gravityInitialized = false
 
+    // 5 Hz gait-band low-pass filter to attenuate 15-50 Hz motorcycle engine & road buzz
+    private var filteredDynamicMag = 0.0
     private var prevDynamicMag = 0.0
     private var rising = false
     private var lastAccelStepMs = -10_000L
@@ -190,7 +249,10 @@ class MotionSignalProcessor {
         stepTimestampsMs.clear()
         accelSamples.clear()
         gravityNorm = 9.81
+        gaitNorm1 = 9.81
+        gaitNorm2 = 9.81
         gravityInitialized = false
+        filteredDynamicMag = 0.0
         prevDynamicMag = 0.0
         rising = false
         lastAccelStepMs = -10_000L
@@ -218,8 +280,9 @@ class MotionSignalProcessor {
 
     /**
      * Feeds either linear acceleration (already gravity-free) or raw accelerometer (with gravity).
-     * Uses orientation-invariant scalar magnitude | ||a|| - g | when gravity is included so tilting,
-     * rotating, or scrolling on the phone while sitting produces ~0 dynamic impulse.
+     * Uses orientation-invariant scalar magnitude | ||a||_gait - g | when gravity is included so:
+     *  - tilting/rotating/scrolling the phone while sitting produces ~0 dynamic impulse, and
+     *  - 15-50 Hz motorcycle engine & asphalt buzz cancels out BEFORE rectification instead of faking running RMS!
      */
     fun onAccelerationSample(
         nowMs: Long,
@@ -236,24 +299,36 @@ class MotionSignalProcessor {
         val mag = if (includesGravity) {
             if (!gravityInitialized) {
                 gravityNorm = rawNorm
+                gaitNorm1 = rawNorm
+                gaitNorm2 = rawNorm
                 gravityInitialized = true
             } else {
-                gravityNorm = 0.92 * gravityNorm + 0.08 * rawNorm
+                gravityNorm = 0.94 * gravityNorm + 0.06 * rawNorm
+                // 2-pole ~3.8 Hz gait-band filter: passes 1.5-3.5 Hz footsteps while rejecting >90% of 20 Hz engine buzz
+                gaitNorm1 = 0.58 * gaitNorm1 + 0.42 * rawNorm
+                gaitNorm2 = 0.58 * gaitNorm2 + 0.42 * gaitNorm1
             }
-            abs(rawNorm - gravityNorm)
+            abs(gaitNorm2 - gravityNorm)
         } else {
             rawNorm
         }
 
-        accelSamples.addLast(nowMs to mag)
+        filteredDynamicMag = 0.52 * filteredDynamicMag + 0.48 * mag
+        accelSamples.addLast(
+            AccelFrame(
+                timestampMs = nowMs,
+                dynamicMag = mag,
+                rawGravityNorm = if (includesGravity) gaitNorm2 else null
+            )
+        )
         pruneOld(nowMs)
 
         // Software step peak detector ONLY runs on devices that lack a hardware TYPE_STEP_DETECTOR sensor
         var detectedStep = false
         if (!hardwareStepSensorAvailable) {
             val minStepIntervalMs = 280L // max ~214 steps/min
-            val peakThreshold = 2.45     // m/s^2 vertical impact peak (ignores hand gestures while sitting)
-            if (mag > prevDynamicMag) {
+            val peakThreshold = 2.45     // m/s^2 gait-band vertical impact peak
+            if (filteredDynamicMag > prevDynamicMag) {
                 rising = true
             } else if (rising && prevDynamicMag >= peakThreshold && (nowMs - lastAccelStepMs) >= minStepIntervalMs) {
                 rising = false
@@ -261,11 +336,11 @@ class MotionSignalProcessor {
                 recordStepTimestamp(nowMs)
                 totalSteps++
                 detectedStep = true
-            } else if (mag < prevDynamicMag) {
+            } else if (filteredDynamicMag < prevDynamicMag) {
                 rising = false
             }
         }
-        prevDynamicMag = mag
+        prevDynamicMag = filteredDynamicMag
         return detectedStep
     }
 
@@ -294,7 +369,7 @@ class MotionSignalProcessor {
         }
         val meanPeriodMs = (sumMs / intervalsMs.size).coerceAtLeast(240.0)
 
-        // Reject irregular / non-rhythmic phone shaking or hand taps (real human gait has low period variance)
+        // Reject irregular / non-rhythmic road bumps or hand taps (human gait has tight stride regularity)
         var varianceSum = 0.0
         for (dt in intervalsMs) {
             val diff = dt - meanPeriodMs
@@ -302,7 +377,7 @@ class MotionSignalProcessor {
         }
         val stdDevMs = sqrt(varianceSum / intervalsMs.size)
         val coeffOfVariation = stdDevMs / meanPeriodMs
-        if (coeffOfVariation > 0.42) {
+        if (coeffOfVariation > 0.36) {
             return 0.0
         }
 
@@ -318,17 +393,47 @@ class MotionSignalProcessor {
 
     fun getDynamicAccelRms(nowMs: Long): Double {
         pruneOld(nowMs)
-        val recent = accelSamples.filter { nowMs - it.first <= 1500L }
+        val recent = accelSamples.filter { nowMs - it.timestampMs <= 1500L }
         if (recent.isEmpty()) return 0.0
-        val meanSq = recent.sumOf { it.second * it.second } / recent.size
+        val meanSq = recent.sumOf { it.dynamicMag * it.dynamicMag } / recent.size
         return sqrt(meanSq)
+    }
+
+    /**
+     * Minimum total 3D acceleration norm (m/s^2) in the last 1.5s when gravity is included.
+     * Airborne running dips < 5.5 m/s^2 during flight phase; seated bike riding stays near ~7-10 m/s^2.
+     */
+    fun getMinRawNorm(nowMs: Long): Double? {
+        pruneOld(nowMs)
+        var minVal: Double? = null
+        for (frame in accelSamples) {
+            if (nowMs - frame.timestampMs <= 1500L && frame.rawGravityNorm != null) {
+                val v = frame.rawGravityNorm
+                if (minVal == null || v < minVal) minVal = v
+            }
+        }
+        return minVal
+    }
+
+    fun getPeakToTroughNorm(nowMs: Long): Double? {
+        pruneOld(nowMs)
+        var minVal: Double? = null
+        var maxVal: Double? = null
+        for (frame in accelSamples) {
+            if (nowMs - frame.timestampMs <= 1500L && frame.rawGravityNorm != null) {
+                val v = frame.rawGravityNorm
+                if (minVal == null || v < minVal) minVal = v
+                if (maxVal == null || v > maxVal) maxVal = v
+            }
+        }
+        return if (minVal != null && maxVal != null) (maxVal - minVal) else null
     }
 
     private fun pruneOld(nowMs: Long) {
         while (stepTimestampsMs.isNotEmpty() && nowMs - stepTimestampsMs.first() > 5000L) {
             stepTimestampsMs.removeFirst()
         }
-        while (accelSamples.isNotEmpty() && nowMs - accelSamples.first().first > 2500L) {
+        while (accelSamples.isNotEmpty() && nowMs - accelSamples.first().timestampMs > 2500L) {
             accelSamples.removeFirst()
         }
     }

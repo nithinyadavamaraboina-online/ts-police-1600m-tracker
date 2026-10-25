@@ -177,6 +177,14 @@ class TrackerDomainTest {
             "Standing.",
             MotionStateAudioCue.buildTransitionSpeech(MotionState.WALKING, MotionState.STANDING, isRecording = false)
         )
+        assertEquals(
+            "Bike or vehicle. Ignored.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.STANDING, MotionState.VEHICLE, isRecording = false)
+        )
+        assertEquals(
+            "Vehicle detected. Run paused.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.RUNNING, MotionState.VEHICLE, isRecording = true)
+        )
     }
 
     @Test
@@ -230,6 +238,85 @@ class TrackerDomainTest {
         assertEquals(
             MotionState.STANDING,
             classifier.update(7000L, gpsSpeedMps = 0.8, cadenceSpm = dsp.getCadenceSpm(7000L), dynamicAccelRms = 1.1)
+        )
+    }
+
+    @Test
+    fun `riding a bike or scooter never classifies as running even on bumpy roads`() {
+        val classifier = GaitClassifier()
+
+        // 1. Bike cruising at 18 km/h (5.0 m/s) with road vibration (3.8 m/s^2) and 0 footsteps -> VEHICLE (not RUNNING!)
+        assertEquals(
+            MotionState.VEHICLE,
+            classifier.classifyInstant(gpsSpeedMps = 5.0, cadenceSpm = 0.0, dynamicAccelRms = 3.8)
+        )
+        assertFalse(MotionState.VEHICLE.countsAsActiveMovement)
+
+        // 2. Slow scooter in traffic at 12.6 km/h (3.5 m/s — exact running speed) without footsteps -> VEHICLE
+        assertEquals(
+            MotionState.VEHICLE,
+            classifier.classifyInstant(gpsSpeedMps = 3.5, cadenceSpm = 0.0, dynamicAccelRms = 3.1)
+        )
+
+        // 3. Bumpy road faking 95 spm step events while riding at 4.5 m/s (impossible 2.84m stride) -> VEHICLE
+        assertEquals(
+            MotionState.VEHICLE,
+            classifier.classifyInstant(gpsSpeedMps = 4.5, cadenceSpm = 95.0, dynamicAccelRms = 4.2)
+        )
+
+        // 4. High-speed motorcycle cruise at 50.4 km/h (14.0 m/s) -> VEHICLE
+        assertEquals(
+            MotionState.VEHICLE,
+            classifier.classifyInstant(gpsSpeedMps = 14.0, cadenceSpm = 165.0, dynamicAccelRms = 6.5)
+        )
+
+        // 5. Full end-to-end DSP simulation: motorcycle with heavy 25 Hz engine vibration (+/- 6 m/s^2)
+        //    + 1.5 Hz road suspension bounce (+/- 2.0 m/s^2) + false hardware step triggers at 168 spm
+        //    while moving right at TS Police 1600m target speed (3.70 m/s = 13.3 km/h)!
+        val bikeDsp = MotionSignalProcessor().apply { hardwareStepSensorAvailable = true }
+        var nextFakeStepMs = 300L
+        for (i in 0..200) {
+            val tMs = i * 20L
+            val tSec = tMs / 1000.0
+            val engineBuzz25Hz = 6.0 * sin(2.0 * Math.PI * 25.0 * tSec)
+            val roadBounce1p5Hz = 2.0 * sin(2.0 * Math.PI * 1.5 * tSec)
+            val ay = (9.81 + engineBuzz25Hz + roadBounce1p5Hz).toFloat()
+            bikeDsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
+            if (tMs >= nextFakeStepMs) {
+                bikeDsp.onHardwareStepDetected(tMs, 1)
+                nextFakeStepMs += 357L // 168 spm false pedometer vibration triggers!
+            }
+        }
+        val stateOnBumpyBike = classifier.classifyInstant(
+            gpsSpeedMps = 3.70,
+            cadenceSpm = bikeDsp.getCadenceSpm(4000L),
+            dynamicAccelRms = bikeDsp.getDynamicAccelRms(4000L),
+            minRawNorm = bikeDsp.getMinRawNorm(4000L),
+            peakToTroughNorm = bikeDsp.getPeakToTroughNorm(4000L)
+        )
+        assertEquals("Seated bumpy motorcycle at 3.7 m/s must be VEHICLE, never RUNNING", MotionState.VEHICLE, stateOnBumpyBike)
+
+        // 6. Verify real human running with aerial flight unloading still hits TARGET_PACE / RUNNING,
+        //    and indoor walking with gravity norm still hits WALKING!
+        assertEquals(
+            MotionState.TARGET_PACE,
+            classifier.classifyInstant(
+                gpsSpeedMps = 3.80,
+                cadenceSpm = 176.0,
+                dynamicAccelRms = 8.5,
+                minRawNorm = 2.1,
+                peakToTroughNorm = 17.5
+            )
+        )
+        assertEquals(
+            MotionState.WALKING,
+            classifier.classifyInstant(
+                gpsSpeedMps = null,
+                cadenceSpm = 104.0,
+                dynamicAccelRms = 2.1,
+                minRawNorm = 7.2,
+                peakToTroughNorm = 4.8
+            )
         )
     }
 

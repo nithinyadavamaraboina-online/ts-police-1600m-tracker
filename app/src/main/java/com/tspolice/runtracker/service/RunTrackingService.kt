@@ -67,6 +67,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         private const val TICK_INTERVAL_MS = 200L
         private const val GPS_FRESHNESS_MS = 5500L
         private const val MAX_ACCEPTABLE_GPS_ACCURACY_M = 28f
+        private const val MAX_PLAUSIBLE_VEHICLE_SPEED_MPS = 55.0 // 198 km/h — keeps real bike/vehicle GPS speeds visible
         const val ACTION_MUTE_POCKET_AUDIO = "com.tspolice.runtracker.ACTION_MUTE_POCKET_AUDIO"
     }
 
@@ -132,6 +133,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
     // GPS tracking state
     private var lastValidLocation: Location? = null
+    private var lastValidLocationElapsedMs: Long = 0L
     private var lastLocationElapsedMs: Long = 0L
     private var smoothedGpsSpeedMps: Double = 0.0
     private var latestGpsAccuracyM: Float? = null
@@ -536,30 +538,36 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
         if (prev != null) {
             val dtSec = ((location.elapsedRealtimeNanos - prev.elapsedRealtimeNanos) / 1e9)
-                .takeIf { it > 0.05 } ?: ((nowElapsed - lastLocationElapsedMs) / 1000.0)
+                .takeIf { it > 0.05 } ?: ((nowElapsed - lastValidLocationElapsedMs) / 1000.0)
             val deltaMeters = prev.distanceTo(location).toDouble()
 
             if (dtSec > 0.1) {
                 val derivedSpeed = deltaMeters / dtSec
-                // Reject impossible GPS teleport spikes (> 11.5 m/s = 41.4 km/h)
-                if (derivedSpeed > 11.5) return
+                // Only reject impossible GPS glitch teleports (> 55 m/s = 198 km/h); never drop real
+                // bike/motorcycle speeds (25-120 km/h), otherwise smoothedGpsSpeedMps freezes in running range!
+                if (derivedSpeed > MAX_PLAUSIBLE_VEHICLE_SPEED_MPS) return
                 if (observedSpeed < 0.0) {
                     observedSpeed = derivedSpeed
                 }
             }
 
-            // Accumulate GPS distance when recording and not below noise floor
+            lastLocationElapsedMs = nowElapsed
+
+            // Accumulate GPS distance ONLY when recording AND in genuine human movement (never Bike/Vehicle or Standing)
             val minMoveFloor = max(1.2, (location.accuracy * 0.22).toDouble())
             if (isRecording && deltaMeters >= minMoveFloor) {
-                addDistanceDelta(deltaMeters)
+                if (gaitClassifier.currentState().countsAsActiveMovement) {
+                    addDistanceDelta(deltaMeters)
+                }
                 lastValidLocation = location
-                lastLocationElapsedMs = nowElapsed
+                lastValidLocationElapsedMs = nowElapsed
             } else if (!isRecording) {
                 lastValidLocation = location
-                lastLocationElapsedMs = nowElapsed
+                lastValidLocationElapsedMs = nowElapsed
             }
         } else {
             lastValidLocation = location
+            lastValidLocationElapsedMs = nowElapsed
             lastLocationElapsedMs = nowElapsed
         }
 
@@ -591,6 +599,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
         val cadenceSpm = signalProcessor.getCadenceSpm(nowMs)
         val accelRms = signalProcessor.getDynamicAccelRms(nowMs)
+        val minRawNorm = signalProcessor.getMinRawNorm(nowMs)
+        val peakToTroughNorm = signalProcessor.getPeakToTroughNorm(nowMs)
         val gpsReliableForGait = gpsFresh &&
             (latestGpsAccuracyM == null || latestGpsAccuracyM!! <= 14f || smoothedGpsSpeedMps >= 0.70)
         val gpsForClassifier = if (gpsReliableForGait) smoothedGpsSpeedMps else null
@@ -599,7 +609,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             nowMs = nowMs,
             gpsSpeedMps = gpsForClassifier,
             cadenceSpm = cadenceSpm,
-            dynamicAccelRms = accelRms
+            dynamicAccelRms = accelRms,
+            minRawNorm = minRawNorm,
+            peakToTroughNorm = peakToTroughNorm
         )
 
         if (state != lastAnnouncedState) {
@@ -650,7 +662,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                     MotionState.RUNNING, MotionState.TARGET_PACE -> runningSec += dtSec
                     MotionState.JOGGING -> joggingSec += dtSec
                     MotionState.WALKING -> walkingSec += dtSec
-                    MotionState.STANDING -> Unit
+                    MotionState.STANDING, MotionState.VEHICLE -> Unit
                 }
             } else {
                 pausedDurationSec += dtSec
@@ -669,12 +681,13 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private fun addDistanceDelta(deltaM: Double) {
         if (deltaM <= 0.0 || !isRecording) return
         val state = gaitClassifier.currentState()
+        if (!state.countsAsActiveMovement) return
         distanceMeters += deltaM
         when (state) {
             MotionState.RUNNING, MotionState.TARGET_PACE -> runningMeters += deltaM
             MotionState.JOGGING -> joggingMeters += deltaM
             MotionState.WALKING -> walkingMeters += deltaM
-            MotionState.STANDING -> runningMeters += deltaM
+            MotionState.STANDING, MotionState.VEHICLE -> Unit
         }
 
         // Record 400m splits
@@ -801,6 +814,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             MotionState.RUNNING -> ToneGenerator.TONE_PROP_BEEP to 110
             MotionState.JOGGING -> ToneGenerator.TONE_PROP_BEEP2 to 120
             MotionState.WALKING -> ToneGenerator.TONE_SUP_PIP to 90
+            MotionState.VEHICLE -> ToneGenerator.TONE_PROP_NACK to 180
             MotionState.STANDING -> ToneGenerator.TONE_PROP_NACK to 160
         }
         runCatching {

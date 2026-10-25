@@ -12,37 +12,50 @@ enum class MotionState(
     val label: String,
     val badgeText: String,
     val colorArgb: Int,
-    val countsAsActiveMovement: Boolean
+    val countsAsActiveMovement: Boolean,
+    val intensityRank: Int
 ) {
     STANDING(
         label = "Standing (Auto-Pause)",
         badgeText = "AUTO-PAUSED • STANDING",
         colorArgb = 0xFF64748B.toInt(),
-        countsAsActiveMovement = false
+        countsAsActiveMovement = false,
+        intensityRank = 0
+    ),
+    VEHICLE(
+        label = "Bike / Vehicle (Ignored)",
+        badgeText = "AUTO-PAUSED • BIKE / VEHICLE",
+        colorArgb = 0xFF8B5CF6.toInt(),
+        countsAsActiveMovement = false,
+        intensityRank = 0
     ),
     WALKING(
         label = "Walking",
         badgeText = "AUTO-DETECTED • WALKING",
         colorArgb = 0xFF38BDF8.toInt(),
-        countsAsActiveMovement = true
+        countsAsActiveMovement = true,
+        intensityRank = 1
     ),
     JOGGING(
         label = "Jogging",
         badgeText = "AUTO-DETECTED • JOGGING",
         colorArgb = 0xFFF59E0B.toInt(),
-        countsAsActiveMovement = true
+        countsAsActiveMovement = true,
+        intensityRank = 2
     ),
     RUNNING(
         label = "Running",
         badgeText = "AUTO-DETECTED • RUNNING",
         colorArgb = 0xFF22C55E.toInt(),
-        countsAsActiveMovement = true
+        countsAsActiveMovement = true,
+        intensityRank = 3
     ),
     TARGET_PACE(
         label = "TS Police Target Pace",
         badgeText = "TS POLICE 7:15 PACE • RUNNING",
         colorArgb = 0xFF10B981.toInt(),
-        countsAsActiveMovement = true
+        countsAsActiveMovement = true,
+        intensityRank = 4
     )
 }
 
@@ -271,6 +284,9 @@ object MotionStateAudioCue {
                 }
             }
             MotionState.WALKING -> "Walking."
+            MotionState.VEHICLE -> {
+                if (isRecording) "Vehicle detected. Run paused." else "Bike or vehicle. Ignored."
+            }
             MotionState.STANDING -> {
                 if (isRecording) "Standing. Auto paused." else "Standing."
             }
