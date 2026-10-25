@@ -1,8 +1,8 @@
 {
-    "versionCode":  4,
-    "versionName":  "1.0.3",
+    "versionCode":  5,
+    "versionName":  "1.0.4",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "e0e2b21af58d1a179c253094e763b561506f587e68b11f04113cfabf98b403a2",
-    "changelog":  "Fixed screen-off pocket audio \u0026 gait detection: keeps CPU/sensors/audio awake when phone is locked in pocket (even without starting a timed run), routes voice/beeps over Media stream, adds lockscreen Mute button, and sharpens Stand/Walk/Jog/Run responsiveness.",
-    "publishedAt":  "2026-10-25T17:01:35Z"
+    "sha256":  "d23f1c613db29d5a5b6725b68066dc4ec635447689e6958e897928fb8b7bb3b6",
+    "changelog":  "Fixed Standing-to-Walking oversensitivity: uses rotation-invariant gravity filtering, disables software step synthesis when hardware step sensor is active, requires \u003e=4 rhythmic footsteps (\u003e=68 spm), and rejects indoor GPS drift while sitting/holding phone.",
+    "publishedAt":  "2026-10-25T17:08:14Z"
 }

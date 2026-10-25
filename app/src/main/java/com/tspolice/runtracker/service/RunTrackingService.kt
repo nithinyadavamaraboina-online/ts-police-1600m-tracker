@@ -433,6 +433,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                     0
                 )
                 hasHardwareStepDetector = stepDetectorRegistered
+                signalProcessor.hardwareStepSensorAvailable = hasHardwareStepDetector
             }
         }
 

@@ -1,5 +1,6 @@
 package com.tspolice.runtracker.domain
 
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
@@ -16,10 +17,12 @@ class GaitClassifier(
     var targetSpeedThresholdMps: Double = TsPoliceBenchmark.targetSpeedMps()
 ) {
     companion object {
-        const val DEFAULT_WALKING_SPEED_MPS = 0.50   // ~1.8 km/h
+        const val DEFAULT_WALKING_SPEED_MPS = 0.75   // ~2.7 km/h real walking speed
         const val DEFAULT_JOGGING_SPEED_MPS = 1.85   // ~6.66 km/h (9:00 /km)
         const val DEFAULT_RUNNING_SPEED_MPS = 3.05   // ~10.98 km/h (5:28 /km)
+        const val MIN_WALKING_CADENCE_SPM = 68.0     // rejects random hand movement / chair shifting
 
+        const val STANDING_TO_WALK_DEBOUNCE_MS = 2200L
         const val UPGRADE_DEBOUNCE_MS = 1400L
         const val DOWNGRADE_DEBOUNCE_MS = 2000L
     }
@@ -45,56 +48,59 @@ class GaitClassifier(
         dynamicAccelRms: Double
     ): MotionState {
         val hasValidGps = gpsSpeedMps != null && gpsSpeedMps.isFinite() && gpsSpeedMps >= 0.0
+        val hasRhythmicSteps = cadenceSpm >= MIN_WALKING_CADENCE_SPM
         val impliedStepSpeed = estimateSpeedFromStepsMps(cadenceSpm, dynamicAccelRms)
 
         if (hasValidGps) {
             val gps = gpsSpeedMps!!
-            // Stationary / pocket-fidget rejection
-            if (gps < DEFAULT_WALKING_SPEED_MPS && cadenceSpm < 42.0 && dynamicAccelRms < 1.35) {
+            // Sitting / hand-use / indoor GPS multipath rejection:
+            // Without rhythmic footsteps (>= 68 spm), ignore indoor GPS wander (< 2.2 m/s) and phone handling!
+            if (!hasRhythmicSteps && (gps < 2.20 || dynamicAccelRms < 2.20)) {
                 return MotionState.STANDING
             }
-            if (gps < 0.35 && cadenceSpm < 55.0 && dynamicAccelRms < 2.2) {
+            if (gps < DEFAULT_WALKING_SPEED_MPS && cadenceSpm < 74.0 && dynamicAccelRms < 0.85) {
                 return MotionState.STANDING
             }
 
             // Fuse GPS ground speed with cadence-implied speed; never let a stationary indoor/lagging GPS
             // fix (0.0 m/s) crush unmistakable active footstrikes in a pocket.
             val fusedSpeed = when {
-                cadenceSpm >= 55.0 && gps < 0.75 && dynamicAccelRms >= 1.65 ->
+                hasRhythmicSteps && gps < 0.85 && dynamicAccelRms >= 0.85 ->
                     maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.94 * impliedStepSpeed)
-                cadenceSpm >= 55.0 && impliedStepSpeed > gps * 1.45 && dynamicAccelRms >= 3.8 ->
+                hasRhythmicSteps && impliedStepSpeed > gps * 1.45 && dynamicAccelRms >= 3.5 ->
                     maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.88 * impliedStepSpeed)
-                cadenceSpm >= 55.0 ->
+                hasRhythmicSteps ->
                     0.78 * gps + 0.22 * impliedStepSpeed
                 else -> gps
             }
 
             return when {
                 fusedSpeed >= targetSpeedThresholdMps ||
-                    (cadenceSpm >= 176.0 && dynamicAccelRms >= 8.2 && gps >= 3.35) -> MotionState.TARGET_PACE
+                    (cadenceSpm >= 176.0 && dynamicAccelRms >= 7.8 && gps >= 3.35) -> MotionState.TARGET_PACE
                 fusedSpeed >= runningSpeedThresholdMps ||
-                    (cadenceSpm >= 164.0 && dynamicAccelRms >= 6.6) -> MotionState.RUNNING
+                    (cadenceSpm >= 164.0 && dynamicAccelRms >= 6.0) -> MotionState.RUNNING
                 fusedSpeed >= DEFAULT_JOGGING_SPEED_MPS ||
-                    (cadenceSpm >= 134.0 && dynamicAccelRms >= 3.8) -> MotionState.JOGGING
+                    (cadenceSpm >= 134.0 && dynamicAccelRms >= 3.4) -> MotionState.JOGGING
                 else -> MotionState.WALKING
             }
         }
 
-        // Indoor / pre-GPS-lock fallback: pure step cadence + 3-axis dynamic impulse RMS
-        if (cadenceSpm < 36.0 && dynamicAccelRms < 1.20) {
+        // Indoor / pre-GPS-lock path: require genuine rhythmic step cadence (>= 68 spm) + footstrike impact
+        // so holding, tilting, or moving the phone while sitting never triggers WALKING.
+        if (!hasRhythmicSteps || dynamicAccelRms < 0.75) {
             return MotionState.STANDING
         }
         return when {
-            cadenceSpm >= 176.0 && dynamicAccelRms >= 8.2 -> MotionState.TARGET_PACE
-            cadenceSpm >= 163.0 || (cadenceSpm >= 152.0 && dynamicAccelRms >= 6.6) -> MotionState.RUNNING
-            cadenceSpm >= 134.0 || (cadenceSpm >= 122.0 && dynamicAccelRms >= 3.9) -> MotionState.JOGGING
-            cadenceSpm >= 36.0 || dynamicAccelRms >= 1.45 -> MotionState.WALKING
-            else -> MotionState.STANDING
+            cadenceSpm >= 176.0 && dynamicAccelRms >= 7.8 -> MotionState.TARGET_PACE
+            cadenceSpm >= 163.0 || (cadenceSpm >= 152.0 && dynamicAccelRms >= 6.0) -> MotionState.RUNNING
+            cadenceSpm >= 134.0 || (cadenceSpm >= 124.0 && dynamicAccelRms >= 3.4) -> MotionState.JOGGING
+            else -> MotionState.WALKING
         }
     }
 
     /**
-     * Applies temporal hysteresis so momentary GPS noise neither pauses a run nor flickers badges.
+     * Applies temporal hysteresis so momentary hand movement or GPS noise neither triggers false walking
+     * nor prematurely pauses an active run.
      */
     fun update(
         nowMs: Long,
@@ -115,10 +121,10 @@ class GaitClassifier(
             return committedState
         }
 
-        val requiredHoldMs = if (raw.ordinal > committedState.ordinal) {
-            UPGRADE_DEBOUNCE_MS
-        } else {
-            DOWNGRADE_DEBOUNCE_MS
+        val requiredHoldMs = when {
+            committedState == MotionState.STANDING && raw == MotionState.WALKING -> STANDING_TO_WALK_DEBOUNCE_MS
+            raw.ordinal > committedState.ordinal -> UPGRADE_DEBOUNCE_MS
+            else -> DOWNGRADE_DEBOUNCE_MS
         }
 
         if (nowMs - candidateSinceMs >= requiredHoldMs) {
@@ -162,16 +168,20 @@ class MotionSignalProcessor {
     private val stepTimestampsMs = ArrayDeque<Long>()
     private val accelSamples = ArrayDeque<Pair<Long, Double>>()
 
-    // Low-pass gravity filter state when raw TYPE_ACCELEROMETER is used
-    private var gravityX = 0.0
-    private var gravityY = 0.0
-    private var gravityZ = 9.81
+    /**
+     * When true, Android's dedicated hardware TYPE_STEP_DETECTOR sensor is active, so software
+     * accelerometer peak step synthesis is disabled to prevent hand/phone gestures while sitting
+     * from registering as fake steps.
+     */
+    var hardwareStepSensorAvailable: Boolean = false
+
+    // Orientation-invariant scalar gravity norm (immune to tilting/rotating the phone in hand!)
+    private var gravityNorm = 9.81
     private var gravityInitialized = false
 
     private var prevDynamicMag = 0.0
     private var rising = false
     private var lastAccelStepMs = -10_000L
-    private var lastHardwareStepMs: Long? = null
 
     var totalSteps: Int = 0
         private set
@@ -179,26 +189,37 @@ class MotionSignalProcessor {
     fun reset() {
         stepTimestampsMs.clear()
         accelSamples.clear()
+        gravityNorm = 9.81
         gravityInitialized = false
         prevDynamicMag = 0.0
         rising = false
         lastAccelStepMs = -10_000L
-        lastHardwareStepMs = null
         totalSteps = 0
     }
 
     fun onHardwareStepDetected(nowMs: Long, count: Int = 1) {
-        lastHardwareStepMs = nowMs
-        repeat(count.coerceIn(1, 6)) {
-            stepTimestampsMs.addLast(nowMs)
-            totalSteps++
-        }
+        totalSteps += count.coerceIn(1, 6)
+        recordStepTimestamp(nowMs)
         pruneOld(nowMs)
+    }
+
+    private fun recordStepTimestamp(nowMs: Long) {
+        val prev = stepTimestampsMs.lastOrNull()
+        if (prev != null) {
+            val gap = nowMs - prev
+            if (gap < 220L) return // ignore duplicate burst event on same footstrike
+            if (gap > 1500L) {
+                // Gap > 1.5s (< 40 spm) breaks any continuous stride — start fresh burst from step 1
+                stepTimestampsMs.clear()
+            }
+        }
+        stepTimestampsMs.addLast(nowMs)
     }
 
     /**
      * Feeds either linear acceleration (already gravity-free) or raw accelerometer (with gravity).
-     * Returns true if the software fallback step detector registered a step peak.
+     * Uses orientation-invariant scalar magnitude | ||a|| - g | when gravity is included so tilting,
+     * rotating, or scrolling on the phone while sitting produces ~0 dynamic impulse.
      */
     fun onAccelerationSample(
         nowMs: Long,
@@ -207,47 +228,37 @@ class MotionSignalProcessor {
         az: Float,
         includesGravity: Boolean
     ): Boolean {
-        val dx: Double
-        val dy: Double
-        val dz: Double
-        if (includesGravity) {
+        val rawNorm = sqrt(
+            ax.toDouble() * ax.toDouble() +
+                ay.toDouble() * ay.toDouble() +
+                az.toDouble() * az.toDouble()
+        )
+        val mag = if (includesGravity) {
             if (!gravityInitialized) {
-                gravityX = ax.toDouble()
-                gravityY = ay.toDouble()
-                gravityZ = az.toDouble()
+                gravityNorm = rawNorm
                 gravityInitialized = true
             } else {
-                val alpha = 0.85
-                gravityX = alpha * gravityX + (1.0 - alpha) * ax
-                gravityY = alpha * gravityY + (1.0 - alpha) * ay
-                gravityZ = alpha * gravityZ + (1.0 - alpha) * az
+                gravityNorm = 0.92 * gravityNorm + 0.08 * rawNorm
             }
-            dx = ax - gravityX
-            dy = ay - gravityY
-            dz = az - gravityZ
+            abs(rawNorm - gravityNorm)
         } else {
-            dx = ax.toDouble()
-            dy = ay.toDouble()
-            dz = az.toDouble()
+            rawNorm
         }
 
-        val mag = sqrt(dx * dx + dy * dy + dz * dz)
         accelSamples.addLast(nowMs to mag)
         pruneOld(nowMs)
 
-        // Software step peak detector activates whenever hardware step sensor hasn't fired in last 2.5s
+        // Software step peak detector ONLY runs on devices that lack a hardware TYPE_STEP_DETECTOR sensor
         var detectedStep = false
-        val hwLast = lastHardwareStepMs
-        val useSoftwareFallback = hwLast == null || (nowMs - hwLast) > 2500L
-        if (useSoftwareFallback) {
-            val minStepIntervalMs = 260L // max ~230 steps/min, rejects pocket double-bounce
-            val peakThreshold = 1.65     // m/s^2 dynamic impulse peak (captures gentle pocket walking + running)
+        if (!hardwareStepSensorAvailable) {
+            val minStepIntervalMs = 280L // max ~214 steps/min
+            val peakThreshold = 2.45     // m/s^2 vertical impact peak (ignores hand gestures while sitting)
             if (mag > prevDynamicMag) {
                 rising = true
             } else if (rising && prevDynamicMag >= peakThreshold && (nowMs - lastAccelStepMs) >= minStepIntervalMs) {
                 rising = false
                 lastAccelStepMs = nowMs
-                stepTimestampsMs.addLast(nowMs)
+                recordStepTimestamp(nowMs)
                 totalSteps++
                 detectedStep = true
             } else if (mag < prevDynamicMag) {
@@ -261,31 +272,48 @@ class MotionSignalProcessor {
     fun getCadenceSpm(nowMs: Long): Double {
         pruneOld(nowMs)
         val totalCount = stepTimestampsMs.size
-        if (totalCount == 0) return 0.0
+        // Require at least 4 consecutive unbroken footsteps before reporting any walking/running cadence!
+        if (totalCount < 4) return 0.0
+
         val lastMs = stepTimestampsMs.last()
         val silenceMs = nowMs - lastMs
         val recentRms = getDynamicAccelRms(nowMs)
-        if (silenceMs > 2200L || (silenceMs > 1550L && recentRms < 1.15)) {
+        if (silenceMs > 1900L || (silenceMs > 1400L && recentRms < 0.75)) {
             return 0.0
-        }
-
-        if (totalCount == 1) {
-            return if (silenceMs < 1500L) 65.0 else 0.0
         }
 
         // Use most recent 6 footstrikes so Walk <-> Jog <-> Run cadence transitions react in ~1.5s
         val startIdx = (totalCount - 6).coerceAtLeast(0)
-        val firstMs = stepTimestampsMs[startIdx]
         val count = totalCount - startIdx
+        val intervalsMs = DoubleArray(count - 1)
+        var sumMs = 0.0
+        for (i in 0 until count - 1) {
+            val dt = (stepTimestampsMs[startIdx + i + 1] - stepTimestampsMs[startIdx + i]).toDouble()
+            intervalsMs[i] = dt
+            sumMs += dt
+        }
+        val meanPeriodMs = (sumMs / intervalsMs.size).coerceAtLeast(240.0)
+
+        // Reject irregular / non-rhythmic phone shaking or hand taps (real human gait has low period variance)
+        var varianceSum = 0.0
+        for (dt in intervalsMs) {
+            val diff = dt - meanPeriodMs
+            varianceSum += diff * diff
+        }
+        val stdDevMs = sqrt(varianceSum / intervalsMs.size)
+        val coeffOfVariation = stdDevMs / meanPeriodMs
+        if (coeffOfVariation > 0.42) {
+            return 0.0
+        }
+
+        val firstMs = stepTimestampsMs[startIdx]
         val stepSpanMs = (lastMs - firstMs).coerceAtLeast(300L)
-        val avgPeriodMs = stepSpanMs.toDouble() / (count - 1).toDouble()
-        val effectiveSpanMs = if (silenceMs > avgPeriodMs * 1.35) {
+        val effectiveSpanMs = if (silenceMs > meanPeriodMs * 1.35) {
             (nowMs - firstMs).toDouble()
         } else {
             stepSpanMs.toDouble()
         }
-        val intervals = (count - 1).toDouble()
-        return ((intervals / (effectiveSpanMs / 1000.0)) * 60.0).coerceIn(0.0, 235.0)
+        return (((count - 1).toDouble() / (effectiveSpanMs / 1000.0)) * 60.0).coerceIn(0.0, 235.0)
     }
 
     fun getDynamicAccelRms(nowMs: Long): Double {

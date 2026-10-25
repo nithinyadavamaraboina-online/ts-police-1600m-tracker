@@ -198,6 +198,41 @@ class TrackerDomainTest {
         )
     }
 
+    @Test
+    fun `sitting and tilting or moving phone in hand never triggers false walking`() {
+        val dsp = MotionSignalProcessor()
+        val classifier = GaitClassifier()
+
+        // 1. Simulate sitting in a chair and tilting/rotating the phone back and forth by 90 degrees
+        //    plus light hand/scroll movement while indoor GPS drifts up to 1.2 m/s!
+        for (i in 0..250) {
+            val tMs = i * 20L
+            val angle = sin(i * 0.08) * (Math.PI / 2.0) // full 90-degree wrist tilt!
+            val handFidget = (0.35 * sin(i * 0.37)).toFloat()
+            val ax = (9.81 * sin(angle)).toFloat() + handFidget
+            val ay = (0.25 * kotlin.math.cos(i * 0.21)).toFloat()
+            val az = (9.81 * kotlin.math.cos(angle)).toFloat()
+            dsp.onAccelerationSample(nowMs = tMs, ax = ax, ay = ay, az = az, includesGravity = true)
+
+            val state = classifier.update(
+                nowMs = tMs,
+                gpsSpeedMps = 1.20, // indoor GPS multipath wander while sitting!
+                cadenceSpm = dsp.getCadenceSpm(tMs),
+                dynamicAccelRms = dsp.getDynamicAccelRms(tMs)
+            )
+            assertEquals("Expected STANDING while sitting & tilting phone at ${tMs}ms", MotionState.STANDING, state)
+        }
+
+        // 2. Simulate 2 isolated chair-shift bumps — fewer than 4 rhythmic steps must stay STANDING
+        dsp.onHardwareStepDetected(6000L, 1)
+        dsp.onHardwareStepDetected(6800L, 1)
+        assertEquals(0.0, dsp.getCadenceSpm(7000L), 0.001)
+        assertEquals(
+            MotionState.STANDING,
+            classifier.update(7000L, gpsSpeedMps = 0.8, cadenceSpm = dsp.getCadenceSpm(7000L), dynamicAccelRms = 1.1)
+        )
+    }
+
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
         val is1600 = mode == RunMode.TIMED_1600M
         return RunSessionRecord(
