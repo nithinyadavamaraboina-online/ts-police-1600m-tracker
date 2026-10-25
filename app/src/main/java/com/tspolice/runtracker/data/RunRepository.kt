@@ -30,6 +30,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_TARGET_SEC = "target_time_sec"
         private const val KEY_RUN_SPEED_MPS = "run_threshold_mps"
         private const val KEY_VOICE_COACH = "voice_coach_enabled"
+        private const val KEY_STATE_CHANGE_AUDIO = "state_change_audio_enabled"
         private const val KEY_STEP_FALLBACK = "indoor_step_distance_fallback"
     }
 
@@ -78,6 +79,10 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     var voiceCoachEnabled: Boolean
         get() = prefs.getBoolean(KEY_VOICE_COACH, true)
         set(value) = prefs.edit().putBoolean(KEY_VOICE_COACH, value).apply()
+
+    var stateChangeAudioEnabled: Boolean
+        get() = prefs.getBoolean(KEY_STATE_CHANGE_AUDIO, true)
+        set(value) = prefs.edit().putBoolean(KEY_STATE_CHANGE_AUDIO, value).apply()
 
     var indoorStepFallbackEnabled: Boolean
         get() = prefs.getBoolean(KEY_STEP_FALLBACK, true)

@@ -31,6 +31,7 @@ import androidx.core.content.ContextCompat
 import com.tspolice.runtracker.data.RunRepository
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.LiveTelemetry
+import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.ProgressionForecaster
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
@@ -52,8 +53,10 @@ class MainActivity : AppCompatActivity() {
     private var lastHandledFinishId: Long? = null
     private var latestDiscoveredRelease: UpdateReleaseInfo? = null
     private var currentlyRecording = false
+    private var activityVisible = false
 
     // Top-level tab containers
+    private lateinit var stateAudioChip: TextView
     private lateinit var updateBanner: TextView
     private lateinit var tabTrackerContainer: ScrollView
     private lateinit var tabProgressContainer: ScrollView
@@ -92,6 +95,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sessionsListLayout: LinearLayout
 
     // Tab 3: Benchmark & Sensor Diagnostics views
+    private lateinit var stateAudioSwitch: Switch
     private lateinit var diagGpsText: TextView
     private lateinit var diagStepText: TextView
     private lateinit var diagStateText: TextView
@@ -116,6 +120,7 @@ class MainActivity : AppCompatActivity() {
             val local = service as? RunTrackingService.LocalBinder ?: return
             trackingService = local.getService()
             serviceBound = true
+            trackingService?.setUiForegroundVisible(activityVisible)
             trackingService?.addTelemetryListener(telemetryListener)
             trackingService?.refreshPermissionsAndSensors()
         }
@@ -153,11 +158,23 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        activityVisible = true
+        trackingService?.setUiForegroundVisible(true)
+    }
+
     override fun onResume() {
         super.onResume()
         if (appUpdater.resumePendingInstallIfPermitted()) {
             Toast.makeText(this, "Launching update installer...", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    override fun onStop() {
+        activityVisible = false
+        trackingService?.setUiForegroundVisible(false)
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -202,6 +219,24 @@ class MainActivity : AppCompatActivity() {
             textSize = 12f
             setTextColor(0xFF94A3B8.toInt())
         })
+        stateAudioChip = TextView(this).apply {
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(9), dp(5), dp(9), dp(5))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(6) }
+            setOnClickListener {
+                val next = !repository.stateChangeAudioEnabled
+                repository.stateChangeAudioEnabled = next
+                if (::stateAudioSwitch.isInitialized && stateAudioSwitch.isChecked != next) {
+                    stateAudioSwitch.isChecked = next
+                }
+                refreshStateAudioChip()
+                trackingService?.previewStateChangeAudio()
+            }
+        }
         val goalChip = TextView(this).apply {
             text = "GOAL < 7:15"
             textSize = 11.5f
@@ -211,6 +246,7 @@ class MainActivity : AppCompatActivity() {
             background = roundedBox(0x1E10B981, 0xFF10B981.toInt(), dp(12))
         }
         header.addView(titleCol)
+        header.addView(stateAudioChip)
         header.addView(goalChip)
         root.addView(header)
 
@@ -779,7 +815,18 @@ class MainActivity : AppCompatActivity() {
         thresholdPresetButtons = thBtns
         settingsCard.addView(threshRow)
 
-        // Switches for Voice Coach & Indoor Step Fallback
+        // Switches for State-Change Audio, Voice Coach & Indoor Step Fallback
+        stateAudioSwitch = Switch(this).apply {
+            text = "State Change Audio (Beep + Voice on Stand/Walk/Jog/Run/Target)"
+            setTextColor(0xFFE2E8F0.toInt())
+            textSize = 13f
+            isChecked = repository.stateChangeAudioEnabled
+            setPadding(0, dp(6), 0, dp(6))
+            setOnCheckedChangeListener { _, checked ->
+                repository.stateChangeAudioEnabled = checked
+                refreshStateAudioChip()
+            }
+        }
         val voiceSwitch = Switch(this).apply {
             text = "Voice Split Coach (400m & 1600m TTS audio)"
             setTextColor(0xFFE2E8F0.toInt())
@@ -793,11 +840,24 @@ class MainActivity : AppCompatActivity() {
             setTextColor(0xFFE2E8F0.toInt())
             textSize = 13f
             isChecked = repository.indoorStepFallbackEnabled
-            setPadding(0, dp(6), 0, dp(4))
+            setPadding(0, dp(6), 0, dp(8))
             setOnCheckedChangeListener { _, checked -> repository.indoorStepFallbackEnabled = checked }
         }
+        val testStateAudioBtn = Button(this).apply {
+            text = "Test State Change Audio Cue"
+            textSize = 12.5f
+            isAllCaps = false
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFFE2E8F0.toInt())
+            background = roundedBox(0xFF1E293B.toInt(), 0xFF38BDF8.toInt(), dp(10))
+            setOnClickListener {
+                trackingService?.previewStateChangeAudio(MotionState.TARGET_PACE)
+            }
+        }
+        settingsCard.addView(stateAudioSwitch)
         settingsCard.addView(voiceSwitch)
         settingsCard.addView(stepFallbackSwitch)
+        settingsCard.addView(testStateAudioBtn)
         col.addView(settingsCard)
 
         // Live Sensor Diagnostics Card
@@ -1288,6 +1348,19 @@ class MainActivity : AppCompatActivity() {
             )
             btn.setTextColor(if (active) 0xFF04130D.toInt() else 0xFFCBD5E1.toInt())
         }
+        refreshStateAudioChip()
+    }
+
+    private fun refreshStateAudioChip() {
+        if (!::stateAudioChip.isInitialized) return
+        val on = repository.stateChangeAudioEnabled
+        stateAudioChip.text = if (on) "AUDIO ON" else "MUTED"
+        stateAudioChip.setTextColor(if (on) 0xFF38BDF8.toInt() else 0xFF64748B.toInt())
+        stateAudioChip.background = roundedBox(
+            if (on) 0x1E38BDF8 else 0xFF111827.toInt(),
+            if (on) 0xFF38BDF8.toInt() else 0xFF334155.toInt(),
+            dp(12)
+        )
     }
 
     private fun hasCorePermissions(): Boolean {

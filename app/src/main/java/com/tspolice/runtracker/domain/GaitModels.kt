@@ -235,3 +235,46 @@ object TsPoliceBenchmark {
         }
     }
 }
+
+/**
+ * Builds concise spoken coaching cues whenever the auto-detected [MotionState] changes.
+ */
+object MotionStateAudioCue {
+    fun buildTransitionSpeech(
+        previousState: MotionState,
+        newState: MotionState,
+        isRecording: Boolean,
+        targetTimeSec: Double = TsPoliceBenchmark.DEFAULT_TARGET_TIME_SEC
+    ): String {
+        return when (newState) {
+            MotionState.TARGET_PACE -> {
+                val mins = targetTimeSec.toInt() / 60
+                val secs = targetTimeSec.toInt() % 60
+                if (secs == 0) {
+                    "Target pace! Under $mins minutes."
+                } else {
+                    "Target pace! On $mins $secs speed."
+                }
+            }
+            MotionState.RUNNING -> {
+                if (previousState == MotionState.TARGET_PACE && isRecording) {
+                    "Running. Below target pace."
+                } else {
+                    "Running."
+                }
+            }
+            MotionState.JOGGING -> {
+                if ((previousState == MotionState.RUNNING || previousState == MotionState.TARGET_PACE) && isRecording) {
+                    "Jogging. Pace dropped."
+                } else {
+                    "Jogging."
+                }
+            }
+            MotionState.WALKING -> "Walking."
+            MotionState.STANDING -> {
+                if (isRecording) "Standing. Auto paused." else "Standing."
+            }
+        }
+    }
+}
+

@@ -67,8 +67,8 @@ $ManifestJson = $ManifestObj | ConvertTo-Json -Depth 4
 $ManifestPath = Join-Path $RepoRoot "version.json"
 [System.IO.File]::WriteAllText($ManifestPath, $ManifestJson, $Utf8NoBom)
 
-git add "app/build.gradle.kts" "version.json"
-git commit -m "chore(release): v$VersionName (build $NewCode)"
+git add -A
+git commit -m "feat(release): v$VersionName - $Notes"
 git tag "v$VersionName"
 git push origin HEAD --tags
 

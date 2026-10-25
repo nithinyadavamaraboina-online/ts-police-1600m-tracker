@@ -4,6 +4,7 @@ import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.MotionSignalProcessor
 import com.tspolice.runtracker.domain.MotionState
+import com.tspolice.runtracker.domain.MotionStateAudioCue
 import com.tspolice.runtracker.domain.ProgressionForecaster
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
@@ -140,6 +141,42 @@ class TrackerDomainTest {
         // Fallback when remote versionCode is 0 (pure GitHub tag comparison)
         assertTrue(VersionComparator.isRemoteNewer(1, "1.0.0", 0, "v1.0.1"))
         assertFalse(VersionComparator.isRemoteNewer(1, "1.2.0", 0, "v1.1.9"))
+    }
+
+    @Test
+    fun `motion state audio cue builds clear spoken transitions across states`() {
+        assertEquals(
+            "Walking.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.STANDING, MotionState.WALKING, isRecording = true)
+        )
+        assertEquals(
+            "Jogging.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.WALKING, MotionState.JOGGING, isRecording = true)
+        )
+        assertEquals(
+            "Running.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.JOGGING, MotionState.RUNNING, isRecording = true)
+        )
+        assertEquals(
+            "Target pace! On 7 15 speed.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.RUNNING, MotionState.TARGET_PACE, isRecording = true, targetTimeSec = 435.0)
+        )
+        assertEquals(
+            "Running. Below target pace.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.TARGET_PACE, MotionState.RUNNING, isRecording = true)
+        )
+        assertEquals(
+            "Jogging. Pace dropped.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.RUNNING, MotionState.JOGGING, isRecording = true)
+        )
+        assertEquals(
+            "Standing. Auto paused.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.JOGGING, MotionState.STANDING, isRecording = true)
+        )
+        assertEquals(
+            "Standing.",
+            MotionStateAudioCue.buildTransitionSpeech(MotionState.WALKING, MotionState.STANDING, isRecording = false)
+        )
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

@@ -17,6 +17,10 @@ import android.hardware.SensorManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Binder
 import android.os.Build
 import android.os.Bundle
@@ -28,6 +32,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.tspolice.runtracker.data.RunRepository
@@ -36,6 +41,7 @@ import com.tspolice.runtracker.domain.LapSplit
 import com.tspolice.runtracker.domain.LiveTelemetry
 import com.tspolice.runtracker.domain.MotionSignalProcessor
 import com.tspolice.runtracker.domain.MotionState
+import com.tspolice.runtracker.domain.MotionStateAudioCue
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
@@ -77,17 +83,25 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private val signalProcessor = MotionSignalProcessor()
     private val gaitClassifier = GaitClassifier()
 
+    private var audioManager: AudioManager? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var toneGenerator: ToneGenerator? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var pendingStateSpeechRunnable: Runnable? = null
 
     private var sensorsRegistered = false
     private var locationRegistered = false
     private var hasHardwareStepDetector = false
+    private var uiForegroundVisible = false
 
-    // Session state
+    // Session & state-transition audio tracking
     private var isRecording = false
     private var isAutoStartArmed = false
     private var autoStartMotionStreakMs = 0L
+    private var lastAnnouncedState: MotionState = MotionState.STANDING
+    private var lastMilestoneSpeechMs: Long = -10_000L
+    private var lastFinishSpeechMs: Long = -10_000L
     private var runMode: RunMode = RunMode.TIMED_1600M
     private var sessionStartedWallMs: Long = 0L
     private var lastTickElapsedMs: Long = 0L
@@ -131,12 +145,41 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         repository = RunRepository(this)
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         syncThresholdsFromPrefs()
         createNotificationChannel()
+
+        val audioAttrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(audioAttrs)
+            .setWillPauseWhenDucked(false)
+            .build()
+        toneGenerator = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 85) }.getOrNull()
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 tts?.language = Locale.US
+                tts?.setAudioAttributes(audioAttrs)
+                tts?.setSpeechRate(1.06f)
+                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) = Unit
+
+                    override fun onDone(utteranceId: String?) {
+                        abandonAudioFocusQuietly()
+                    }
+
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        abandonAudioFocusQuietly()
+                    }
+
+                    override fun onError(utteranceId: String?, errorCode: Int) {
+                        abandonAudioFocusQuietly()
+                    }
+                })
                 ttsReady = true
             }
         }
@@ -153,11 +196,22 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     override fun onDestroy() {
-        mainHandler.removeCallbacks(tickRunnable)
+        mainHandler.removeCallbacksAndMessages(null)
         unregisterHardwareStreams()
+        abandonAudioFocusQuietly()
+        runCatching { toneGenerator?.release() }
+        toneGenerator = null
         tts?.stop()
         tts?.shutdown()
         super.onDestroy()
+    }
+
+    fun setUiForegroundVisible(visible: Boolean) {
+        val becameVisible = visible && !uiForegroundVisible
+        uiForegroundVisible = visible
+        if (becameVisible && !isRecording && !isAutoStartArmed) {
+            lastAnnouncedState = gaitClassifier.currentState()
+        }
     }
 
     fun addTelemetryListener(listener: (LiveTelemetry) -> Unit) {
@@ -229,13 +283,15 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         nextLapBoundaryM = TsPoliceBenchmark.LAP_DISTANCE_M
         prevLapCumulativeSec = 0.0
         lastStepCountForFallback = signalProcessor.totalSteps
+        lastAnnouncedState = gaitClassifier.currentState()
 
         promoteToForeground()
         vibratePulse(140L)
         if (triggeredAutomatically) {
             speakCoach("Movement detected. Timer started.")
         } else if (mode == RunMode.TIMED_1600M) {
-            speakCoach("Starting 1.6 kilometer trial. Target 7 minutes 15 seconds.")
+            val targetFmt = spokenTime(repository.targetTimeSec)
+            speakCoach("Starting 1.6 kilometer trial. Target $targetFmt.")
         } else {
             speakCoach("Practice run started.")
         }
@@ -485,6 +541,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             dynamicAccelRms = accelRms
         )
 
+        if (state != lastAnnouncedState) {
+            val previousState = lastAnnouncedState
+            lastAnnouncedState = state
+            onMotionStateChanged(previousState, state, nowMs)
+        }
+
         val stepSpeedMps = gaitClassifier.estimateSpeedFromStepsMps(cadenceSpm, accelRms)
         val effectiveSpeedMps = when {
             !state.countsAsActiveMovement -> 0.0
@@ -587,6 +649,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             } else {
                 "${ diff.toInt() } seconds above target."
             }
+            lastFinishSpeechMs = SystemClock.elapsedRealtime()
             speakCoach(
                 "1.6 kilometer trial complete! Time ${spokenTime(finalSec)}. $verdict"
             )
@@ -606,9 +669,100 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         )
     }
 
+    /**
+     * Plays an instant earcon beep + clear TTS voice cue whenever the auto-detected MotionState changes.
+     * Active during recorded workouts, Auto-Start armed mode, and whenever the app UI is visible on screen.
+     */
+    private fun onMotionStateChanged(previousState: MotionState, newState: MotionState, nowMs: Long) {
+        if (!repository.stateChangeAudioEnabled) return
+        if (!isRecording && !isAutoStartArmed && !uiForegroundVisible) return
+        if (!isRecording && (nowMs - lastFinishSpeechMs) in 0L..6000L) return
+
+        requestAudioFocusQuietly()
+        playStateTone(newState)
+        if (isRecording) {
+            vibratePulse(70L)
+        }
+
+        val speech = MotionStateAudioCue.buildTransitionSpeech(
+            previousState = previousState,
+            newState = newState,
+            isRecording = isRecording,
+            targetTimeSec = repository.targetTimeSec
+        )
+        speakStateTransition(speech, nowMs)
+    }
+
+    /**
+     * Manual test/preview cue triggered from the UI audio toggle or settings screen.
+     */
+    fun previewStateChangeAudio(sampleState: MotionState = MotionState.RUNNING) {
+        requestAudioFocusQuietly()
+        playStateTone(sampleState)
+        val speech = if (repository.stateChangeAudioEnabled) {
+            val cue = MotionStateAudioCue.buildTransitionSpeech(
+                previousState = MotionState.JOGGING,
+                newState = sampleState,
+                isRecording = true,
+                targetTimeSec = repository.targetTimeSec
+            )
+            "State audio active. $cue"
+        } else {
+            "State audio muted."
+        }
+        speakStateTransition(speech, SystemClock.elapsedRealtime())
+    }
+
+    private fun speakStateTransition(speech: String, nowMs: Long) {
+        pendingStateSpeechRunnable?.let { mainHandler.removeCallbacks(it) }
+        if (!ttsReady) {
+            mainHandler.postDelayed({ abandonAudioFocusQuietly() }, 500L)
+            return
+        }
+        val queueMode = if ((nowMs - lastMilestoneSpeechMs) in 0L..4500L) {
+            TextToSpeech.QUEUE_ADD
+        } else {
+            TextToSpeech.QUEUE_FLUSH
+        }
+        val r = Runnable {
+            tts?.speak(speech, queueMode, null, "ts_state_${SystemClock.elapsedRealtime()}")
+        }
+        pendingStateSpeechRunnable = r
+        mainHandler.postDelayed(r, 130L)
+    }
+
+    private fun playStateTone(state: MotionState) {
+        val (toneType, durationMs) = when (state) {
+            MotionState.TARGET_PACE -> ToneGenerator.TONE_PROP_ACK to 160
+            MotionState.RUNNING -> ToneGenerator.TONE_PROP_BEEP to 110
+            MotionState.JOGGING -> ToneGenerator.TONE_PROP_BEEP2 to 120
+            MotionState.WALKING -> ToneGenerator.TONE_SUP_PIP to 90
+            MotionState.STANDING -> ToneGenerator.TONE_PROP_NACK to 160
+        }
+        runCatching {
+            if (toneGenerator == null) {
+                toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 85)
+            }
+            toneGenerator?.startTone(toneType, durationMs)
+        }
+    }
+
     private fun speakCoach(message: String) {
         if (!repository.voiceCoachEnabled || !ttsReady) return
-        tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, "ts_coach_${SystemClock.elapsedRealtime()}")
+        pendingStateSpeechRunnable?.let { mainHandler.removeCallbacks(it) }
+        lastMilestoneSpeechMs = SystemClock.elapsedRealtime()
+        requestAudioFocusQuietly()
+        tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, "ts_coach_$lastMilestoneSpeechMs")
+    }
+
+    private fun requestAudioFocusQuietly() {
+        val req = audioFocusRequest ?: return
+        runCatching { audioManager?.requestAudioFocus(req) }
+    }
+
+    private fun abandonAudioFocusQuietly() {
+        val req = audioFocusRequest ?: return
+        runCatching { audioManager?.abandonAudioFocusRequest(req) }
     }
 
     private fun spokenTime(sec: Double): String {
