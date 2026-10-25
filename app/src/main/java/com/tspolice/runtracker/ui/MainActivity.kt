@@ -843,13 +843,14 @@ class MainActivity : AppCompatActivity() {
 
         // Switches for State-Change Audio, Voice Coach & Indoor Step Fallback
         stateAudioSwitch = Switch(this).apply {
-            text = "State Change Audio (Beep + Voice on Stand/Walk/Jog/Run/Target)"
+            text = "Pocket & Screen-Off State Audio (Speaks Stand/Walk/Jog/Run in pocket)"
             setTextColor(0xFFE2E8F0.toInt())
             textSize = 13f
             isChecked = repository.stateChangeAudioEnabled
             setPadding(0, dp(6), 0, dp(6))
             setOnCheckedChangeListener { _, checked ->
                 repository.stateChangeAudioEnabled = checked
+                trackingService?.syncPocketForegroundAndWakeLock()
                 refreshStateAudioChip()
             }
         }
@@ -956,6 +957,7 @@ class MainActivity : AppCompatActivity() {
     // =========================================================================
     private fun renderLiveTelemetry(snap: LiveTelemetry) {
         currentlyRecording = snap.isRecording
+        refreshStateAudioChip()
         val targetSec = repository.targetTimeSec
 
         // Mode highlight
@@ -1380,7 +1382,10 @@ class MainActivity : AppCompatActivity() {
     private fun refreshStateAudioChip() {
         if (!::stateAudioChip.isInitialized) return
         val on = repository.stateChangeAudioEnabled
-        stateAudioChip.text = if (on) "AUDIO ON" else "MUTED"
+        if (::stateAudioSwitch.isInitialized && stateAudioSwitch.isChecked != on) {
+            stateAudioSwitch.isChecked = on
+        }
+        stateAudioChip.text = if (on) "POCKET AUDIO ON" else "MUTED"
         stateAudioChip.setTextColor(if (on) 0xFF38BDF8.toInt() else 0xFF64748B.toInt())
         stateAudioChip.background = roundedBox(
             if (on) 0x1E38BDF8 else 0xFF111827.toInt(),

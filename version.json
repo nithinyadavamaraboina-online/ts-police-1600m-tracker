@@ -1,8 +1,8 @@
 {
-    "versionCode":  3,
-    "versionName":  "1.0.2",
+    "versionCode":  4,
+    "versionName":  "1.0.3",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "3a16aad166c5173dbe2f92790a48dc7d098d33cfd4083b54952fa786f58b0981",
-    "changelog":  "Added periodic background JobScheduler auto-update checks (every 15 min, survives reboot), silent APK pre-download with SHA-256 verification, 1-tap system notification install, and app-resume checks.",
-    "publishedAt":  "2026-10-25T16:49:48Z"
+    "sha256":  "e0e2b21af58d1a179c253094e763b561506f587e68b11f04113cfabf98b403a2",
+    "changelog":  "Fixed screen-off pocket audio \u0026 gait detection: keeps CPU/sensors/audio awake when phone is locked in pocket (even without starting a timed run), routes voice/beeps over Media stream, adds lockscreen Mute button, and sharpens Stand/Walk/Jog/Run responsiveness.",
+    "publishedAt":  "2026-10-25T17:01:35Z"
 }

@@ -27,6 +27,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -66,6 +67,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         private const val TICK_INTERVAL_MS = 200L
         private const val GPS_FRESHNESS_MS = 5500L
         private const val MAX_ACCEPTABLE_GPS_ACCURACY_M = 28f
+        const val ACTION_MUTE_POCKET_AUDIO = "com.tspolice.runtracker.ACTION_MUTE_POCKET_AUDIO"
     }
 
     inner class LocalBinder : Binder() {
@@ -79,6 +81,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private lateinit var repository: RunRepository
     private lateinit var sensorManager: SensorManager
     private lateinit var locationManager: LocationManager
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private val signalProcessor = MotionSignalProcessor()
     private val gaitClassifier = GaitClassifier()
@@ -90,10 +93,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var ttsReady = false
     private var pendingStateSpeechRunnable: Runnable? = null
 
-    private var sensorsRegistered = false
+    private var accelRegistered = false
+    private var stepDetectorRegistered = false
     private var locationRegistered = false
     private var hasHardwareStepDetector = false
     private var uiForegroundVisible = false
+    private var isInForeground = false
 
     // Session & state-transition audio tracking
     private var isRecording = false
@@ -149,15 +154,24 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         syncThresholdsFromPrefs()
         createNotificationChannel()
 
+        val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        wakeLock = powerManager?.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "TSPoliceTracker::PocketGaitWakeLock"
+        )?.apply {
+            setReferenceCounted(false)
+        }
+
+        // Route TTS and tones through USAGE_MEDIA / STREAM_MUSIC so lockscreen / pocket screen-off never mutes audio
         val audioAttrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+            .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build()
         audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
             .setAudioAttributes(audioAttrs)
             .setWillPauseWhenDucked(false)
             .build()
-        toneGenerator = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 85) }.getOrNull()
+        toneGenerator = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 95) }.getOrNull()
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -187,17 +201,26 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
     override fun onBind(intent: Intent?): IBinder {
         startPassiveTelemetry()
+        syncPocketForegroundAndWakeLock()
         return binder
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_MUTE_POCKET_AUDIO) {
+            repository.stateChangeAudioEnabled = false
+            syncPocketForegroundAndWakeLock()
+            broadcastTelemetry()
+            return START_STICKY
+        }
         startPassiveTelemetry()
+        syncPocketForegroundAndWakeLock()
         return START_STICKY
     }
 
     override fun onDestroy() {
         mainHandler.removeCallbacksAndMessages(null)
         unregisterHardwareStreams()
+        releaseWakeLockQuietly()
         abandonAudioFocusQuietly()
         runCatching { toneGenerator?.release() }
         toneGenerator = null
@@ -207,10 +230,40 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     fun setUiForegroundVisible(visible: Boolean) {
-        val becameVisible = visible && !uiForegroundVisible
         uiForegroundVisible = visible
-        if (becameVisible && !isRecording && !isAutoStartArmed) {
-            lastAnnouncedState = gaitClassifier.currentState()
+        syncPocketForegroundAndWakeLock()
+    }
+
+    /**
+     * Keeps CPU, accelerometer/step sensors, GPS, and media audio active when the user locks their phone
+     * and puts it in their pocket whenever State Audio is ON, Auto-Start is armed, or a run is recording.
+     */
+    fun syncPocketForegroundAndWakeLock() {
+        val keepPocketAwake = isRecording || isAutoStartArmed || repository.stateChangeAudioEnabled
+        if (keepPocketAwake) {
+            acquireWakeLockQuietly()
+            promoteToForeground()
+        } else {
+            releaseWakeLockQuietly()
+            demoteFromForeground()
+        }
+    }
+
+    private fun acquireWakeLockQuietly() {
+        runCatching {
+            val wl = wakeLock ?: return
+            if (!wl.isHeld) {
+                wl.acquire(3L * 60L * 60L * 1000L) // up to 3 hours continuous pocket testing/running
+            }
+        }
+    }
+
+    private fun releaseWakeLockQuietly() {
+        runCatching {
+            val wl = wakeLock ?: return
+            if (wl.isHeld) {
+                wl.release()
+            }
         }
     }
 
@@ -231,6 +284,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     fun refreshPermissionsAndSensors() {
         registerLocationIfPermitted()
         registerMotionSensors()
+        syncPocketForegroundAndWakeLock()
     }
 
     fun setRunMode(mode: RunMode) {
@@ -244,11 +298,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (isRecording) return
         isAutoStartArmed = armed
         autoStartMotionStreakMs = 0L
+        syncPocketForegroundAndWakeLock()
         if (armed) {
-            promoteToForeground()
             speakCoach("Auto start armed. Begin jogging or running whenever ready.")
-        } else {
-            stopForeground(STOP_FOREGROUND_REMOVE)
         }
         broadcastTelemetry()
     }
@@ -285,7 +337,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         lastStepCountForFallback = signalProcessor.totalSteps
         lastAnnouncedState = gaitClassifier.currentState()
 
-        promoteToForeground()
+        syncPocketForegroundAndWakeLock()
         vibratePulse(140L)
         if (triggeredAutomatically) {
             speakCoach("Movement detected. Timer started.")
@@ -305,7 +357,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     fun finishWorkout(forceSave: Boolean = true): Long? {
         if (!isRecording) return null
         isRecording = false
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        syncPocketForegroundAndWakeLock()
 
         var savedId: Long? = null
         if (forceSave && (distanceMeters >= 30.0 || activeDurationSec >= 10.0)) {
@@ -350,7 +402,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     fun discardWorkout() {
         isRecording = false
         isAutoStartArmed = false
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        syncPocketForegroundAndWakeLock()
         distanceMeters = 0.0
         activeDurationSec = 0.0
         pausedDurationSec = 0.0
@@ -366,33 +418,38 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     private fun registerMotionSensors() {
-        if (sensorsRegistered) return
         val canReadSteps = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ContextCompat.checkSelfPermission(this, Manifest.permission.ACTIVITY_RECOGNITION) ==
                 PackageManager.PERMISSION_GRANTED
         } else true
 
-        if (canReadSteps) {
+        if (canReadSteps && !stepDetectorRegistered) {
             val stepDetector = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
             if (stepDetector != null) {
-                hasHardwareStepDetector = sensorManager.registerListener(
+                stepDetectorRegistered = sensorManager.registerListener(
                     this,
                     stepDetector,
-                    SensorManager.SENSOR_DELAY_FASTEST
+                    SensorManager.SENSOR_DELAY_FASTEST,
+                    0
                 )
+                hasHardwareStepDetector = stepDetectorRegistered
             }
         }
 
-        val linearAccel = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
-        if (linearAccel != null) {
-            sensorManager.registerListener(this, linearAccel, SensorManager.SENSOR_DELAY_GAME)
-        } else {
+        // Use physical hardware TYPE_ACCELEROMETER (with maxReportLatencyUs = 0) so events continue
+        // uninterrupted when the screen turns off in a pocket (virtual TYPE_LINEAR_ACCELERATION uses
+        // gyroscope on many OEMs and can pause on screen-off).
+        if (!accelRegistered) {
             val rawAccel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
             if (rawAccel != null) {
-                sensorManager.registerListener(this, rawAccel, SensorManager.SENSOR_DELAY_GAME)
+                accelRegistered = sensorManager.registerListener(
+                    this,
+                    rawAccel,
+                    SensorManager.SENSOR_DELAY_GAME,
+                    0
+                )
             }
         }
-        sensorsRegistered = true
     }
 
     private fun registerLocationIfPermitted() {
@@ -431,7 +488,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private fun unregisterHardwareStreams() {
         runCatching { sensorManager.unregisterListener(this) }
         runCatching { locationManager.removeUpdates(this) }
-        sensorsRegistered = false
+        accelRegistered = false
+        stepDetectorRegistered = false
         locationRegistered = false
     }
 
@@ -532,7 +590,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
         val cadenceSpm = signalProcessor.getCadenceSpm(nowMs)
         val accelRms = signalProcessor.getDynamicAccelRms(nowMs)
-        val gpsForClassifier = if (gpsFresh) smoothedGpsSpeedMps else null
+        val gpsReliableForGait = gpsFresh &&
+            (latestGpsAccuracyM == null || latestGpsAccuracyM!! <= 14f || smoothedGpsSpeedMps >= 0.70)
+        val gpsForClassifier = if (gpsReliableForGait) smoothedGpsSpeedMps else null
 
         val state = gaitClassifier.update(
             nowMs = nowMs,
@@ -594,12 +654,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             } else {
                 pausedDurationSec += dtSec
             }
+        }
 
-            if (nowMs - lastNotificationUpdateMs >= 1000L) {
-                lastNotificationUpdateMs = nowMs
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(NOTIFICATION_ID, buildForegroundNotification(state, effectiveSpeedMps))
-            }
+        if (isInForeground && nowMs - lastNotificationUpdateMs >= 1000L) {
+            lastNotificationUpdateMs = nowMs
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(NOTIFICATION_ID, buildForegroundNotification(state, effectiveSpeedMps, cadenceSpm))
         }
 
         broadcastTelemetry(effectiveSpeedMps, gpsFresh, cadenceSpm, accelRms)
@@ -671,18 +731,15 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
     /**
      * Plays an instant earcon beep + clear TTS voice cue whenever the auto-detected MotionState changes.
-     * Active during recorded workouts, Auto-Start armed mode, and whenever the app UI is visible on screen.
+     * Works both with the screen open AND with the phone locked inside your pocket whenever State Audio is ON.
      */
     private fun onMotionStateChanged(previousState: MotionState, newState: MotionState, nowMs: Long) {
         if (!repository.stateChangeAudioEnabled) return
-        if (!isRecording && !isAutoStartArmed && !uiForegroundVisible) return
         if (!isRecording && (nowMs - lastFinishSpeechMs) in 0L..6000L) return
 
         requestAudioFocusQuietly()
         playStateTone(newState)
-        if (isRecording) {
-            vibratePulse(70L)
-        }
+        vibratePulse(if (newState == MotionState.RUNNING || newState == MotionState.TARGET_PACE) 110L else 65L)
 
         val speech = MotionStateAudioCue.buildTransitionSpeech(
             previousState = previousState,
@@ -697,6 +754,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
      * Manual test/preview cue triggered from the UI audio toggle or settings screen.
      */
     fun previewStateChangeAudio(sampleState: MotionState = MotionState.RUNNING) {
+        syncPocketForegroundAndWakeLock()
         requestAudioFocusQuietly()
         playStateTone(sampleState)
         val speech = if (repository.stateChangeAudioEnabled) {
@@ -706,11 +764,16 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 isRecording = true,
                 targetTimeSec = repository.targetTimeSec
             )
-            "State audio active. $cue"
+            "Pocket audio active. $cue"
         } else {
-            "State audio muted."
+            "Pocket audio muted."
         }
         speakStateTransition(speech, SystemClock.elapsedRealtime())
+    }
+
+    private fun ttsMediaParams(): Bundle = Bundle().apply {
+        putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
+        putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
     }
 
     private fun speakStateTransition(speech: String, nowMs: Long) {
@@ -725,7 +788,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             TextToSpeech.QUEUE_FLUSH
         }
         val r = Runnable {
-            tts?.speak(speech, queueMode, null, "ts_state_${SystemClock.elapsedRealtime()}")
+            tts?.speak(speech, queueMode, ttsMediaParams(), "ts_state_${SystemClock.elapsedRealtime()}")
         }
         pendingStateSpeechRunnable = r
         mainHandler.postDelayed(r, 130L)
@@ -741,7 +804,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         }
         runCatching {
             if (toneGenerator == null) {
-                toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 85)
+                toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 95)
             }
             toneGenerator?.startTone(toneType, durationMs)
         }
@@ -752,7 +815,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         pendingStateSpeechRunnable?.let { mainHandler.removeCallbacks(it) }
         lastMilestoneSpeechMs = SystemClock.elapsedRealtime()
         requestAudioFocusQuietly()
-        tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, "ts_coach_$lastMilestoneSpeechMs")
+        tts?.speak(message, TextToSpeech.QUEUE_FLUSH, ttsMediaParams(), "ts_coach_$lastMilestoneSpeechMs")
     }
 
     private fun requestAudioFocusQuietly() {
@@ -785,21 +848,36 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     private fun promoteToForeground() {
-        val notification = buildForegroundNotification(gaitClassifier.currentState(), 0.0)
+        val notification = buildForegroundNotification(gaitClassifier.currentState(), 0.0, 0.0)
         runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-                )
+                val hasLocationPerm =
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                val fgType = if (hasLocationPerm) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                } else {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                }
+                startForeground(NOTIFICATION_ID, notification, fgType)
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
+            isInForeground = true
         }
     }
 
-    private fun buildForegroundNotification(state: MotionState, speedMps: Double): Notification {
+    private fun demoteFromForeground() {
+        if (!isInForeground) return
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        isInForeground = false
+    }
+
+    private fun buildForegroundNotification(
+        state: MotionState,
+        speedMps: Double,
+        cadenceSpm: Double = 0.0
+    ): Notification {
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
@@ -809,21 +887,48 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val title = if (isAutoStartArmed && !isRecording) {
-            "Auto-Start Armed • Waiting for Jog/Run"
-        } else {
-            "${String.format("%.2f km", distanceMeters / 1000.0)} • ${TsPoliceBenchmark.formatDuration(activeDurationSec)} • ${state.label}"
-        }
-        val subtitle = "Pace ${TsPoliceBenchmark.formatPacePerKm(speedMps)} • Target 1.6km < 7:15"
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val title = when {
+            isRecording ->
+                "${String.format("%.2f km", distanceMeters / 1000.0)} • ${TsPoliceBenchmark.formatDuration(activeDurationSec)} • ${state.label}"
+            isAutoStartArmed ->
+                "Auto-Start Armed • ${state.label}"
+            else ->
+                "Pocket Gait Audio Active • ${state.label}"
+        }
+        val subtitle = if (isRecording) {
+            "Pace ${TsPoliceBenchmark.formatPacePerKm(speedMps)} • Target 1.6km < 7:15"
+        } else {
+            "Cadence ${cadenceSpm.toInt()} spm • Speaks Stand/Walk/Jog/Run in pocket"
+        }
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(title)
             .setContentText(subtitle)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(pending)
-            .build()
+
+        if (!isRecording && repository.stateChangeAudioEnabled) {
+            val muteIntent = Intent(this, RunTrackingService::class.java).apply {
+                action = ACTION_MUTE_POCKET_AUDIO
+            }
+            val mutePending = PendingIntent.getService(
+                this,
+                1601,
+                muteIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(
+                android.R.drawable.ic_lock_silent_mode,
+                "Mute Pocket Audio",
+                mutePending
+            )
+        }
+
+        return builder.build()
     }
 
     private fun createNotificationChannel() {

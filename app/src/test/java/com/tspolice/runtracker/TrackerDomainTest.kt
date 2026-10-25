@@ -179,6 +179,25 @@ class TrackerDomainTest {
         )
     }
 
+    @Test
+    fun `pocket gait classifier detects walking jogging and running even when indoor gps speed is zero`() {
+        val classifier = GaitClassifier()
+
+        // Stationary indoor GPS (0.0 m/s) must NOT suppress real footstrikes in a pocket
+        assertEquals(
+            MotionState.WALKING,
+            classifier.classifyInstant(gpsSpeedMps = 0.0, cadenceSpm = 102.0, dynamicAccelRms = 2.2)
+        )
+        assertEquals(
+            MotionState.JOGGING,
+            classifier.classifyInstant(gpsSpeedMps = 0.0, cadenceSpm = 148.0, dynamicAccelRms = 4.6)
+        )
+        assertEquals(
+            MotionState.RUNNING,
+            classifier.classifyInstant(gpsSpeedMps = 0.0, cadenceSpm = 170.0, dynamicAccelRms = 7.2)
+        )
+    }
+
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
         val is1600 = mode == RunMode.TIMED_1600M
         return RunSessionRecord(

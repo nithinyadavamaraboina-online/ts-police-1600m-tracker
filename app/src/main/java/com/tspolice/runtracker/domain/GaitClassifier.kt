@@ -20,8 +20,8 @@ class GaitClassifier(
         const val DEFAULT_JOGGING_SPEED_MPS = 1.85   // ~6.66 km/h (9:00 /km)
         const val DEFAULT_RUNNING_SPEED_MPS = 3.05   // ~10.98 km/h (5:28 /km)
 
-        const val UPGRADE_DEBOUNCE_MS = 1800L
-        const val DOWNGRADE_DEBOUNCE_MS = 2800L
+        const val UPGRADE_DEBOUNCE_MS = 1400L
+        const val DOWNGRADE_DEBOUNCE_MS = 2000L
     }
 
     private var committedState: MotionState = MotionState.STANDING
@@ -57,19 +57,25 @@ class GaitClassifier(
                 return MotionState.STANDING
             }
 
-            // Fuse GPS ground speed with cadence-implied speed when steps are observed
-            val fusedSpeed = if (cadenceSpm >= 55.0) {
-                0.78 * gps + 0.22 * impliedStepSpeed
-            } else {
-                gps
+            // Fuse GPS ground speed with cadence-implied speed; never let a stationary indoor/lagging GPS
+            // fix (0.0 m/s) crush unmistakable active footstrikes in a pocket.
+            val fusedSpeed = when {
+                cadenceSpm >= 55.0 && gps < 0.75 && dynamicAccelRms >= 1.65 ->
+                    maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.94 * impliedStepSpeed)
+                cadenceSpm >= 55.0 && impliedStepSpeed > gps * 1.45 && dynamicAccelRms >= 3.8 ->
+                    maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.88 * impliedStepSpeed)
+                cadenceSpm >= 55.0 ->
+                    0.78 * gps + 0.22 * impliedStepSpeed
+                else -> gps
             }
 
             return when {
-                fusedSpeed >= targetSpeedThresholdMps -> MotionState.TARGET_PACE
+                fusedSpeed >= targetSpeedThresholdMps ||
+                    (cadenceSpm >= 176.0 && dynamicAccelRms >= 8.2 && gps >= 3.35) -> MotionState.TARGET_PACE
                 fusedSpeed >= runningSpeedThresholdMps ||
-                    (gps >= 2.75 && cadenceSpm >= 166.0 && dynamicAccelRms >= 6.8) -> MotionState.RUNNING
+                    (cadenceSpm >= 164.0 && dynamicAccelRms >= 6.6) -> MotionState.RUNNING
                 fusedSpeed >= DEFAULT_JOGGING_SPEED_MPS ||
-                    (gps >= 1.55 && cadenceSpm >= 136.0 && dynamicAccelRms >= 3.8) -> MotionState.JOGGING
+                    (cadenceSpm >= 134.0 && dynamicAccelRms >= 3.8) -> MotionState.JOGGING
                 else -> MotionState.WALKING
             }
         }
@@ -234,8 +240,8 @@ class MotionSignalProcessor {
         val hwLast = lastHardwareStepMs
         val useSoftwareFallback = hwLast == null || (nowMs - hwLast) > 2500L
         if (useSoftwareFallback) {
-            val minStepIntervalMs = 250L // max 240 steps/min
-            val peakThreshold = 2.25     // m/s^2 dynamic impulse peak
+            val minStepIntervalMs = 260L // max ~230 steps/min, rejects pocket double-bounce
+            val peakThreshold = 1.65     // m/s^2 dynamic impulse peak (captures gentle pocket walking + running)
             if (mag > prevDynamicMag) {
                 rising = true
             } else if (rising && prevDynamicMag >= peakThreshold && (nowMs - lastAccelStepMs) >= minStepIntervalMs) {
@@ -254,18 +260,24 @@ class MotionSignalProcessor {
 
     fun getCadenceSpm(nowMs: Long): Double {
         pruneOld(nowMs)
-        val count = stepTimestampsMs.size
-        if (count == 0) return 0.0
-        val firstMs = stepTimestampsMs.first()
+        val totalCount = stepTimestampsMs.size
+        if (totalCount == 0) return 0.0
         val lastMs = stepTimestampsMs.last()
         val silenceMs = nowMs - lastMs
-        if (silenceMs > 3500L) return 0.0
-
-        if (count == 1) {
-            return if (silenceMs < 1800L) 60.0 else 0.0
+        val recentRms = getDynamicAccelRms(nowMs)
+        if (silenceMs > 2200L || (silenceMs > 1550L && recentRms < 1.15)) {
+            return 0.0
         }
+
+        if (totalCount == 1) {
+            return if (silenceMs < 1500L) 65.0 else 0.0
+        }
+
+        // Use most recent 6 footstrikes so Walk <-> Jog <-> Run cadence transitions react in ~1.5s
+        val startIdx = (totalCount - 6).coerceAtLeast(0)
+        val firstMs = stepTimestampsMs[startIdx]
+        val count = totalCount - startIdx
         val stepSpanMs = (lastMs - firstMs).coerceAtLeast(300L)
-        // Include trailing silence if user has slowed down since last detected footstrike
         val avgPeriodMs = stepSpanMs.toDouble() / (count - 1).toDouble()
         val effectiveSpanMs = if (silenceMs > avgPeriodMs * 1.35) {
             (nowMs - firstMs).toDouble()
@@ -278,17 +290,17 @@ class MotionSignalProcessor {
 
     fun getDynamicAccelRms(nowMs: Long): Double {
         pruneOld(nowMs)
-        val recent = accelSamples.filter { nowMs - it.first <= 2200L }
+        val recent = accelSamples.filter { nowMs - it.first <= 1500L }
         if (recent.isEmpty()) return 0.0
         val meanSq = recent.sumOf { it.second * it.second } / recent.size
         return sqrt(meanSq)
     }
 
     private fun pruneOld(nowMs: Long) {
-        while (stepTimestampsMs.isNotEmpty() && nowMs - stepTimestampsMs.first() > 8000L) {
+        while (stepTimestampsMs.isNotEmpty() && nowMs - stepTimestampsMs.first() > 5000L) {
             stepTimestampsMs.removeFirst()
         }
-        while (accelSamples.isNotEmpty() && nowMs - accelSamples.first().first > 3000L) {
+        while (accelSamples.isNotEmpty() && nowMs - accelSamples.first().first > 2500L) {
             accelSamples.removeFirst()
         }
     }
