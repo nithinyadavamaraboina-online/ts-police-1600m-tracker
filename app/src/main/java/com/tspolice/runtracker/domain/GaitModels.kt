@@ -56,17 +56,53 @@ enum class MotionState(
         colorArgb = 0xFF10B981.toInt(),
         countsAsActiveMovement = true,
         intensityRank = 4
-    )
+    );
+
+    fun isJogOrRun(): Boolean =
+        this == JOGGING || this == RUNNING || this == TARGET_PACE
+}
+
+enum class PtTrialPhase {
+    IDLE,
+    ARMED_WAITING_FOR_JOG_RUN,
+    RUNNING_TRIAL
+}
+
+/**
+ * Always-on whole-day automatic activity summary (00:00 -> 23:59 local date).
+ * Automatically accumulates Walking vs Jogging + Running without pressing any Start button.
+ */
+data class DailyActivitySummary(
+    val dateIso: String = "",
+    val walkingSec: Double = 0.0,
+    val joggingSec: Double = 0.0,
+    val runningSec: Double = 0.0,
+    val walkingMeters: Double = 0.0,
+    val joggingMeters: Double = 0.0,
+    val runningMeters: Double = 0.0,
+    val totalSteps: Int = 0,
+    val maxSpeedMps: Double = 0.0,
+    val maxCadenceSpm: Double = 0.0,
+    val isDemo: Boolean = false
+) {
+    val jogRunCombinedSec: Double
+        get() = joggingSec + runningSec
+
+    val jogRunCombinedMeters: Double
+        get() = joggingMeters + runningMeters
+
+    val totalDistanceMeters: Double
+        get() = walkingMeters + joggingMeters + runningMeters
 }
 
 enum class RunMode(val title: String, val subtitle: String) {
     TIMED_1600M(
-        title = "1.6 km TS Police Trial",
-        subtitle = "Auto-finishes at 1,600m • 400m track splits vs 7:15"
+        title = "1.6 km TS Police PT Trial",
+        subtitle = "Starts automatically on Jog/Run • Auto-finishes at 1,600m"
     ),
     OPEN_PRACTICE(
-        title = "Open Practice Run",
-        subtitle = "Unlimited distance • Auto-detects Jog vs Run + 1.6km equiv"
+        title = "All-Day Auto Run",
+        subtitle = "Auto-detected continuous jog/run session"
     ),
     MANUAL_LOG(
         title = "Manual Stopwatch Entry",
@@ -85,6 +121,7 @@ data class LapSplit(
 data class LiveTelemetry(
     val isRecording: Boolean = false,
     val isAutoStartArmed: Boolean = false,
+    val ptTrialPhase: PtTrialPhase = PtTrialPhase.IDLE,
     val mode: RunMode = RunMode.TIMED_1600M,
     val motionState: MotionState = MotionState.STANDING,
     val distanceMeters: Double = 0.0,
@@ -105,6 +142,7 @@ data class LiveTelemetry(
     val walkingMeters: Double = 0.0,
     val first1600mSplitSec: Double? = null,
     val lapSplits: List<LapSplit> = emptyList(),
+    val dailySummary: DailyActivitySummary = DailyActivitySummary(),
     val justFinishedSessionId: Long? = null
 )
 

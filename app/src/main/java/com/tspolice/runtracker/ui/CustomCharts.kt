@@ -145,17 +145,18 @@ class PaceArcGaugeView(context: Context) : View(context) {
 
         // State pill above timer
         val badgeStr = when {
-            isArmed && !isRecording -> "ARMED • START JOG/RUN TO BEGIN"
+            isArmed && !isRecording -> "PT READY • START JOG/RUN TO BEGIN"
             else -> state.badgeText
         }
+        val pillColor = if (isArmed && !isRecording) 0xFFF59E0B.toInt() else state.colorArgb
         val textW = badgeTextPaint.measureText(badgeStr)
         val pillW = textW + dp(22f)
         val pillH = dp(24f)
         val pillTop = cy - dp(56f)
         pillRect.set(cx - pillW / 2f, pillTop, cx + pillW / 2f, pillTop + pillH)
-        badgeBgPaint.color = (state.colorArgb and 0x00FFFFFF) or 0x33000000
+        badgeBgPaint.color = (pillColor and 0x00FFFFFF) or 0x33000000
         canvas.drawRoundRect(pillRect, dp(12f), dp(12f), badgeBgPaint)
-        badgeTextPaint.color = if (state == MotionState.STANDING) 0xFFCBD5E1.toInt() else state.colorArgb
+        badgeTextPaint.color = if (!isArmed && state == MotionState.STANDING) 0xFFCBD5E1.toInt() else pillColor
         canvas.drawText(badgeStr, cx, pillTop + dp(16.5f), badgeTextPaint)
 
         // Main timer
@@ -174,7 +175,10 @@ class PaceArcGaugeView(context: Context) : View(context) {
         val delta = TsPoliceBenchmark.splitDeltaSec(distanceM, activeSec, targetTimeSec)
         val targetLabel = TsPoliceBenchmark.formatDuration(targetTimeSec)
         val bottomText: String
-        if (delta != null && (isRecording || activeSec > 0.0)) {
+        if (isArmed && !isRecording) {
+            deltaPaint.color = 0xFFFBBF24.toInt()
+            bottomText = "Walking ignored • Timer starts automatically on Jog/Run"
+        } else if (delta != null && (isRecording || activeSec > 0.0)) {
             if (delta <= 0.0) {
                 deltaPaint.color = 0xFF10B981.toInt()
                 bottomText = "${TsPoliceBenchmark.formatSignedDelta(delta)} AHEAD OF $targetLabel"

@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.LapSplit
 import com.tspolice.runtracker.domain.MotionState
@@ -23,8 +24,9 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
 ) {
     companion object {
         private const val DB_NAME = "ts_police_1600m.db"
-        private const val DB_VERSION = 1
+        private const val DB_VERSION = 2
         private const val TABLE_RUNS = "run_sessions"
+        private const val TABLE_DAILY = "daily_activity"
         private const val PREFS_NAME = "ts_police_prefs"
 
         private const val KEY_TARGET_SEC = "target_time_sec"
@@ -32,6 +34,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_VOICE_COACH = "voice_coach_enabled"
         private const val KEY_STATE_CHANGE_AUDIO = "state_change_audio_enabled"
         private const val KEY_STEP_FALLBACK = "indoor_step_distance_fallback"
+        private const val KEY_ALL_DAY_AUTO = "all_day_auto_tracking_enabled"
     }
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -39,7 +42,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """
-            CREATE TABLE $TABLE_RUNS (
+            CREATE TABLE IF NOT EXISTS $TABLE_RUNS (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 started_at_ms INTEGER NOT NULL,
                 date_iso TEXT NOT NULL,
@@ -60,12 +63,35 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             )
             """.trimIndent()
         )
-        db.execSQL("CREATE INDEX idx_runs_date ON $TABLE_RUNS(date_iso, started_at_ms DESC)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_runs_date ON $TABLE_RUNS(date_iso, started_at_ms DESC)")
+        createDailyTableIfNeeded(db)
+    }
+
+    private fun createDailyTableIfNeeded(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $TABLE_DAILY (
+                date_iso TEXT PRIMARY KEY NOT NULL,
+                walking_sec REAL NOT NULL DEFAULT 0,
+                jogging_sec REAL NOT NULL DEFAULT 0,
+                running_sec REAL NOT NULL DEFAULT 0,
+                walking_m REAL NOT NULL DEFAULT 0,
+                jogging_m REAL NOT NULL DEFAULT 0,
+                running_m REAL NOT NULL DEFAULT 0,
+                total_steps INTEGER NOT NULL DEFAULT 0,
+                max_speed_mps REAL NOT NULL DEFAULT 0,
+                max_cadence_spm REAL NOT NULL DEFAULT 0,
+                is_demo INTEGER NOT NULL DEFAULT 0
+            )
+            """.trimIndent()
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_RUNS")
-        onCreate(db)
+        // Non-destructive upgrade: preserve all existing user run_sessions!
+        if (oldVersion < 2) {
+            createDailyTableIfNeeded(db)
+        }
     }
 
     var targetTimeSec: Double
@@ -87,6 +113,95 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     var indoorStepFallbackEnabled: Boolean
         get() = prefs.getBoolean(KEY_STEP_FALLBACK, true)
         set(value) = prefs.edit().putBoolean(KEY_STEP_FALLBACK, value).apply()
+
+    var allDayTrackingEnabled: Boolean
+        get() = prefs.getBoolean(KEY_ALL_DAY_AUTO, true)
+        set(value) = prefs.edit().putBoolean(KEY_ALL_DAY_AUTO, value).apply()
+
+    fun getDailyActivity(dateIso: String): DailyActivitySummary {
+        readableDatabase.query(
+            TABLE_DAILY,
+            null,
+            "date_iso = ?",
+            arrayOf(dateIso),
+            null,
+            null,
+            null
+        ).use { c ->
+            if (c.moveToFirst()) {
+                return DailyActivitySummary(
+                    dateIso = c.getString(c.getColumnIndexOrThrow("date_iso")),
+                    walkingSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec")),
+                    joggingSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec")),
+                    runningSec = c.getDouble(c.getColumnIndexOrThrow("running_sec")),
+                    walkingMeters = c.getDouble(c.getColumnIndexOrThrow("walking_m")),
+                    joggingMeters = c.getDouble(c.getColumnIndexOrThrow("jogging_m")),
+                    runningMeters = c.getDouble(c.getColumnIndexOrThrow("running_m")),
+                    totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps")),
+                    maxSpeedMps = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps")),
+                    maxCadenceSpm = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm")),
+                    isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
+                )
+            }
+        }
+        return DailyActivitySummary(dateIso = dateIso)
+    }
+
+    fun upsertDailyActivity(summary: DailyActivitySummary) {
+        if (summary.dateIso.isBlank()) return
+        val values = ContentValues().apply {
+            put("date_iso", summary.dateIso)
+            put("walking_sec", summary.walkingSec)
+            put("jogging_sec", summary.joggingSec)
+            put("running_sec", summary.runningSec)
+            put("walking_m", summary.walkingMeters)
+            put("jogging_m", summary.joggingMeters)
+            put("running_m", summary.runningMeters)
+            put("total_steps", summary.totalSteps)
+            put("max_speed_mps", summary.maxSpeedMps)
+            put("max_cadence_spm", summary.maxCadenceSpm)
+            put("is_demo", if (summary.isDemo) 1 else 0)
+        }
+        writableDatabase.insertWithOnConflict(
+            TABLE_DAILY,
+            null,
+            values,
+            SQLiteDatabase.CONFLICT_REPLACE
+        )
+    }
+
+    fun getRecentDailyActivities(limit: Int = 14): List<DailyActivitySummary> {
+        val out = mutableListOf<DailyActivitySummary>()
+        readableDatabase.query(
+            TABLE_DAILY,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "date_iso DESC",
+            limit.toString()
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(
+                    DailyActivitySummary(
+                        dateIso = c.getString(c.getColumnIndexOrThrow("date_iso")),
+                        walkingSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec")),
+                        joggingSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec")),
+                        runningSec = c.getDouble(c.getColumnIndexOrThrow("running_sec")),
+                        walkingMeters = c.getDouble(c.getColumnIndexOrThrow("walking_m")),
+                        joggingMeters = c.getDouble(c.getColumnIndexOrThrow("jogging_m")),
+                        runningMeters = c.getDouble(c.getColumnIndexOrThrow("running_m")),
+                        totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps")),
+                        maxSpeedMps = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps")),
+                        maxCadenceSpm = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm")),
+                        isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
+                    )
+                )
+            }
+        }
+        return out
+    }
 
     fun insertSession(record: RunSessionRecord): Long {
         val values = ContentValues().apply {
@@ -168,6 +283,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
 
     fun clearDemoSessions() {
         writableDatabase.delete(TABLE_RUNS, "is_demo = 1", null)
+        writableDatabase.delete(TABLE_DAILY, "is_demo = 1", null)
     }
 
     /**
@@ -227,6 +343,25 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
                     walkingSec = 0.0,
                     lapSplits = splits,
                     notes = s.note,
+                    isDemo = true
+                )
+            )
+
+            // Also seed whole-day automatic walk + jog/run activity for those past days
+            val walkSec = 1950.0 + (s.daysAgo * 85.0)
+            val walkM = walkSec * 1.28
+            upsertDailyActivity(
+                DailyActivitySummary(
+                    dateIso = date.toString(),
+                    walkingSec = walkSec,
+                    joggingSec = jogSec,
+                    runningSec = runSec,
+                    walkingMeters = walkM,
+                    joggingMeters = s.distanceM * (1.0 - s.runShare),
+                    runningMeters = s.distanceM * s.runShare,
+                    totalSteps = ((walkM / 0.76) + (s.distanceM / 1.18)).toInt(),
+                    maxSpeedMps = (s.distanceM / s.durationSec) * 1.14,
+                    maxCadenceSpm = if (s.runShare > 0.7) 176.0 else 164.0,
                     isDemo = true
                 )
             )

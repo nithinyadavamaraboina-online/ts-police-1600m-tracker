@@ -1,11 +1,13 @@
 package com.tspolice.runtracker
 
+import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.MotionSignalProcessor
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.MotionStateAudioCue
 import com.tspolice.runtracker.domain.ProgressionForecaster
+import com.tspolice.runtracker.domain.PtTrialPhase
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
@@ -358,6 +360,83 @@ class TrackerDomainTest {
         assertTrue("Expected walking cadence ~105 spm, got $endCadence", endCadence in 92.0..118.0)
         assertEquals(MotionState.WALKING, classifier.currentState())
         assertTrue("Expected >= 7.0m indoor stride distance, got $accumulatedDistanceM", accumulatedDistanceM >= 7.0)
+    }
+
+    @Test
+    fun `daily activity summary combines whole-day jogging and running while keeping walking separate`() {
+        val summary = DailyActivitySummary(
+            dateIso = "2026-10-25",
+            walkingSec = 2400.0,   // 40m 00s walked across the day
+            joggingSec = 420.0,    // 7m 00s jogged
+            runningSec = 450.0,    // 7m 30s ran
+            walkingMeters = 2950.0,
+            joggingMeters = 1010.0,
+            runningMeters = 1610.0,
+            totalSteps = 6820,
+            maxSpeedMps = 4.00,    // 4:10 /km peak pace
+            maxCadenceSpm = 181.0
+        )
+
+        assertEquals(870.0, summary.jogRunCombinedSec, 0.001)      // 14:30 combined jog + run
+        assertEquals("14:30", TsPoliceBenchmark.formatDuration(summary.jogRunCombinedSec))
+        assertEquals("40:00", TsPoliceBenchmark.formatDuration(summary.walkingSec))
+        assertEquals(2620.0, summary.jogRunCombinedMeters, 0.001)  // 2.62 km jog + run
+        assertEquals(5570.0, summary.totalDistanceMeters, 0.001)   // 5.57 km whole-day total
+        assertEquals("4:10 /km", TsPoliceBenchmark.formatPacePerKm(summary.maxSpeedMps))
+    }
+
+    @Test
+    fun `armed 1600m pt trial ignores standing walking and bike and launches only on jogging or running`() {
+        assertFalse(MotionState.STANDING.isJogOrRun())
+        assertFalse(MotionState.WALKING.isJogOrRun())
+        assertFalse(MotionState.VEHICLE.isJogOrRun())
+        assertTrue(MotionState.JOGGING.isJogOrRun())
+        assertTrue(MotionState.RUNNING.isJogOrRun())
+        assertTrue(MotionState.TARGET_PACE.isJogOrRun())
+
+        val classifier = GaitClassifier()
+        var phase = PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN
+        var confirmMs = 0L
+        var launchBufferSec = 0.0
+        var activeTrialSec = 0.0
+
+        // 1. User arms PT Trial, puts phone in pocket, and WALKS for 10 seconds to the 400m track start line:
+        //    PT Trial MUST stay ARMED_WAITING_FOR_JOG_RUN at 0.0s!
+        for (step in 1..40) {
+            val tMs = step * 250L
+            val state = classifier.update(tMs, gpsSpeedMps = 1.32, cadenceSpm = 106.0, dynamicAccelRms = 2.2)
+            assertFalse("Walking must never flag candidateIsJogOrRun", classifier.candidateIsJogOrRun())
+            assertFalse("Walking must never flag state.isJogOrRun", state.isJogOrRun())
+            assertEquals(PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN, phase)
+        }
+        assertEquals(MotionState.WALKING, classifier.currentState())
+        assertEquals(0.0, activeTrialSec, 0.001)
+
+        // 2. User crosses start line and breaks into RUNNING (3.65 m/s, 172 spm):
+        //    Candidate buffers launch seconds immediately, then commits RUNNING_TRIAL and credits launch time!
+        for (step in 41..52) {
+            val tMs = step * 250L
+            val dtSec = 0.25
+            val state = classifier.update(tMs, gpsSpeedMps = 3.65, cadenceSpm = 172.0, dynamicAccelRms = 7.8)
+            if (phase == PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN) {
+                if (state.isJogOrRun()) {
+                    launchBufferSec = (launchBufferSec + dtSec).coerceAtMost(2.6)
+                    confirmMs += 250L
+                    if (confirmMs >= 400L) {
+                        phase = PtTrialPhase.RUNNING_TRIAL
+                        activeTrialSec = launchBufferSec
+                    }
+                } else if (classifier.candidateIsJogOrRun()) {
+                    launchBufferSec = (launchBufferSec + dtSec).coerceAtMost(2.6)
+                    confirmMs = 0L
+                }
+            } else {
+                activeTrialSec += dtSec
+            }
+        }
+
+        assertEquals(PtTrialPhase.RUNNING_TRIAL, phase)
+        assertTrue("Expected launch stride time credited (~2.0..3.0s), got $activeTrialSec", activeTrialSec >= 1.75)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

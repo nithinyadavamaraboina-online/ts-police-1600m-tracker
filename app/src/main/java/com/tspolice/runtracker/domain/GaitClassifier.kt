@@ -36,6 +36,10 @@ class GaitClassifier(
 
     fun currentState(): MotionState = committedState
 
+    fun candidateState(): MotionState = candidateState
+
+    fun candidateIsJogOrRun(): Boolean = candidateState.isJogOrRun()
+
     fun reset() {
         committedState = MotionState.STANDING
         candidateState = MotionState.STANDING

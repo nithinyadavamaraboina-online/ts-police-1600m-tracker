@@ -37,12 +37,14 @@ import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.tspolice.runtracker.data.RunRepository
+import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.LapSplit
 import com.tspolice.runtracker.domain.LiveTelemetry
 import com.tspolice.runtracker.domain.MotionSignalProcessor
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.MotionStateAudioCue
+import com.tspolice.runtracker.domain.PtTrialPhase
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
@@ -104,10 +106,13 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var uiForegroundVisible = false
     private var isInForeground = false
 
-    // Session & state-transition audio tracking
+    // 1.6 km PT Trial state & state-transition audio tracking
+    private var ptTrialPhase: PtTrialPhase = PtTrialPhase.IDLE
     private var isRecording = false
     private var isAutoStartArmed = false
-    private var autoStartMotionStreakMs = 0L
+    private var ptJogRunConfirmMs = 0L
+    private var ptLaunchBufferSec = 0.0
+    private var ptLaunchBufferMeters = 0.0
     private var lastAnnouncedState: MotionState = MotionState.STANDING
     private var lastMilestoneSpeechMs: Long = -10_000L
     private var lastFinishSpeechMs: Long = -10_000L
@@ -115,6 +120,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var sessionStartedWallMs: Long = 0L
     private var lastTickElapsedMs: Long = 0L
 
+    // Active 1.6 km PT Trial counters
     private var distanceMeters = 0.0
     private var activeDurationSec = 0.0
     private var pausedDurationSec = 0.0
@@ -134,6 +140,35 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var nextLapBoundaryM = TsPoliceBenchmark.LAP_DISTANCE_M
     private var prevLapCumulativeSec = 0.0
 
+    // Always-On 24/7 All-Day Auto Activity counters (persisted per YYYY-MM-DD in SQLite)
+    private var dailyDateIso: String = ""
+    private var dailyWalkSec = 0.0
+    private var dailyJogSec = 0.0
+    private var dailyRunSec = 0.0
+    private var dailyWalkMeters = 0.0
+    private var dailyJogMeters = 0.0
+    private var dailyRunMeters = 0.0
+    private var dailyTotalSteps = 0
+    private var dailyMaxSpeedMps = 0.0
+    private var dailyMaxCadenceSpm = 0.0
+    private var dailyDirty = false
+    private var lastDailyPersistElapsedMs = 0L
+    private var lastSignalStepsProcessed = 0
+
+    // Automatic Open Jog/Run bout detector (logs >= 600m casual jog/runs into 7:15 Progress & ETA automatically!)
+    private var openBoutStartedWallMs = 0L
+    private var openBoutJogRunMeters = 0.0
+    private var openBoutActiveSec = 0.0
+    private var openBoutPausedSec = 0.0
+    private var openBoutRunSec = 0.0
+    private var openBoutJogSec = 0.0
+    private var openBoutWalkSec = 0.0
+    private var openBoutMaxSpeed = 0.0
+    private var openBoutCadenceSum = 0.0
+    private var openBoutCadenceCount = 0
+    private var openBoutFirst1600Sec: Double? = null
+    private var openBoutIdleMs = 0L
+
     // GPS tracking state
     private var lastValidLocation: Location? = null
     private var lastValidLocationElapsedMs: Long = 0L
@@ -141,7 +176,6 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var lastGpsDistanceContributionMs: Long = -100_000L
     private var smoothedGpsSpeedMps: Double = 0.0
     private var latestGpsAccuracyM: Float? = null
-    private var lastStepCountForFallback: Int = 0
     private var lastNotificationUpdateMs: Long = 0L
 
     private val tickRunnable = object : Runnable {
@@ -158,6 +192,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         syncThresholdsFromPrefs()
+        ensureDailyLoadedForToday()
         createNotificationChannel()
 
         val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -224,6 +259,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     override fun onDestroy() {
+        flushOpenBoutIfQualified()
+        persistDailySummaryNow()
         mainHandler.removeCallbacksAndMessages(null)
         unregisterHardwareStreams()
         releaseWakeLockQuietly()
@@ -242,10 +279,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
     /**
      * Keeps CPU, accelerometer/step sensors, GPS, and media audio active when the user locks their phone
-     * and puts it in their pocket whenever State Audio is ON, Auto-Start is armed, or a run is recording.
+     * and puts it in their pocket whenever All-Day Auto Tracking is ON, a 1.6km PT Trial is armed/running,
+     * or Pocket State Audio is ON.
      */
     fun syncPocketForegroundAndWakeLock() {
-        val keepPocketAwake = isRecording || isAutoStartArmed || repository.stateChangeAudioEnabled
+        val keepPocketAwake =
+            repository.allDayTrackingEnabled || ptTrialPhase != PtTrialPhase.IDLE || repository.stateChangeAudioEnabled
         if (keepPocketAwake) {
             acquireWakeLockQuietly()
             promoteToForeground()
@@ -259,7 +298,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         runCatching {
             val wl = wakeLock ?: return
             if (!wl.isHeld) {
-                wl.acquire(3L * 60L * 60L * 1000L) // up to 3 hours continuous pocket testing/running
+                wl.acquire(4L * 60L * 60L * 1000L) // 4h lease auto-renewed in onTick for all-day tracking
             }
         }
     }
@@ -293,35 +332,86 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         syncPocketForegroundAndWakeLock()
     }
 
-    fun setRunMode(mode: RunMode) {
-        if (!isRecording) {
-            runMode = mode
-            broadcastTelemetry()
+    private fun ensureDailyLoadedForToday() {
+        val today = LocalDate.now().toString()
+        if (dailyDateIso == today) return
+        if (dailyDateIso.isNotBlank() && dailyDirty) {
+            flushOpenBoutIfQualified()
+            persistDailySummaryNow()
+        }
+        val stored = repository.getDailyActivity(today)
+        dailyDateIso = today
+        dailyWalkSec = stored.walkingSec
+        dailyJogSec = stored.joggingSec
+        dailyRunSec = stored.runningSec
+        dailyWalkMeters = stored.walkingMeters
+        dailyJogMeters = stored.joggingMeters
+        dailyRunMeters = stored.runningMeters
+        dailyTotalSteps = stored.totalSteps
+        dailyMaxSpeedMps = stored.maxSpeedMps
+        dailyMaxCadenceSpm = stored.maxCadenceSpm
+        dailyDirty = false
+        lastSignalStepsProcessed = signalProcessor.totalSteps
+    }
+
+    private fun currentDailySnapshot(): DailyActivitySummary = DailyActivitySummary(
+        dateIso = dailyDateIso.ifBlank { LocalDate.now().toString() },
+        walkingSec = dailyWalkSec,
+        joggingSec = dailyJogSec,
+        runningSec = dailyRunSec,
+        walkingMeters = dailyWalkMeters,
+        joggingMeters = dailyJogMeters,
+        runningMeters = dailyRunMeters,
+        totalSteps = dailyTotalSteps,
+        maxSpeedMps = dailyMaxSpeedMps,
+        maxCadenceSpm = dailyMaxCadenceSpm,
+        isDemo = false
+    )
+
+    private fun persistDailySummaryNow() {
+        if (dailyDateIso.isBlank()) return
+        runCatching {
+            repository.upsertDailyActivity(currentDailySnapshot())
+            dailyDirty = false
+            lastDailyPersistElapsedMs = SystemClock.elapsedRealtime()
         }
     }
 
-    fun setAutoStartArmed(armed: Boolean) {
-        if (isRecording) return
-        isAutoStartArmed = armed
-        autoStartMotionStreakMs = 0L
-        syncPocketForegroundAndWakeLock()
-        if (armed) {
-            speakCoach("Auto start armed. Begin jogging or running whenever ready.")
-        }
+    fun resetTodayDailySummary() {
+        dailyDateIso = LocalDate.now().toString()
+        dailyWalkSec = 0.0
+        dailyJogSec = 0.0
+        dailyRunSec = 0.0
+        dailyWalkMeters = 0.0
+        dailyJogMeters = 0.0
+        dailyRunMeters = 0.0
+        dailyTotalSteps = 0
+        dailyMaxSpeedMps = 0.0
+        dailyMaxCadenceSpm = 0.0
+        resetOpenBout()
+        persistDailySummaryNow()
         broadcastTelemetry()
     }
 
-    fun startWorkout(mode: RunMode = runMode, triggeredAutomatically: Boolean = false) {
-        if (isRecording) return
+    /**
+     * Arms the 1.6 km TS Police PT Trial:
+     * Standing, putting the phone in your pocket, or WALKING to the starting line are IGNORED (0:00.0, 0m).
+     * The 1,600m stopwatch & distance start ONLY when you actually break into JOGGING or RUNNING!
+     */
+    fun armPtTrial() {
+        if (ptTrialPhase != PtTrialPhase.IDLE) return
+        flushOpenBoutIfQualified()
+        resetOpenBout()
         syncThresholdsFromPrefs()
         refreshPermissionsAndSensors()
 
-        runMode = mode
-        isRecording = true
-        isAutoStartArmed = false
-        autoStartMotionStreakMs = 0L
-        sessionStartedWallMs = System.currentTimeMillis()
-        lastTickElapsedMs = SystemClock.elapsedRealtime()
+        runMode = RunMode.TIMED_1600M
+        ptTrialPhase = PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN
+        isAutoStartArmed = true
+        isRecording = false
+        ptJogRunConfirmMs = 0L
+        ptLaunchBufferSec = 0.0
+        ptLaunchBufferMeters = 0.0
         lastCompletedSessionId = null
 
         distanceMeters = 0.0
@@ -340,34 +430,73 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         lapSplits.clear()
         nextLapBoundaryM = TsPoliceBenchmark.LAP_DISTANCE_M
         prevLapCumulativeSec = 0.0
-        lastGpsDistanceContributionMs = -100_000L
-        lastStepCountForFallback = signalProcessor.totalSteps
-        lastAnnouncedState = gaitClassifier.currentState()
 
         syncPocketForegroundAndWakeLock()
         vibratePulse(140L)
-        if (triggeredAutomatically) {
-            speakCoach("Movement detected. Timer started.")
-        } else if (mode == RunMode.TIMED_1600M) {
-            val targetFmt = spokenTime(repository.targetTimeSec)
-            speakCoach("Starting 1.6 kilometer trial. Target $targetFmt.")
+        val targetFmt = spokenTime(repository.targetTimeSec)
+        speakCoach("1.6 kilometer P T trial ready. Target $targetFmt. Timer starts when you jog or run.")
+        broadcastTelemetry()
+    }
+
+    private fun beginArmedPtTrialNow(initialState: MotionState) {
+        runMode = RunMode.TIMED_1600M
+        ptTrialPhase = PtTrialPhase.RUNNING_TRIAL
+        isAutoStartArmed = false
+        isRecording = true
+        sessionStartedWallMs = System.currentTimeMillis() - (ptLaunchBufferSec * 1000.0).toLong()
+        lastCompletedSessionId = null
+
+        val creditSec = ptLaunchBufferSec.coerceIn(0.0, 2.6)
+        val creditMeters = ptLaunchBufferMeters.coerceIn(0.0, 14.0)
+        ptJogRunConfirmMs = 0L
+        ptLaunchBufferSec = 0.0
+        ptLaunchBufferMeters = 0.0
+
+        activeDurationSec = creditSec
+        pausedDurationSec = 0.0
+        if (initialState == MotionState.JOGGING) {
+            joggingSec = creditSec
+            runningSec = 0.0
         } else {
-            speakCoach("Practice run started.")
+            runningSec = creditSec
+            joggingSec = 0.0
         }
+        walkingSec = 0.0
+        distanceMeters = 0.0
+        runningMeters = 0.0
+        joggingMeters = 0.0
+        walkingMeters = 0.0
+        maxSpeedMps = 0.0
+        cadenceSamplesSum = 0.0
+        cadenceSamplesCount = 0
+        first1600mSplitSec = null
+        lapSplits.clear()
+        nextLapBoundaryM = TsPoliceBenchmark.LAP_DISTANCE_M
+        prevLapCumulativeSec = 0.0
+
+        if (creditMeters > 0.0) {
+            addPtTrialDistanceDelta(creditMeters, initialState, allowDuringWarmup = true)
+        }
+
+        syncPocketForegroundAndWakeLock()
+        playStateTone(MotionState.TARGET_PACE)
+        vibratePulse(200L)
+        speakCoach("Go! 1.6 kilometer trial started.")
         broadcastTelemetry()
     }
 
     /**
-     * Stops recording. Saves to database if distance >= 50m (or forceSave = true).
-     * Returns saved row ID or null if discarded.
+     * Stops the active 1.6 km PT Trial and saves to database if distance >= 50m (or forceSave = true).
      */
     fun finishWorkout(forceSave: Boolean = true): Long? {
-        if (!isRecording) return null
+        if (ptTrialPhase != PtTrialPhase.RUNNING_TRIAL && !isRecording) return null
+        ptTrialPhase = PtTrialPhase.IDLE
         isRecording = false
+        isAutoStartArmed = false
         syncPocketForegroundAndWakeLock()
 
         var savedId: Long? = null
-        if (forceSave && (distanceMeters >= 30.0 || activeDurationSec >= 10.0)) {
+        if (forceSave && (distanceMeters >= 50.0 || activeDurationSec >= 15.0)) {
             val avgCadence = if (cadenceSamplesCount > 0) {
                 cadenceSamplesSum / cadenceSamplesCount
             } else 0.0
@@ -379,7 +508,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             val record = RunSessionRecord(
                 startedAtEpochMs = sessionStartedWallMs,
                 dateIso = LocalDate.now().toString(),
-                mode = runMode,
+                mode = RunMode.TIMED_1600M,
                 distanceMeters = distanceMeters,
                 activeDurationSec = activeDurationSec,
                 pausedDurationSec = pausedDurationSec,
@@ -391,10 +520,10 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 joggingSec = joggingSec,
                 walkingSec = walkingSec,
                 lapSplits = lapSplits.toList(),
-                notes = if (runMode == RunMode.TIMED_1600M && distanceMeters >= 1595.0) {
-                    "Official 1.6 km Timed Trial"
+                notes = if (distanceMeters >= 1595.0) {
+                    "Official 1.6 km PT Trial"
                 } else {
-                    "Auto-tracked ${runMode.title}"
+                    "1.6 km PT Trial (${distanceMeters.toInt()}m partial)"
                 },
                 isDemo = false
             )
@@ -402,20 +531,31 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             lastCompletedSessionId = savedId
             vibratePulse(320L)
         }
+        persistDailySummaryNow()
         broadcastTelemetry()
         return savedId
     }
 
-    fun discardWorkout() {
+    fun cancelPtTrial() {
+        val wasRunningOrArmed = ptTrialPhase != PtTrialPhase.IDLE || isRecording || isAutoStartArmed
+        ptTrialPhase = PtTrialPhase.IDLE
         isRecording = false
         isAutoStartArmed = false
-        syncPocketForegroundAndWakeLock()
+        ptJogRunConfirmMs = 0L
+        ptLaunchBufferSec = 0.0
+        ptLaunchBufferMeters = 0.0
         distanceMeters = 0.0
         activeDurationSec = 0.0
         pausedDurationSec = 0.0
         lapSplits.clear()
+        syncPocketForegroundAndWakeLock()
+        if (wasRunningOrArmed) {
+            speakCoach("1.6 kilometer trial cancelled.")
+        }
         broadcastTelemetry()
     }
+
+    fun discardWorkout() = cancelPtTrial()
 
     private fun startPassiveTelemetry() {
         refreshPermissionsAndSensors()
@@ -584,18 +724,35 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
             lastLocationElapsedMs = nowElapsed
 
-            // Accumulate GPS distance when recording and genuinely moving on foot (never Bike/Vehicle)
+            // Always-on GPS distance accumulation when genuinely moving on foot (never Bike/Vehicle!)
             val minMoveFloor = max(1.2, (location.accuracy * 0.22).toDouble())
-            if (isRecording && deltaMeters >= minMoveFloor) {
+            if (deltaMeters >= minMoveFloor) {
                 val curState = gaitClassifier.currentState()
+                val candState = gaitClassifier.candidateState()
                 val activeCadence = signalProcessor.getCadenceSpm(nowElapsed) >= GaitClassifier.MIN_WALKING_CADENCE_SPM
-                if (curState != MotionState.VEHICLE && (curState.countsAsActiveMovement || activeCadence)) {
-                    addDistanceDelta(deltaMeters, allowDuringWarmup = activeCadence)
+                val onFoot = curState != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
+                    (curState.countsAsActiveMovement || activeCadence)
+
+                if (onFoot) {
                     lastGpsDistanceContributionMs = nowElapsed
+                    if (repository.allDayTrackingEnabled) {
+                        val effectiveState = if (curState.countsAsActiveMovement) curState else {
+                            if (candState.countsAsActiveMovement) candState else MotionState.WALKING
+                        }
+                        addAllDayDistanceDelta(deltaMeters, effectiveState)
+                    }
+                    when (ptTrialPhase) {
+                        PtTrialPhase.RUNNING_TRIAL -> {
+                            addPtTrialDistanceDelta(deltaMeters, curState, allowDuringWarmup = activeCadence)
+                        }
+                        PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> {
+                            if (curState.isJogOrRun() || candState.isJogOrRun()) {
+                                ptLaunchBufferMeters = (ptLaunchBufferMeters + deltaMeters).coerceAtMost(14.0)
+                            }
+                        }
+                        PtTrialPhase.IDLE -> Unit
+                    }
                 }
-                lastValidLocation = location
-                lastValidLocationElapsedMs = nowElapsed
-            } else if (!isRecording) {
                 lastValidLocation = location
                 lastValidLocationElapsedMs = nowElapsed
             }
@@ -625,6 +782,11 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         val dtSec = dtMs / 1000.0
         lastTickElapsedMs = nowMs
 
+        ensureDailyLoadedForToday()
+        if (repository.allDayTrackingEnabled || ptTrialPhase != PtTrialPhase.IDLE || repository.stateChangeAudioEnabled) {
+            acquireWakeLockQuietly()
+        }
+
         val gpsFresh = lastLocationElapsedMs > 0L && (nowMs - lastLocationElapsedMs) <= GPS_FRESHNESS_MS
         if (!gpsFresh) {
             smoothedGpsSpeedMps *= 0.88 // gentle decay if GPS signal drops indoors
@@ -651,6 +813,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (state != lastAnnouncedState) {
             val previousState = lastAnnouncedState
             lastAnnouncedState = state
+            if (dailyDirty) persistDailySummaryNow()
             onMotionStateChanged(previousState, state, nowMs)
         }
 
@@ -664,49 +827,110 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             else -> stepSpeedMps
         }
 
-        // Hands-Free Auto-Start detection (3.0 seconds of sustained Jogging/Running)
-        if (!isRecording && isAutoStartArmed) {
-            if (state == MotionState.JOGGING || state == MotionState.RUNNING || state == MotionState.TARGET_PACE) {
-                autoStartMotionStreakMs += dtMs
-                if (autoStartMotionStreakMs >= 3000L) {
-                    startWorkout(mode = runMode, triggeredAutomatically = true)
-                    return
+        // Compute new footsteps since previous tick (used by BOTH All-Day Open Mode & 1.6 km PT Trial!)
+        val currentSteps = signalProcessor.totalSteps
+        val newSteps = (currentSteps - lastSignalStepsProcessed).coerceAtLeast(0)
+        lastSignalStepsProcessed = currentSteps
+
+        val candState = gaitClassifier.candidateState()
+        val onFootNow = state != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
+            (state.countsAsActiveMovement || cadenceSpm >= GaitClassifier.MIN_WALKING_CADENCE_SPM)
+        val stepFallbackDeltaM = if (!gpsActivelyMeasuringDistance && repository.indoorStepFallbackEnabled && newSteps > 0 && onFootNow) {
+            newSteps * gaitClassifier.estimateStrideLengthMeters(cadenceSpm.coerceAtLeast(85.0), accelRms)
+        } else {
+            0.0
+        }
+
+        // =========================================================================
+        // 1. ALWAYS-ON 24/7 ALL-DAY OPEN AUTO TRACKING (NO START BUTTON REQUIRED!)
+        // =========================================================================
+        if (repository.allDayTrackingEnabled) {
+            if (newSteps > 0 && state != MotionState.VEHICLE && candState != MotionState.VEHICLE) {
+                dailyTotalSteps += newSteps
+                dailyDirty = true
+            }
+            if (stepFallbackDeltaM > 0.0) {
+                val effectiveState = if (state.countsAsActiveMovement) state else {
+                    if (candState.countsAsActiveMovement) candState else MotionState.WALKING
                 }
-            } else {
-                autoStartMotionStreakMs = 0L
+                addAllDayDistanceDelta(stepFallbackDeltaM, effectiveState)
+            }
+            if (state.countsAsActiveMovement) {
+                when (state) {
+                    MotionState.WALKING -> dailyWalkSec += dtSec
+                    MotionState.JOGGING -> dailyJogSec += dtSec
+                    MotionState.RUNNING, MotionState.TARGET_PACE -> dailyRunSec += dtSec
+                    MotionState.STANDING, MotionState.VEHICLE -> Unit
+                }
+                if (effectiveSpeedMps in 0.55..GaitClassifier.MAX_HUMAN_RUNNING_SPEED_MPS &&
+                    effectiveSpeedMps > dailyMaxSpeedMps
+                ) {
+                    dailyMaxSpeedMps = effectiveSpeedMps
+                }
+                if (cadenceSpm in 68.0..235.0 && cadenceSpm > dailyMaxCadenceSpm) {
+                    dailyMaxCadenceSpm = cadenceSpm
+                }
+                dailyDirty = true
+            }
+
+            if (ptTrialPhase == PtTrialPhase.IDLE) {
+                updateAutomaticOpenRunBout(state, dtMs, dtSec, effectiveSpeedMps, cadenceSpm)
+            }
+
+            if (dailyDirty && (nowMs - lastDailyPersistElapsedMs) >= 5000L) {
+                persistDailySummaryNow()
             }
         }
 
-        if (isRecording) {
-            // Hybrid Step-Stride Distance: counts every real step whenever GPS hasn't actively contributed
-            // outdoor displacement in the last 4s (handles indoor testing, weak GPS, and stationary Wi-Fi FUSED_PROVIDER!)
-            val currentSteps = signalProcessor.totalSteps
-            val newSteps = (currentSteps - lastStepCountForFallback).coerceAtLeast(0)
-            lastStepCountForFallback = currentSteps
-
-            val onFootNow = state != MotionState.VEHICLE &&
-                (state.countsAsActiveMovement || cadenceSpm >= GaitClassifier.MIN_WALKING_CADENCE_SPM)
-            if (!gpsActivelyMeasuringDistance && repository.indoorStepFallbackEnabled && newSteps > 0 && onFootNow) {
-                val strideM = gaitClassifier.estimateStrideLengthMeters(cadenceSpm.coerceAtLeast(85.0), accelRms)
-                addDistanceDelta(newSteps * strideM, allowDuringWarmup = true)
-            }
-
-            if (state.countsAsActiveMovement) {
-                activeDurationSec += dtSec
-                if (effectiveSpeedMps > maxSpeedMps) maxSpeedMps = effectiveSpeedMps
-                if (cadenceSpm > 30.0) {
-                    cadenceSamplesSum += cadenceSpm
-                    cadenceSamplesCount++
+        // =========================================================================
+        // 2. 1.6 KM PT TRIAL STATE MACHINE (STARTS ONLY ON JOGGING OR RUNNING!)
+        // =========================================================================
+        when (ptTrialPhase) {
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> {
+                if (stepFallbackDeltaM > 0.0 && (state.isJogOrRun() || candState.isJogOrRun())) {
+                    ptLaunchBufferMeters = (ptLaunchBufferMeters + stepFallbackDeltaM).coerceAtMost(14.0)
                 }
-                when (state) {
-                    MotionState.RUNNING, MotionState.TARGET_PACE -> runningSec += dtSec
-                    MotionState.JOGGING -> joggingSec += dtSec
-                    MotionState.WALKING -> walkingSec += dtSec
-                    MotionState.STANDING, MotionState.VEHICLE -> Unit
+                if (state.isJogOrRun()) {
+                    ptLaunchBufferSec = (ptLaunchBufferSec + dtSec).coerceAtMost(2.6)
+                    ptJogRunConfirmMs += dtMs
+                    if (ptJogRunConfirmMs >= 400L) {
+                        beginArmedPtTrialNow(state)
+                        return
+                    }
+                } else if (candState.isJogOrRun()) {
+                    // Buffering the 1.4s jog/run launch stride before commit; walking/standing stays ignored!
+                    ptLaunchBufferSec = (ptLaunchBufferSec + dtSec).coerceAtMost(2.6)
+                    ptJogRunConfirmMs = 0L
+                } else {
+                    ptJogRunConfirmMs = 0L
+                    ptLaunchBufferSec = 0.0
+                    ptLaunchBufferMeters = 0.0
                 }
-            } else {
-                pausedDurationSec += dtSec
             }
+            PtTrialPhase.RUNNING_TRIAL -> {
+                if (stepFallbackDeltaM > 0.0) {
+                    addPtTrialDistanceDelta(stepFallbackDeltaM, state, allowDuringWarmup = true)
+                }
+                if (ptTrialPhase == PtTrialPhase.RUNNING_TRIAL) { // may have auto-finished at 1,600m above!
+                    if (state.countsAsActiveMovement) {
+                        activeDurationSec += dtSec
+                        if (effectiveSpeedMps > maxSpeedMps) maxSpeedMps = effectiveSpeedMps
+                        if (cadenceSpm > 30.0) {
+                            cadenceSamplesSum += cadenceSpm
+                            cadenceSamplesCount++
+                        }
+                        when (state) {
+                            MotionState.RUNNING, MotionState.TARGET_PACE -> runningSec += dtSec
+                            MotionState.JOGGING -> joggingSec += dtSec
+                            MotionState.WALKING -> walkingSec += dtSec
+                            MotionState.STANDING, MotionState.VEHICLE -> Unit
+                        }
+                    } else {
+                        pausedDurationSec += dtSec
+                    }
+                }
+            }
+            PtTrialPhase.IDLE -> Unit
         }
 
         if (isInForeground && nowMs - lastNotificationUpdateMs >= 1000L) {
@@ -718,9 +942,108 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         broadcastTelemetry(effectiveSpeedMps, gpsFresh, cadenceSpm, accelRms)
     }
 
-    private fun addDistanceDelta(deltaM: Double, allowDuringWarmup: Boolean = false) {
-        if (deltaM <= 0.0 || !isRecording) return
-        val state = gaitClassifier.currentState()
+    private fun addAllDayDistanceDelta(deltaM: Double, state: MotionState) {
+        if (deltaM <= 0.0 || state == MotionState.VEHICLE) return
+        when (state) {
+            MotionState.RUNNING, MotionState.TARGET_PACE -> dailyRunMeters += deltaM
+            MotionState.JOGGING -> dailyJogMeters += deltaM
+            MotionState.WALKING, MotionState.STANDING -> dailyWalkMeters += deltaM
+            MotionState.VEHICLE -> Unit
+        }
+        if (ptTrialPhase == PtTrialPhase.IDLE && state.isJogOrRun()) {
+            val prevBoutM = openBoutJogRunMeters
+            openBoutJogRunMeters += deltaM
+            if (prevBoutM < 1600.0 && openBoutJogRunMeters >= 1600.0 && openBoutFirst1600Sec == null) {
+                openBoutFirst1600Sec = openBoutActiveSec
+            }
+        }
+        dailyDirty = true
+    }
+
+    private fun updateAutomaticOpenRunBout(
+        state: MotionState,
+        dtMs: Long,
+        dtSec: Double,
+        effectiveSpeedMps: Double,
+        cadenceSpm: Double
+    ) {
+        if (state.isJogOrRun()) {
+            if (openBoutStartedWallMs == 0L) {
+                openBoutStartedWallMs = System.currentTimeMillis()
+            }
+            openBoutIdleMs = 0L
+            openBoutActiveSec += dtSec
+            if (state == MotionState.JOGGING) openBoutJogSec += dtSec else openBoutRunSec += dtSec
+            if (effectiveSpeedMps > openBoutMaxSpeed) openBoutMaxSpeed = effectiveSpeedMps
+            if (cadenceSpm > 60.0) {
+                openBoutCadenceSum += cadenceSpm
+                openBoutCadenceCount++
+            }
+        } else if (openBoutStartedWallMs > 0L) {
+            openBoutIdleMs += dtMs
+            if (state == MotionState.WALKING) {
+                openBoutWalkSec += dtSec
+            } else {
+                openBoutPausedSec += dtSec
+            }
+            // After 75s without jogging/running, save >= 600m continuous run automatically into Progress & ETA!
+            if (openBoutIdleMs >= 75_000L) {
+                flushOpenBoutIfQualified()
+                resetOpenBout()
+            }
+        }
+    }
+
+    private fun flushOpenBoutIfQualified() {
+        if (openBoutStartedWallMs > 0L && openBoutJogRunMeters >= 600.0 && openBoutActiveSec >= 90.0) {
+            val avgCad = if (openBoutCadenceCount > 0) openBoutCadenceSum / openBoutCadenceCount else 155.0
+            val equiv = TsPoliceBenchmark.computeEquiv1600mSec(
+                distanceMeters = openBoutJogRunMeters,
+                activeDurationSec = openBoutActiveSec,
+                first1600mSplitSec = openBoutFirst1600Sec
+            )
+            val savedId = repository.insertSession(
+                RunSessionRecord(
+                    startedAtEpochMs = openBoutStartedWallMs,
+                    dateIso = dailyDateIso.ifBlank { LocalDate.now().toString() },
+                    mode = RunMode.OPEN_PRACTICE,
+                    distanceMeters = openBoutJogRunMeters,
+                    activeDurationSec = openBoutActiveSec,
+                    pausedDurationSec = openBoutPausedSec,
+                    first1600mSplitSec = openBoutFirst1600Sec,
+                    equiv1600mSec = equiv,
+                    avgCadenceSpm = avgCad,
+                    maxSpeedMps = openBoutMaxSpeed,
+                    runningSec = openBoutRunSec,
+                    joggingSec = openBoutJogSec,
+                    walkingSec = openBoutWalkSec,
+                    lapSplits = emptyList(),
+                    notes = "All-Day Auto-Detected Run (${openBoutJogRunMeters.toInt()}m)",
+                    isDemo = false
+                )
+            )
+            lastCompletedSessionId = savedId
+        }
+        resetOpenBout()
+    }
+
+    private fun resetOpenBout() {
+        openBoutStartedWallMs = 0L
+        openBoutJogRunMeters = 0.0
+        openBoutActiveSec = 0.0
+        openBoutPausedSec = 0.0
+        openBoutRunSec = 0.0
+        openBoutJogSec = 0.0
+        openBoutWalkSec = 0.0
+        openBoutMaxSpeed = 0.0
+        openBoutCadenceSum = 0.0
+        openBoutCadenceCount = 0
+        openBoutFirst1600Sec = null
+        openBoutIdleMs = 0L
+    }
+
+    private fun addPtTrialDistanceDelta(deltaM: Double, state: MotionState, allowDuringWarmup: Boolean = false) {
+        if (deltaM <= 0.0 || ptTrialPhase != PtTrialPhase.RUNNING_TRIAL) return
         if (state == MotionState.VEHICLE) return
         if (!state.countsAsActiveMovement && !allowDuringWarmup) return
         distanceMeters += deltaM
@@ -728,7 +1051,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             MotionState.RUNNING, MotionState.TARGET_PACE -> runningMeters += deltaM
             MotionState.JOGGING -> joggingMeters += deltaM
             MotionState.WALKING -> walkingMeters += deltaM
-            MotionState.STANDING -> walkingMeters += deltaM
+            MotionState.STANDING -> runningMeters += deltaM
             MotionState.VEHICLE -> Unit
         }
 
@@ -753,8 +1076,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             nextLapBoundaryM += TsPoliceBenchmark.LAP_DISTANCE_M
         }
 
-        // Auto-complete 1.6 km TS Police Timed Trial at 1,600m!
-        if (runMode == RunMode.TIMED_1600M && distanceMeters >= TsPoliceBenchmark.TARGET_DISTANCE_M) {
+        // Auto-complete 1.6 km TS Police PT Trial at 1,600m!
+        if (distanceMeters >= TsPoliceBenchmark.TARGET_DISTANCE_M) {
             distanceMeters = TsPoliceBenchmark.TARGET_DISTANCE_M
             val finalSec = activeDurationSec
             val targetSec = repository.targetTimeSec
@@ -767,7 +1090,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             }
             lastFinishSpeechMs = SystemClock.elapsedRealtime()
             speakCoach(
-                "1.6 kilometer trial complete! Time ${spokenTime(finalSec)}. $verdict"
+                "1.6 kilometer P T trial complete! Time ${spokenTime(finalSec)}. $verdict"
             )
         }
     }
@@ -945,18 +1268,22 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val title = when {
-            isRecording ->
-                "${String.format("%.2f km", distanceMeters / 1000.0)} • ${TsPoliceBenchmark.formatDuration(activeDurationSec)} • ${state.label}"
-            isAutoStartArmed ->
-                "Auto-Start Armed • ${state.label}"
-            else ->
-                "Pocket Gait Audio Active • ${state.label}"
+        val daily = currentDailySnapshot()
+        val title = when (ptTrialPhase) {
+            PtTrialPhase.RUNNING_TRIAL ->
+                "1.6K PT Trial: ${distanceMeters.toInt()}m / 1600m • ${TsPoliceBenchmark.formatDuration(activeDurationSec)}"
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN ->
+                "1.6K PT Trial READY • Start Jogging/Running!"
+            PtTrialPhase.IDLE ->
+                "All-Day Auto • Jog+Run ${TsPoliceBenchmark.formatDuration(daily.jogRunCombinedSec)} • Walk ${TsPoliceBenchmark.formatDuration(daily.walkingSec)}"
         }
-        val subtitle = if (isRecording) {
-            "Pace ${TsPoliceBenchmark.formatPacePerKm(speedMps)} • Target 1.6km < 7:15"
-        } else {
-            "Cadence ${cadenceSpm.toInt()} spm • Speaks Stand/Walk/Jog/Run in pocket"
+        val subtitle = when (ptTrialPhase) {
+            PtTrialPhase.RUNNING_TRIAL ->
+                "Pace ${TsPoliceBenchmark.formatPacePerKm(speedMps)} • Target < 7:15 • ${state.label}"
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN ->
+                "Walking ignored • Stopwatch starts automatically on Jog/Run"
+            PtTrialPhase.IDLE ->
+                "${String.format("%.2f km", daily.totalDistanceMeters / 1000.0)} • ${daily.totalSteps} steps • ${state.label}"
         }
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -1005,31 +1332,36 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         gpsFresh: Boolean = false,
         cadenceSpm: Double = 0.0,
         accelRms: Double = 0.0
-    ): LiveTelemetry = LiveTelemetry(
-        isRecording = isRecording,
-        isAutoStartArmed = isAutoStartArmed,
-        mode = runMode,
-        motionState = gaitClassifier.currentState(),
-        distanceMeters = distanceMeters,
-        activeDurationSec = activeDurationSec,
-        pausedDurationSec = pausedDurationSec,
-        currentSpeedMps = effectiveSpeedMps,
-        cadenceSpm = cadenceSpm,
-        dynamicAccelRms = accelRms,
-        totalSteps = signalProcessor.totalSteps,
-        gpsAccuracyMeters = latestGpsAccuracyM,
-        isGpsLocked = gpsFresh,
-        hasHardwareStepSensor = signalProcessor.isReceivingHardwareSteps(SystemClock.elapsedRealtime()),
-        runningSec = runningSec,
-        joggingSec = joggingSec,
-        walkingSec = walkingSec,
-        runningMeters = runningMeters,
-        joggingMeters = joggingMeters,
-        walkingMeters = walkingMeters,
-        first1600mSplitSec = first1600mSplitSec,
-        lapSplits = lapSplits.toList(),
-        justFinishedSessionId = lastCompletedSessionId
-    )
+    ): LiveTelemetry {
+        val daily = currentDailySnapshot()
+        return LiveTelemetry(
+            isRecording = ptTrialPhase == PtTrialPhase.RUNNING_TRIAL,
+            isAutoStartArmed = ptTrialPhase == PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN,
+            ptTrialPhase = ptTrialPhase,
+            mode = runMode,
+            motionState = gaitClassifier.currentState(),
+            distanceMeters = distanceMeters,
+            activeDurationSec = activeDurationSec,
+            pausedDurationSec = pausedDurationSec,
+            currentSpeedMps = effectiveSpeedMps,
+            cadenceSpm = cadenceSpm,
+            dynamicAccelRms = accelRms,
+            totalSteps = daily.totalSteps,
+            gpsAccuracyMeters = latestGpsAccuracyM,
+            isGpsLocked = gpsFresh,
+            hasHardwareStepSensor = signalProcessor.isReceivingHardwareSteps(SystemClock.elapsedRealtime()),
+            runningSec = runningSec,
+            joggingSec = joggingSec,
+            walkingSec = walkingSec,
+            runningMeters = runningMeters,
+            joggingMeters = joggingMeters,
+            walkingMeters = walkingMeters,
+            first1600mSplitSec = first1600mSplitSec,
+            lapSplits = lapSplits.toList(),
+            dailySummary = daily,
+            justFinishedSessionId = lastCompletedSessionId
+        )
+    }
 
     private fun broadcastTelemetry(
         effectiveSpeedMps: Double = 0.0,

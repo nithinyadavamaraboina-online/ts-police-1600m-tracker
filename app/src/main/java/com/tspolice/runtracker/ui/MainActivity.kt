@@ -30,10 +30,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.tspolice.runtracker.data.RunRepository
+import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.LiveTelemetry
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.ProgressionForecaster
+import com.tspolice.runtracker.domain.PtTrialPhase
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
@@ -58,6 +60,13 @@ class MainActivity : AppCompatActivity() {
     private var lastAutoUpdateCheckElapsedMs = -10_000_000L
     private var activeUpdateDialog: AlertDialog? = null
 
+    // Tracker sub-tab state: 0 = Always-On All-Day Open Mode (default), 1 = 1.6 km PT Trial
+    private var activeTrackerSubTab = 0
+    private var lastRenderedPtPhase: PtTrialPhase = PtTrialPhase.IDLE
+    private var cachedPastDailyLogs: List<DailyActivitySummary> = emptyList()
+    private var lastDailyHistoryRenderMs = -60_000L
+    private var lastDailyHistoryKey = ""
+
     // Top-level tab containers
     private lateinit var stateAudioChip: TextView
     private lateinit var updateBanner: TextView
@@ -66,11 +75,45 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tabGuideContainer: ScrollView
     private val navTabViews = mutableListOf<TextView>()
 
-    // Tab 1: Live Tracker views
+    // Tab 1: Sub-Tab Switcher & Containers
     private lateinit var permissionBanner: LinearLayout
-    private lateinit var mode1600Btn: TextView
-    private lateinit var modeOpenBtn: TextView
+    private lateinit var subTabOpenBtn: TextView
+    private lateinit var subTabPtBtn: TextView
+    private lateinit var openAllDayContainer: LinearLayout
+    private lateinit var ptTrialContainer: LinearLayout
+
+    // Tab 1A: Always-On All-Day Open Mode views
+    private lateinit var allDayLiveChip: TextView
+    private lateinit var allDayStateBadge: TextView
+    private lateinit var allDayStatusSub: TextView
+    private lateinit var dailyJogRunTimeVal: TextView
+    private lateinit var dailyJogRunDistSub: TextView
+    private lateinit var dailyJogRunSplitSub: TextView
+    private lateinit var dailyWalkTimeVal: TextView
+    private lateinit var dailyWalkDistSub: TextView
+    private lateinit var dailyWalkStepsSub: TextView
+    private lateinit var dailyMaxPaceVal: TextView
+    private lateinit var dailyMaxPaceSub: TextView
+    private lateinit var dailyMaxCadenceVal: TextView
+    private lateinit var dailyMaxCadenceSub: TextView
+    private lateinit var openLivePaceVal: TextView
+    private lateinit var openLivePaceSub: TextView
+    private lateinit var openLiveCadenceVal: TextView
+    private lateinit var openLiveCadenceSub: TextView
+    private lateinit var dailyTotalDistVal: TextView
+    private lateinit var dailyTotalDistSub: TextView
+    private lateinit var openGpsStatusVal: TextView
+    private lateinit var openGpsStatusSub: TextView
+    private lateinit var dailyGaitBar: GaitBreakdownBarView
+    private lateinit var dailyGaitLegendText: TextView
+    private lateinit var launchPtFromOpenBtn: Button
+    private lateinit var dailyHistoryListLayout: LinearLayout
+
+    // Tab 1B: 1.6 km PT Trial views (starts ONLY when Jogging or Running)
     private lateinit var paceArcGauge: PaceArcGaugeView
+    private lateinit var primaryActionBtn: Button
+    private lateinit var ptArmHintText: TextView
+    private lateinit var secondaryActionBtn: Button
     private lateinit var metricPaceVal: TextView
     private lateinit var metricPaceSub: TextView
     private lateinit var metricCadenceVal: TextView
@@ -81,8 +124,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var metricSensorSub: TextView
     private lateinit var gaitBar: GaitBreakdownBarView
     private lateinit var gaitLegendText: TextView
-    private lateinit var primaryActionBtn: Button
-    private lateinit var secondaryActionBtn: Button
     private lateinit var splitsListLayout: LinearLayout
 
     // Tab 2: Progress & 7:15 ETA views
@@ -98,6 +139,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sessionsListLayout: LinearLayout
 
     // Tab 3: Benchmark & Sensor Diagnostics views
+    private lateinit var allDayAutoSwitch: Switch
     private lateinit var stateAudioSwitch: Switch
     private lateinit var diagGpsText: TextView
     private lateinit var diagStepText: TextView
@@ -111,6 +153,7 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         updatePermissionBanner()
+        startTrackingServiceSafely()
         trackingService?.refreshPermissionsAndSensors()
     }
 
@@ -143,15 +186,30 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(buildRootLayout())
         selectTab(0)
+        selectTrackerSubTab(0)
+        refreshCachedDailyHistory(forceRender = true)
         refreshProgressDashboard()
         updatePermissionBanner()
 
-        val svcIntent = Intent(this, RunTrackingService::class.java)
-        startService(svcIntent)
+        val svcIntent = startTrackingServiceSafely()
         bindService(svcIntent, serviceConnection, Context.BIND_AUTO_CREATE)
 
         requestNeededPermissionsIfMissing(silentCheckOnly = false)
         appUpdater.syncBackgroundUpdateSchedule()
+    }
+
+    private fun startTrackingServiceSafely(): Intent {
+        val svcIntent = Intent(this, RunTrackingService::class.java)
+        runCatching {
+            if (hasCorePermissions() && (repository.allDayTrackingEnabled || repository.stateChangeAudioEnabled)) {
+                ContextCompat.startForegroundService(this, svcIntent)
+            } else {
+                startService(svcIntent)
+            }
+        }.onFailure {
+            runCatching { startService(svcIntent) }
+        }
+        return svcIntent
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -241,7 +299,7 @@ class MainActivity : AppCompatActivity() {
             letterSpacing = 0.04f
         })
         titleCol.addView(TextView(this).apply {
-            text = "Auto Run/Jog Detection • 7:15 PET Target & ETA"
+            text = "All-Day Auto Mode • 1.6 km PT Trial (< 7:15)"
             textSize = 12f
             setTextColor(0xFF94A3B8.toInt())
         })
@@ -317,7 +375,7 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(0xFF0F172A.toInt())
             setPadding(dp(8), dp(8), dp(8), dp(10))
         }
-        val tabs = listOf("LIVE 1.6K RUN", "PROGRESS & ETA", "PET & SENSORS")
+        val tabs = listOf("ALL-DAY & PT", "PROGRESS & ETA", "PET & SENSORS")
         tabs.forEachIndexed { index, label ->
             val tv = TextView(this).apply {
                 text = label
@@ -352,13 +410,36 @@ class MainActivity : AppCompatActivity() {
                 tv.background = roundedBox(0x00000000, 0x00000000, dp(10))
             }
         }
-        if (index == 1) {
+        if (index == 0) {
+            refreshCachedDailyHistory(forceRender = true)
+        } else if (index == 1) {
             refreshProgressDashboard()
         }
     }
 
+    private fun selectTrackerSubTab(subIndex: Int) {
+        activeTrackerSubTab = subIndex.coerceIn(0, 1)
+        val isOpen = activeTrackerSubTab == 0
+        openAllDayContainer.visibility = if (isOpen) View.VISIBLE else View.GONE
+        ptTrialContainer.visibility = if (!isOpen) View.VISIBLE else View.GONE
+
+        subTabOpenBtn.background = roundedBox(
+            if (isOpen) 0xFF10B981.toInt() else 0x00000000,
+            if (isOpen) 0xFF10B981.toInt() else 0x00000000,
+            dp(9)
+        )
+        subTabOpenBtn.setTextColor(if (isOpen) 0xFF04130D.toInt() else 0xFF94A3B8.toInt())
+
+        subTabPtBtn.background = roundedBox(
+            if (!isOpen) 0xFF38BDF8.toInt() else 0x00000000,
+            if (!isOpen) 0xFF38BDF8.toInt() else 0x00000000,
+            dp(9)
+        )
+        subTabPtBtn.setTextColor(if (!isOpen) 0xFF04130D.toInt() else 0xFF94A3B8.toInt())
+    }
+
     // =========================================================================
-    // TAB 1: LIVE RUN TRACKER & AUTO-GAIT CLASSIFIER
+    // TAB 1: ALWAYS-ON ALL-DAY OPEN MODE + 1.6 KM PT TRIAL
     // =========================================================================
     private fun buildTrackerTab(): ScrollView {
         val scroll = ScrollView(this)
@@ -379,7 +460,7 @@ class MainActivity : AppCompatActivity() {
             ).apply { bottomMargin = dp(12) }
         }
         permissionBanner.addView(TextView(this).apply {
-            text = "Enable GPS & Motion Sensors for live Run/Jog auto-detection"
+            text = "Enable GPS & Motion Sensors for 24/7 All-Day Walk/Jog/Run tracking"
             textSize = 12f
             setTextColor(0xFFFDE68A.toInt())
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -391,7 +472,7 @@ class MainActivity : AppCompatActivity() {
         })
         col.addView(permissionBanner)
 
-        // Mode switcher (1.6km Trial vs Open Practice)
+        // Sub-Tab Switcher: [All-Day Auto (Open)] vs [1.6 km PT Trial]
         val modeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             background = roundedBox(0xFF111827.toInt(), 0xFF1E293B.toInt(), dp(12))
@@ -401,27 +482,305 @@ class MainActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = dp(12) }
         }
-        mode1600Btn = TextView(this).apply {
-            text = "1.6 km PET Trial"
+        subTabOpenBtn = TextView(this).apply {
+            text = "All-Day Auto (Open)"
             gravity = Gravity.CENTER
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(8), dp(9), dp(8), dp(9))
+            setPadding(dp(8), dp(10), dp(8), dp(10))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { trackingService?.setRunMode(RunMode.TIMED_1600M) }
+            setOnClickListener { selectTrackerSubTab(0) }
         }
-        modeOpenBtn = TextView(this).apply {
-            text = "Open Practice Run"
+        subTabPtBtn = TextView(this).apply {
+            text = "1.6 km PT Trial"
             gravity = Gravity.CENTER
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(8), dp(9), dp(8), dp(9))
+            setPadding(dp(8), dp(10), dp(8), dp(10))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { trackingService?.setRunMode(RunMode.OPEN_PRACTICE) }
+            setOnClickListener { selectTrackerSubTab(1) }
         }
-        modeRow.addView(mode1600Btn)
-        modeRow.addView(modeOpenBtn)
+        modeRow.addView(subTabOpenBtn)
+        modeRow.addView(subTabPtBtn)
         col.addView(modeRow)
+
+        openAllDayContainer = buildOpenAllDaySubView()
+        ptTrialContainer = buildPtTrialSubView()
+
+        col.addView(openAllDayContainer)
+        col.addView(ptTrialContainer)
+
+        scroll.addView(col)
+        return scroll
+    }
+
+    /**
+     * Sub-View 0: Always-On Open All-Day Auto Mode (Default — Zero Start Button Needed!).
+     * Automatically tracks whole-day Walking time, combined Jogging + Running time (with Jog/Run breakdown),
+     * Max Pace, Max Cadence, Live Pace, Live Cadence, Total Distance, and Total Steps.
+     */
+    private fun buildOpenAllDaySubView(): LinearLayout {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        // 1. Live Auto-Detection Status Card
+        val liveCard = cardContainer().apply {
+            background = roundedBox(0xFF0F1D2E.toInt(), 0xFF10B981.toInt(), dp(15))
+        }
+        val topStatusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        topStatusRow.addView(TextView(this).apply {
+            text = "OPEN MODE • ALWAYS-ON WHOLE-DAY AUTO"
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFF10B981.toInt())
+            letterSpacing = 0.04f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        allDayLiveChip = TextView(this).apply {
+            text = "24/7 ACTIVE"
+            textSize = 10.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFF04130D.toInt())
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(10))
+        }
+        topStatusRow.addView(allDayLiveChip)
+        liveCard.addView(topStatusRow)
+
+        allDayStateBadge = TextView(this).apply {
+            text = "AUTO-PAUSED • STANDING"
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFFF8FAFC.toInt())
+            setPadding(0, dp(8), 0, dp(4))
+        }
+        liveCard.addView(allDayStateBadge)
+
+        allDayStatusSub = TextView(this).apply {
+            text = "No Start button needed — automatically counts your whole-day Walk & Jog+Run time (ignores sitting & bike)."
+            textSize = 12f
+            setTextColor(0xFF94A3B8.toInt())
+        }
+        liveCard.addView(allDayStatusSub)
+        box.addView(liveCard)
+
+        // 2. Two Hero Cards Side-by-Side: [JOG + RUN TODAY (Combined)] & [WALKING TODAY]
+        val heroRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
+        }
+
+        // Left Hero: Combined Jog + Run Today
+        val jogRunCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = roundedBox(0xFF111827.toInt(), 0xFF10B981.toInt(), dp(14))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(5)
+            }
+        }
+        jogRunCard.addView(TextView(this).apply {
+            text = "JOG + RUN TODAY"
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFF10B981.toInt())
+        })
+        dailyJogRunTimeVal = TextView(this).apply {
+            text = "0:00"
+            textSize = 25f
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            setTextColor(0xFFF8FAFC.toInt())
+            setPadding(0, dp(4), 0, dp(2))
+        }
+        dailyJogRunDistSub = TextView(this).apply {
+            text = "0 m combined"
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFF34D399.toInt())
+        }
+        dailyJogRunSplitSub = TextView(this).apply {
+            text = "Jog 0:00 • Run 0:00"
+            textSize = 11f
+            setTextColor(0xFF94A3B8.toInt())
+            setPadding(0, dp(3), 0, 0)
+        }
+        jogRunCard.addView(dailyJogRunTimeVal)
+        jogRunCard.addView(dailyJogRunDistSub)
+        jogRunCard.addView(dailyJogRunSplitSub)
+
+        // Right Hero: Walking Today
+        val walkCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = roundedBox(0xFF111827.toInt(), 0xFF38BDF8.toInt(), dp(14))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(5)
+            }
+        }
+        walkCard.addView(TextView(this).apply {
+            text = "WALKING TODAY"
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFF38BDF8.toInt())
+        })
+        dailyWalkTimeVal = TextView(this).apply {
+            text = "0:00"
+            textSize = 25f
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            setTextColor(0xFFF8FAFC.toInt())
+            setPadding(0, dp(4), 0, dp(2))
+        }
+        dailyWalkDistSub = TextView(this).apply {
+            text = "0 m walked"
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFF7DD3FC.toInt())
+        }
+        dailyWalkStepsSub = TextView(this).apply {
+            text = "0 steps today"
+            textSize = 11f
+            setTextColor(0xFF94A3B8.toInt())
+            setPadding(0, dp(3), 0, 0)
+        }
+        walkCard.addView(dailyWalkTimeVal)
+        walkCard.addView(dailyWalkDistSub)
+        walkCard.addView(dailyWalkStepsSub)
+
+        heroRow.addView(jogRunCard)
+        heroRow.addView(walkCard)
+        box.addView(heroRow)
+
+        // 3. 3x2 Peak & Live Metrics Grid (Max Pace, Max Cadence, Live Pace, Live Cadence, Total Distance, GPS/Step)
+        val peakRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
+        }
+        val maxPaceTile = metricTile("MAX PACE TODAY", "--:-- /km", "Peak 0.0 km/h")
+        dailyMaxPaceVal = maxPaceTile.second
+        dailyMaxPaceSub = maxPaceTile.third
+        val maxCadTile = metricTile("MAX CADENCE", "0 spm", "Peak stride rate")
+        dailyMaxCadenceVal = maxCadTile.second
+        dailyMaxCadenceSub = maxCadTile.third
+        peakRow.addView(maxPaceTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
+        peakRow.addView(maxCadTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
+        box.addView(peakRow)
+
+        val liveRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
+        }
+        val livePaceTile = metricTile("LIVE PACE NOW", "--:-- /km", "0.0 km/h")
+        openLivePaceVal = livePaceTile.second
+        openLivePaceSub = livePaceTile.third
+        val liveCadTile = metricTile("LIVE CADENCE", "0 spm", "0.0 m/s² motion")
+        openLiveCadenceVal = liveCadTile.second
+        openLiveCadenceSub = liveCadTile.third
+        liveRow.addView(livePaceTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
+        liveRow.addView(liveCadTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
+        box.addView(liveRow)
+
+        val totalsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
+        }
+        val totDistTile = metricTile("TOTAL DISTANCE", "0 m", "0 total steps")
+        dailyTotalDistVal = totDistTile.second
+        dailyTotalDistSub = totDistTile.third
+        val gpsTile = metricTile("GPS & STEP ENGINE", "Step-Stride", "Indoor / Pocket ready")
+        openGpsStatusVal = gpsTile.second
+        openGpsStatusSub = gpsTile.third
+        totalsRow.addView(totDistTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
+        totalsRow.addView(gpsTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
+        box.addView(totalsRow)
+
+        // 4. Whole-Day Gait Share Bar
+        val dayGaitCard = cardContainer()
+        dayGaitCard.addView(sectionHeader("TODAY'S WHOLE-DAY MOVEMENT BREAKDOWN"))
+        dailyGaitBar = GaitBreakdownBarView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(14)
+            ).apply { topMargin = dp(8); bottomMargin = dp(8) }
+        }
+        dayGaitCard.addView(dailyGaitBar)
+        dailyGaitLegendText = TextView(this).apply {
+            text = "Jog+Run 0:00 (Run 0:00 • Jog 0:00)  •  Walk 0:00"
+            textSize = 12f
+            setTextColor(0xFFCBD5E1.toInt())
+        }
+        dayGaitCard.addView(dailyGaitLegendText)
+        box.addView(dayGaitCard)
+
+        // 5. 1-Tap CTA to Arm & Launch 1.6 km PT Trial
+        launchPtFromOpenBtn = Button(this).apply {
+            text = "START 1.6 KM PT TRIAL (Starts Only When You Jog/Run) →"
+            textSize = 13.5f
+            typeface = Typeface.DEFAULT_BOLD
+            isAllCaps = false
+            setTextColor(0xFF04130D.toInt())
+            background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(13))
+            setPadding(dp(14), dp(13), dp(14), dp(13))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
+            setOnClickListener {
+                selectTrackerSubTab(1)
+                if (trackingService?.let { lastRenderedPtPhase == PtTrialPhase.IDLE } != false) {
+                    requestNeededPermissionsIfMissing(silentCheckOnly = false)
+                    trackingService?.armPtTrial()
+                }
+            }
+        }
+        box.addView(launchPtFromOpenBtn)
+
+        // 6. Recent Whole-Day Activity Log Card
+        val dailyLogCard = cardContainer()
+        dailyLogCard.addView(sectionHeader("DAILY WHOLE-DAY ACTIVITY LOG"))
+        dailyHistoryListLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        dailyLogCard.addView(dailyHistoryListLayout)
+        box.addView(dailyLogCard)
+
+        return box
+    }
+
+    /**
+     * Sub-View 1: Dedicated 1.6 km TS Police PT Trial.
+     * Pressing Start arms the trial at 0:00.0 / 0m; standing & walking are ignored;
+     * the timer & distance start ONLY when Jogging or Running is detected!
+     */
+    private fun buildPtTrialSubView(): LinearLayout {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
 
         // Gauge Card
         val gaugeCard = cardContainer().apply {
@@ -431,7 +790,44 @@ class MainActivity : AppCompatActivity() {
         gaugeCard.addView(paceArcGauge)
         col.addView(gaugeCard)
 
-        // 2x2 Live Sensor Metrics Grid
+        // PT Trial Action Controls (placed right under Gauge for instant thumb reach!)
+        primaryActionBtn = Button(this).apply {
+            text = "START 1.6 KM PT TRIAL (Starts When You Jog/Run)"
+            textSize = 14.5f
+            typeface = Typeface.DEFAULT_BOLD
+            isAllCaps = false
+            setTextColor(0xFF04130D.toInt())
+            background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(14))
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+        ptArmHintText = TextView(this).apply {
+            text = "Tap Start, put phone in pocket & walk to the line — timer stays at 0:00 until you start jogging or running."
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setTextColor(0xFF94A3B8.toInt())
+            setPadding(dp(6), 0, dp(6), dp(10))
+        }
+        secondaryActionBtn = Button(this).apply {
+            text = "← Back to All-Day Open Mode"
+            textSize = 12.5f
+            isAllCaps = false
+            setTextColor(0xFF38BDF8.toInt())
+            background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(12))
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
+        }
+        col.addView(primaryActionBtn)
+        col.addView(ptArmHintText)
+        col.addView(secondaryActionBtn)
+
+        // 2x2 Live PT Trial Sensor Metrics Grid
         val gridRow1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
@@ -442,7 +838,7 @@ class MainActivity : AppCompatActivity() {
         val paceTile = metricTile("LIVE PACE", "--:-- /km", "0.0 km/h")
         metricPaceVal = paceTile.second
         metricPaceSub = paceTile.third
-        val cadTile = metricTile("STEP CADENCE", "0 spm", "0 steps")
+        val cadTile = metricTile("STEP CADENCE", "0 spm", "0 steps today")
         metricCadenceVal = cadTile.second
         metricCadenceSub = cadTile.third
         gridRow1.addView(paceTile.first.apply {
@@ -474,9 +870,9 @@ class MainActivity : AppCompatActivity() {
         })
         col.addView(gridRow2)
 
-        // Auto-Detected Gait Share Card
+        // PT Trial Gait Share Card
         val gaitCard = cardContainer()
-        gaitCard.addView(sectionHeader("AUTO-DETECTED GAIT BREAKDOWN (NO SPORT PICKER)"))
+        gaitCard.addView(sectionHeader("PT TRIAL GAIT BREAKDOWN"))
         gaitBar = GaitBreakdownBarView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -492,35 +888,6 @@ class MainActivity : AppCompatActivity() {
         gaitCard.addView(gaitLegendText)
         col.addView(gaitCard)
 
-        // Start / Auto-Arm / Finish Controls
-        primaryActionBtn = Button(this).apply {
-            text = "START 1.6 KM TIMED RUN"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            isAllCaps = false
-            setTextColor(0xFF04130D.toInt())
-            background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(14))
-            setPadding(dp(16), dp(14), dp(16), dp(14))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
-        }
-        secondaryActionBtn = Button(this).apply {
-            text = "Arm Hands-Free Auto-Start (Begins when you Jog/Run)"
-            textSize = 12.5f
-            isAllCaps = false
-            setTextColor(0xFF38BDF8.toInt())
-            background = roundedBox(0xFF111827.toInt(), 0xFF38BDF8.toInt(), dp(12))
-            setPadding(dp(14), dp(11), dp(14), dp(11))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(14) }
-        }
-        col.addView(primaryActionBtn)
-        col.addView(secondaryActionBtn)
-
         // Live 400m Track Splits Card
         val splitsCard = cardContainer()
         splitsCard.addView(sectionHeader("400M TRACK LAP SPLITS (TARGET 1:48.8 / LAP)"))
@@ -531,8 +898,7 @@ class MainActivity : AppCompatActivity() {
         splitsCard.addView(splitsListLayout)
         col.addView(splitsCard)
 
-        scroll.addView(col)
-        return scroll
+        return col
     }
 
     // =========================================================================
@@ -628,7 +994,7 @@ class MainActivity : AppCompatActivity() {
         }
         chartCard.addView(trendChartView)
         chartCard.addView(TextView(this).apply {
-            text = "Blue dots = 1.6km Trials  •  Amber = Open Run Equiv  •  Dashed line = Forecast to 7:15"
+            text = "Blue dots = 1.6km PT Trials  •  Amber = Auto Open Runs  •  Dashed line = Forecast to 7:15"
             textSize = 11f
             setTextColor(0xFF64748B.toInt())
             setPadding(0, dp(4), 0, 0)
@@ -672,6 +1038,7 @@ class MainActivity : AppCompatActivity() {
                     repository.seedSampleProgressionIfRequested()
                     Toast.makeText(this@MainActivity, "Loaded 2-week sample progression!", Toast.LENGTH_SHORT).show()
                 }
+                refreshCachedDailyHistory(forceRender = true)
                 refreshProgressDashboard()
             }
         }
@@ -681,7 +1048,7 @@ class MainActivity : AppCompatActivity() {
 
         // Daily Sessions History Card
         val historyCard = cardContainer()
-        historyCard.addView(sectionHeader("RECORDED PRACTICE SESSIONS"))
+        historyCard.addView(sectionHeader("RECORDED 1.6 KM PT TRIALS & AUTO RUNS"))
         sessionsListLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(8), 0, 0)
@@ -753,9 +1120,9 @@ class MainActivity : AppCompatActivity() {
         }
         col.addView(tableCard)
 
-        // Target Time Selector Card
+        // Target Time & Tracking Preferences Card
         val settingsCard = cardContainer()
-        settingsCard.addView(sectionHeader("TARGET CUTOFF & GAIT THRESHOLD"))
+        settingsCard.addView(sectionHeader("TARGET CUTOFF, ALL-DAY AUTO & AUDIO"))
         settingsCard.addView(TextView(this).apply {
             text = "1.6 km Target Cutoff Time:"
             textSize = 12.5f
@@ -841,7 +1208,18 @@ class MainActivity : AppCompatActivity() {
         thresholdPresetButtons = thBtns
         settingsCard.addView(threshRow)
 
-        // Switches for State-Change Audio, Voice Coach & Indoor Step Fallback
+        // Switches for All-Day Auto Mode, State-Change Audio, Voice Coach & Indoor Step Fallback
+        allDayAutoSwitch = Switch(this).apply {
+            text = "All-Day 24/7 Open Auto Mode (Counts whole-day Walk & Jog+Run)"
+            setTextColor(0xFFE2E8F0.toInt())
+            textSize = 13f
+            isChecked = repository.allDayTrackingEnabled
+            setPadding(0, dp(6), 0, dp(6))
+            setOnCheckedChangeListener { _, checked ->
+                repository.allDayTrackingEnabled = checked
+                trackingService?.syncPocketForegroundAndWakeLock()
+            }
+        }
         stateAudioSwitch = Switch(this).apply {
             text = "Pocket & Screen-Off State Audio (Speaks Stand/Walk/Jog/Run in pocket)"
             setTextColor(0xFFE2E8F0.toInt())
@@ -877,14 +1255,39 @@ class MainActivity : AppCompatActivity() {
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(0xFFE2E8F0.toInt())
             background = roundedBox(0xFF1E293B.toInt(), 0xFF38BDF8.toInt(), dp(10))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
             setOnClickListener {
                 trackingService?.previewStateChangeAudio(MotionState.TARGET_PACE)
             }
         }
+        val resetTodayDailyBtn = Button(this).apply {
+            text = "Reset Today's All-Day Counters"
+            textSize = 12f
+            isAllCaps = false
+            setTextColor(0xFF94A3B8.toInt())
+            background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(10))
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Reset today's whole-day counters?")
+                    .setMessage("This resets today's Walk & Jog+Run counters to 0:00 (saved 1.6 km sessions are untouched).")
+                    .setPositiveButton("Reset Today") { _, _ ->
+                        trackingService?.resetTodayDailySummary()
+                        refreshCachedDailyHistory(forceRender = true)
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
+
+        settingsCard.addView(allDayAutoSwitch)
         settingsCard.addView(stateAudioSwitch)
         settingsCard.addView(voiceSwitch)
         settingsCard.addView(stepFallbackSwitch)
         settingsCard.addView(testStateAudioBtn)
+        settingsCard.addView(resetTodayDailyBtn)
         col.addView(settingsCard)
 
         // Live Sensor Diagnostics Card
@@ -955,48 +1358,211 @@ class MainActivity : AppCompatActivity() {
     // =========================================================================
     // LIVE RENDERING & STATE UPDATES
     // =========================================================================
+    private fun formatDistanceShort(meters: Double): String {
+        return if (meters >= 1000.0) {
+            String.format("%.2f km", meters / 1000.0)
+        } else {
+            "${meters.toInt()} m"
+        }
+    }
+
+    private fun refreshCachedDailyHistory(forceRender: Boolean = false) {
+        val today = LocalDate.now().toString()
+        cachedPastDailyLogs = repository.getRecentDailyActivities(10).filter { it.dateIso != today }
+        if (forceRender) {
+            lastDailyHistoryRenderMs = -60_000L
+            lastDailyHistoryKey = ""
+        }
+    }
+
+    private fun renderDailyHistoryCards(todaySummary: DailyActivitySummary) {
+        val nowMs = SystemClock.elapsedRealtime()
+        val key = "${todaySummary.dateIso}:${todaySummary.walkingSec.toInt()}:${todaySummary.jogRunCombinedSec.toInt()}:${todaySummary.totalSteps}:${cachedPastDailyLogs.size}"
+        if (key == lastDailyHistoryKey && (nowMs - lastDailyHistoryRenderMs) < 4000L) return
+        if ((nowMs - lastDailyHistoryRenderMs) >= 15_000L) {
+            val today = LocalDate.now().toString()
+            cachedPastDailyLogs = repository.getRecentDailyActivities(10).filter { it.dateIso != today }
+        }
+        lastDailyHistoryKey = key
+        lastDailyHistoryRenderMs = nowMs
+
+        val rows = mutableListOf(todaySummary)
+        rows.addAll(cachedPastDailyLogs)
+
+        dailyHistoryListLayout.removeAllViews()
+        for ((idx, day) in rows.withIndex()) {
+            val isToday = idx == 0
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(11), dp(9), dp(11), dp(9))
+                background = roundedBox(
+                    if (isToday) 0xFF0F1D2E.toInt() else 0xFF0B1120.toInt(),
+                    if (isToday) 0xFF1E3A5F.toInt() else 0xFF1E293B.toInt(),
+                    dp(10)
+                )
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(7) }
+            }
+
+            val top = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val dateTag = when {
+                isToday -> "TODAY (${day.dateIso})"
+                day.isDemo -> "${day.dateIso} • DEMO"
+                else -> day.dateIso
+            }
+            top.addView(TextView(this).apply {
+                text = dateTag
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(if (isToday) 0xFF38BDF8.toInt() else 0xFFE2E8F0.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            top.addView(TextView(this).apply {
+                text = "${formatDistanceShort(day.totalDistanceMeters)} • ${day.totalSteps} steps"
+                textSize = 12f
+                typeface = Typeface.MONOSPACE
+                setTextColor(0xFFCBD5E1.toInt())
+            })
+            card.addView(top)
+
+            card.addView(TextView(this).apply {
+                text = "Jog+Run ${TsPoliceBenchmark.formatDuration(day.jogRunCombinedSec)}  •  " +
+                    "Walk ${TsPoliceBenchmark.formatDuration(day.walkingSec)}  •  " +
+                    "Max ${TsPoliceBenchmark.formatPacePerKm(day.maxSpeedMps)} (${day.maxCadenceSpm.roundToInt()} spm)"
+                textSize = 11.5f
+                setTextColor(0xFF94A3B8.toInt())
+                setPadding(0, dp(3), 0, 0)
+            })
+
+            dailyHistoryListLayout.addView(card)
+        }
+    }
+
     private fun renderLiveTelemetry(snap: LiveTelemetry) {
         currentlyRecording = snap.isRecording
         refreshStateAudioChip()
         val targetSec = repository.targetTimeSec
+        val daily = snap.dailySummary
 
-        // Mode highlight
-        val is1600 = snap.mode == RunMode.TIMED_1600M
-        mode1600Btn.background = roundedBox(
-            if (is1600) 0xFF1E293B.toInt() else 0x00000000,
-            if (is1600) 0xFF38BDF8.toInt() else 0x00000000,
-            dp(9)
-        )
-        mode1600Btn.setTextColor(if (is1600) 0xFFF8FAFC.toInt() else 0xFF94A3B8.toInt())
-        modeOpenBtn.background = roundedBox(
-            if (!is1600) 0xFF1E293B.toInt() else 0x00000000,
-            if (!is1600) 0xFF38BDF8.toInt() else 0x00000000,
-            dp(9)
-        )
-        modeOpenBtn.setTextColor(if (!is1600) 0xFFF8FAFC.toInt() else 0xFF94A3B8.toInt())
+        // Auto-switch to the 1.6 km PT Trial view whenever a PT Trial transitions into ARMED or RUNNING
+        if (snap.ptTrialPhase != lastRenderedPtPhase) {
+            if (snap.ptTrialPhase != PtTrialPhase.IDLE) {
+                selectTrackerSubTab(1)
+            }
+            lastRenderedPtPhase = snap.ptTrialPhase
+        }
 
-        // Gauge
+        // Update sub-tab badge label if PT Trial is active
+        subTabPtBtn.text = when (snap.ptTrialPhase) {
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> "1.6 km PT (READY)"
+            PtTrialPhase.RUNNING_TRIAL -> "1.6 km PT (LIVE)"
+            PtTrialPhase.IDLE -> "1.6 km PT Trial"
+        }
+
+        // =====================================================================
+        // A. RENDER ALWAYS-ON ALL-DAY OPEN MODE (SUB-VIEW 0)
+        // =====================================================================
+        val allDayOn = repository.allDayTrackingEnabled
+        allDayLiveChip.text = if (allDayOn) "24/7 ACTIVE" else "PAUSED"
+        allDayLiveChip.background = roundedBox(
+            if (allDayOn) 0xFF10B981.toInt() else 0xFF475569.toInt(),
+            if (allDayOn) 0xFF10B981.toInt() else 0xFF475569.toInt(),
+            dp(10)
+        )
+        allDayStateBadge.text = snap.motionState.badgeText
+        allDayStateBadge.setTextColor(
+            if (snap.motionState == MotionState.STANDING) 0xFFCBD5E1.toInt() else snap.motionState.colorArgb
+        )
+        allDayStatusSub.text = when (snap.ptTrialPhase) {
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN ->
+                "1.6 km PT Trial is ARMED & waiting for Jog/Run • Whole-day counters remain active."
+            PtTrialPhase.RUNNING_TRIAL ->
+                "1.6 km PT Trial in progress (${snap.distanceMeters.toInt()}m / 1,600m) • Tap '1.6 km PT' above."
+            PtTrialPhase.IDLE ->
+                "No Start button needed — automatically counts whole-day Walk & Jog+Run time (ignores sitting & bike)."
+        }
+
+        // Hero Cards: Combined Jog + Run Today & Walking Today
+        dailyJogRunTimeVal.text = TsPoliceBenchmark.formatDuration(daily.jogRunCombinedSec)
+        dailyJogRunDistSub.text = "${formatDistanceShort(daily.jogRunCombinedMeters)} jog + run"
+        dailyJogRunSplitSub.text =
+            "Jog ${TsPoliceBenchmark.formatDuration(daily.joggingSec)} • Run ${TsPoliceBenchmark.formatDuration(daily.runningSec)}"
+
+        dailyWalkTimeVal.text = TsPoliceBenchmark.formatDuration(daily.walkingSec)
+        dailyWalkDistSub.text = "${formatDistanceShort(daily.walkingMeters)} walked"
+        dailyWalkStepsSub.text = "${daily.totalSteps} steps today"
+
+        // 3x2 Peak & Live Tiles
+        dailyMaxPaceVal.text = TsPoliceBenchmark.formatPacePerKm(daily.maxSpeedMps)
+        dailyMaxPaceSub.text = String.format("Peak %.1f km/h today", daily.maxSpeedMps * 3.6)
+
+        dailyMaxCadenceVal.text = "${daily.maxCadenceSpm.roundToInt()} spm"
+        dailyMaxCadenceSub.text = if (daily.maxCadenceSpm >= 165.0) "Target stride reached!" else "Peak stride rate today"
+
+        openLivePaceVal.text = TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)
+        openLivePaceSub.text = String.format("%.1f km/h live speed", snap.currentSpeedMps * 3.6)
+
+        openLiveCadenceVal.text = "${snap.cadenceSpm.roundToInt()} spm"
+        openLiveCadenceSub.text = String.format("%.1f m/s² motion", snap.dynamicAccelRms)
+
+        dailyTotalDistVal.text = formatDistanceShort(daily.totalDistanceMeters)
+        dailyTotalDistSub.text = "${daily.totalSteps} total steps"
+
+        openGpsStatusVal.text = if (snap.isGpsLocked) "GPS Locked" else "Step-Stride"
+        openGpsStatusVal.setTextColor(if (snap.isGpsLocked) 0xFF10B981.toInt() else 0xFF38BDF8.toInt())
+        openGpsStatusSub.text = when {
+            snap.isGpsLocked && snap.gpsAccuracyMeters != null ->
+                String.format("±%.0fm sky lock", snap.gpsAccuracyMeters)
+            snap.gpsAccuracyMeters != null ->
+                String.format("±%.0fm • Step active", snap.gpsAccuracyMeters)
+            else -> "Pocket / Indoor active"
+        }
+
+        // Whole-Day Gait Bar
+        dailyGaitBar.setDurations(daily.runningSec, daily.joggingSec, daily.walkingSec, 0.0)
+        dailyGaitLegendText.text =
+            "Combined Jog+Run ${TsPoliceBenchmark.formatDuration(daily.jogRunCombinedSec)} " +
+                "(Run ${TsPoliceBenchmark.formatDuration(daily.runningSec)} • Jog ${TsPoliceBenchmark.formatDuration(daily.joggingSec)})  •  " +
+                "Walk ${TsPoliceBenchmark.formatDuration(daily.walkingSec)}"
+
+        launchPtFromOpenBtn.text = when (snap.ptTrialPhase) {
+            PtTrialPhase.IDLE -> "START 1.6 KM PT TRIAL (Starts Only When You Jog/Run) →"
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> "1.6 KM PT TRIAL ARMED • VIEW / CANCEL →"
+            PtTrialPhase.RUNNING_TRIAL -> "VIEW LIVE 1.6 KM PT TRIAL (${snap.distanceMeters.toInt()}m) →"
+        }
+
+        renderDailyHistoryCards(daily)
+
+        // =====================================================================
+        // B. RENDER 1.6 KM PT TRIAL (SUB-VIEW 1)
+        // =====================================================================
         paceArcGauge.updateState(
             distanceMeters = snap.distanceMeters,
             activeDurationSec = snap.activeDurationSec,
             targetSec = targetSec,
             motionState = snap.motionState,
-            recording = snap.isRecording,
-            armed = snap.isAutoStartArmed
+            recording = snap.ptTrialPhase == PtTrialPhase.RUNNING_TRIAL,
+            armed = snap.ptTrialPhase == PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN
         )
 
-        // 4 Live Sensor Tiles
         metricPaceVal.text = TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)
         metricPaceSub.text = String.format("%.1f km/h ground speed", snap.currentSpeedMps * 3.6)
 
         metricCadenceVal.text = String.format("%d spm", snap.cadenceSpm.roundToInt())
-        metricCadenceSub.text = "${snap.totalSteps} steps detected"
+        metricCadenceSub.text = "${snap.totalSteps} steps today"
 
-        val projSec = TsPoliceBenchmark.projected1600mFinishSec(
-            snap.distanceMeters,
-            snap.activeDurationSec,
-            snap.currentSpeedMps
-        )
+        val projSec = if (snap.ptTrialPhase == PtTrialPhase.RUNNING_TRIAL) {
+            TsPoliceBenchmark.projected1600mFinishSec(
+                snap.distanceMeters,
+                snap.activeDurationSec,
+                snap.currentSpeedMps
+            )
+        } else null
         metricProjVal.text = if (projSec != null) TsPoliceBenchmark.formatDuration(projSec) else "--:--"
         metricProjVal.setTextColor(
             when {
@@ -1016,7 +1582,7 @@ class MainActivity : AppCompatActivity() {
             else -> "Indoor / Step-Stride Mode"
         }
 
-        // Gait breakdown bar
+        // PT Trial Gait breakdown bar
         gaitBar.setDurations(snap.runningSec, snap.joggingSec, snap.walkingSec, snap.pausedDurationSec)
         gaitLegendText.text =
             "Run ${TsPoliceBenchmark.formatDuration(snap.runningSec)}  •  " +
@@ -1024,63 +1590,82 @@ class MainActivity : AppCompatActivity() {
                 "Walk ${TsPoliceBenchmark.formatDuration(snap.walkingSec)}  •  " +
                 "Pause ${TsPoliceBenchmark.formatDuration(snap.pausedDurationSec)}"
 
-        // Action buttons
-        if (snap.isRecording) {
-            primaryActionBtn.text = "FINISH & SAVE RUN"
-            primaryActionBtn.setTextColor(0xFFF8FAFC.toInt())
-            primaryActionBtn.background = roundedBox(0xFFEF4444.toInt(), 0xFFEF4444.toInt(), dp(14))
-            primaryActionBtn.setOnClickListener {
-                val id = trackingService?.finishWorkout(forceSave = true)
-                if (id != null) {
-                    Toast.makeText(this, "Run saved! Updating your 7:15 ETA forecast.", Toast.LENGTH_LONG).show()
-                    refreshProgressDashboard()
-                    selectTab(1)
-                } else {
-                    Toast.makeText(this, "Run too short to log (<30m).", Toast.LENGTH_SHORT).show()
-                }
-            }
-
-            secondaryActionBtn.text = "Discard Current Run"
-            secondaryActionBtn.setTextColor(0xFF94A3B8.toInt())
-            secondaryActionBtn.background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(12))
-            secondaryActionBtn.setOnClickListener {
-                AlertDialog.Builder(this)
-                    .setTitle("Discard current run?")
-                    .setMessage("This will stop the timer without saving.")
-                    .setPositiveButton("Discard") { _, _ -> trackingService?.discardWorkout() }
-                    .setNegativeButton("Keep Running", null)
-                    .show()
-            }
-        } else {
-            primaryActionBtn.text = if (is1600) "START 1.6 KM TIMED RUN" else "START OPEN PRACTICE RUN"
-            primaryActionBtn.setTextColor(0xFF04130D.toInt())
-            primaryActionBtn.background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(14))
-            primaryActionBtn.setOnClickListener {
-                requestNeededPermissionsIfMissing(silentCheckOnly = false)
-                trackingService?.startWorkout(snap.mode)
-            }
-
-            if (snap.isAutoStartArmed) {
-                secondaryActionBtn.text = "Auto-Start ARMED (Tap to Disarm) • Start Jogging!"
-                secondaryActionBtn.setTextColor(0xFFFBBF24.toInt())
-                secondaryActionBtn.background = roundedBox(0x22F59E0B, 0xFFF59E0B.toInt(), dp(12))
-                secondaryActionBtn.setOnClickListener { trackingService?.setAutoStartArmed(false) }
-            } else {
-                secondaryActionBtn.text = "Arm Hands-Free Auto-Start (Begins when you Jog/Run)"
-                secondaryActionBtn.setTextColor(0xFF38BDF8.toInt())
-                secondaryActionBtn.background = roundedBox(0xFF111827.toInt(), 0xFF38BDF8.toInt(), dp(12))
-                secondaryActionBtn.setOnClickListener {
+        // PT Trial Action Buttons across IDLE -> ARMED_WAITING_FOR_JOG_RUN -> RUNNING_TRIAL
+        when (snap.ptTrialPhase) {
+            PtTrialPhase.IDLE -> {
+                primaryActionBtn.text = "START 1.6 KM PT TRIAL (Starts When You Jog/Run)"
+                primaryActionBtn.setTextColor(0xFF04130D.toInt())
+                primaryActionBtn.background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(14))
+                primaryActionBtn.setOnClickListener {
                     requestNeededPermissionsIfMissing(silentCheckOnly = false)
-                    trackingService?.setAutoStartArmed(true)
+                    trackingService?.armPtTrial()
+                }
+                ptArmHintText.text =
+                    "Tap Start, put phone in pocket & walk to the line — timer stays at 0:00 until you start jogging or running."
+                ptArmHintText.setTextColor(0xFF94A3B8.toInt())
+
+                secondaryActionBtn.visibility = View.VISIBLE
+                secondaryActionBtn.text = "← Back to All-Day Open Mode"
+                secondaryActionBtn.setTextColor(0xFF38BDF8.toInt())
+                secondaryActionBtn.background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(12))
+                secondaryActionBtn.setOnClickListener { selectTrackerSubTab(0) }
+            }
+
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> {
+                primaryActionBtn.text = "WAITING FOR JOG / RUN... (Tap to Cancel)"
+                primaryActionBtn.setTextColor(0xFF04130D.toInt())
+                primaryActionBtn.background = roundedBox(0xFFF59E0B.toInt(), 0xFFF59E0B.toInt(), dp(14))
+                primaryActionBtn.setOnClickListener {
+                    trackingService?.cancelPtTrial()
+                }
+                ptArmHintText.text =
+                    "Detected now: ${snap.motionState.label} • Standing & Walking ignored. Start jogging or running to launch!"
+                ptArmHintText.setTextColor(0xFFFDE68A.toInt())
+
+                secondaryActionBtn.visibility = View.GONE
+            }
+
+            PtTrialPhase.RUNNING_TRIAL -> {
+                primaryActionBtn.text = "FINISH EARLY & SAVE PT TRIAL"
+                primaryActionBtn.setTextColor(0xFFF8FAFC.toInt())
+                primaryActionBtn.background = roundedBox(0xFFEF4444.toInt(), 0xFFEF4444.toInt(), dp(14))
+                primaryActionBtn.setOnClickListener {
+                    val id = trackingService?.finishWorkout(forceSave = true)
+                    if (id != null) {
+                        Toast.makeText(this, "PT Trial saved! Updating your 7:15 ETA forecast.", Toast.LENGTH_LONG).show()
+                        refreshProgressDashboard()
+                        selectTab(1)
+                    } else {
+                        Toast.makeText(this, "Trial too short to log (<50m).", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                ptArmHintText.text =
+                    "Auto-finishes & saves at 1,600 m • Calls out every 400 m lap split"
+                ptArmHintText.setTextColor(0xFF34D399.toInt())
+
+                secondaryActionBtn.visibility = View.VISIBLE
+                secondaryActionBtn.text = "Cancel PT Trial (Don't Save)"
+                secondaryActionBtn.setTextColor(0xFF94A3B8.toInt())
+                secondaryActionBtn.background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(12))
+                secondaryActionBtn.setOnClickListener {
+                    AlertDialog.Builder(this)
+                        .setTitle("Cancel current 1.6 km PT Trial?")
+                        .setMessage("This stops the 1.6 km stopwatch without saving (whole-day open tracking stays intact).")
+                        .setPositiveButton("Cancel Trial") { _, _ -> trackingService?.cancelPtTrial() }
+                        .setNegativeButton("Keep Running", null)
+                        .show()
                 }
             }
         }
 
-        // Auto-completion jump to Progress tab when 1.6km trial finishes hands-free!
-        if (!snap.isRecording && snap.justFinishedSessionId != null && snap.justFinishedSessionId != lastHandledFinishId) {
+        // Auto-completion jump to Progress tab when 1.6km PT trial finishes hands-free!
+        if (snap.ptTrialPhase == PtTrialPhase.IDLE &&
+            snap.justFinishedSessionId != null &&
+            snap.justFinishedSessionId != lastHandledFinishId
+        ) {
             lastHandledFinishId = snap.justFinishedSessionId
             refreshProgressDashboard()
-            Toast.makeText(this, "1.6 km Trial Complete! Saved to Progress.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "1.6 km PT Trial Complete! Saved to Progress.", Toast.LENGTH_LONG).show()
             selectTab(1)
         }
 
@@ -1201,7 +1786,7 @@ class MainActivity : AppCompatActivity() {
         sessionsListLayout.removeAllViews()
         if (sessions.isEmpty()) {
             sessionsListLayout.addView(TextView(this).apply {
-                text = "No sessions yet. Start a live 1.6 km run, tap '+ Log Track Time', or tap 'Load Sample Data' to preview."
+                text = "No sessions yet. Run a 1.6 km PT Trial, jog >= 600m in Open Mode, tap '+ Log Track Time', or tap 'Load Sample Data'."
                 textSize = 12.5f
                 setTextColor(0xFF64748B.toInt())
             })
