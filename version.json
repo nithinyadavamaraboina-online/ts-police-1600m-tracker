@@ -1,8 +1,8 @@
 {
-    "versionCode":  2,
-    "versionName":  "1.0.1",
+    "versionCode":  3,
+    "versionName":  "1.0.2",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "9d5c1f8fee7e1c7a1e814ca736f6c6a0bf5b5e97e83d41ed6bf8f8ced9e0ac34",
-    "changelog":  "Added state-change audio cues (sport beep + spoken voice for Standing, Walking, Jogging, Running, and 7:15 Target Pace) with music ducking and quick mute toggle.",
-    "publishedAt":  "2026-10-25T16:43:02Z"
+    "sha256":  "3a16aad166c5173dbe2f92790a48dc7d098d33cfd4083b54952fa786f58b0981",
+    "changelog":  "Added periodic background JobScheduler auto-update checks (every 15 min, survives reboot), silent APK pre-download with SHA-256 verification, 1-tap system notification install, and app-resume checks.",
+    "publishedAt":  "2026-10-25T16:49:48Z"
 }

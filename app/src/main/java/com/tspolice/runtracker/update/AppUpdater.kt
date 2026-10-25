@@ -1,5 +1,12 @@
 package com.tspolice.runtracker.update
 
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.job.JobInfo
+import android.app.job.JobScheduler
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,7 +15,10 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import com.tspolice.runtracker.ui.MainActivity
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -102,6 +112,12 @@ class AppUpdater(private val context: Context) {
 
         private const val PREFS_NAME = "ts_police_updater_prefs"
         private const val KEY_AUTO_CHECK = "auto_check_updates"
+        private const val KEY_LAST_NOTIFIED_VERSION = "last_notified_version_tag"
+
+        private const val BACKGROUND_JOB_ID = 1602
+        private const val UPDATE_NOTIFICATION_ID = 1602
+        private const val UPDATE_CHANNEL_ID = "ts_police_ota_updates"
+        const val EXTRA_INSTALL_UPDATE_ON_OPEN = "extra_install_update_on_open"
     }
 
     private val appContext = context.applicationContext
@@ -114,7 +130,68 @@ class AppUpdater(private val context: Context) {
 
     var autoCheckOnLaunch: Boolean
         get() = prefs.getBoolean(KEY_AUTO_CHECK, true)
-        set(value) = prefs.edit().putBoolean(KEY_AUTO_CHECK, value).apply()
+        set(value) {
+            prefs.edit().putBoolean(KEY_AUTO_CHECK, value).apply()
+            syncBackgroundUpdateSchedule()
+        }
+
+    /**
+     * Schedules or cancels periodic background GitHub Release checks via Android JobScheduler
+     * (runs every 15 minutes whenever network is available, persisted across device reboots).
+     */
+    fun syncBackgroundUpdateSchedule() {
+        val scheduler = appContext.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler ?: return
+        if (!autoCheckOnLaunch) {
+            scheduler.cancel(BACKGROUND_JOB_ID)
+            return
+        }
+        // Keep existing periodic schedule intact if already registered so reopening the app doesn't reset the timer
+        if (scheduler.getPendingJob(BACKGROUND_JOB_ID) != null) {
+            return
+        }
+        val canPersist = ContextCompat.checkSelfPermission(
+            appContext,
+            Manifest.permission.RECEIVE_BOOT_COMPLETED
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val component = ComponentName(appContext, UpdateCheckJobService::class.java)
+        val periodMs = maxOf(JobInfo.getMinPeriodMillis(), 15L * 60L * 1000L)
+        val jobInfo = JobInfo.Builder(BACKGROUND_JOB_ID, component)
+            .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+            .setPeriodic(periodMs)
+            .setPersisted(canPersist)
+            .build()
+        runCatching { scheduler.schedule(jobInfo) }
+    }
+
+    /**
+     * Invoked periodically in the background by [UpdateCheckJobService] even when the app is closed:
+     * checks GitHub Releases, pre-downloads & SHA-256 verifies the APK into cache, and posts a
+     * 1-tap system notification ready to install.
+     */
+    fun runBackgroundCheckAndPreDownload(onComplete: () -> Unit) {
+        executor.execute {
+            try {
+                val (installedCode, installedName) = getInstalledVersion()
+                val remote = fetchRemoteReleaseInfo()
+                if (VersionComparator.isRemoteNewer(
+                        installedVersionCode = installedCode,
+                        installedVersionName = installedName,
+                        remoteVersionCode = remote.versionCode,
+                        remoteVersionName = remote.versionName
+                    )
+                ) {
+                    // Pre-download and verify SHA-256 silently so tapping the notification installs immediately
+                    runCatching { downloadAndVerifyApkFile(remote, onProgress = null) }
+                    postBackgroundUpdateNotification(remote)
+                }
+            } catch (_: Exception) {
+                // Silent retry on next JobScheduler window
+            } finally {
+                mainHandler.post { onComplete() }
+            }
+        }
+    }
 
     fun getInstalledVersion(): Pair<Int, String> {
         return try {
@@ -174,54 +251,7 @@ class AppUpdater(private val context: Context) {
     ) {
         executor.execute {
             try {
-                val updatesDir = File(appContext.cacheDir, "updates").apply { mkdirs() }
-                val partFile = File(updatesDir, "ts-police-update.apk.part")
-                val finalFile = File(updatesDir, "ts-police-update-${release.versionCode}.apk")
-
-                // Clean old cached APKs
-                updatesDir.listFiles()?.forEach { if (it != finalFile) it.delete() }
-
-                val conn = openFollowingRedirects(release.apkUrl, acceptHeader = "application/octet-stream")
-                val totalBytes = conn.contentLengthLong
-                val digest = MessageDigest.getInstance("SHA-256")
-
-                conn.inputStream.use { input ->
-                    FileOutputStream(partFile).use { output ->
-                        val buf = ByteArray(16 * 1024)
-                        var downloaded = 0L
-                        var lastReportedPct = -1
-                        while (true) {
-                            val read = input.read(buf)
-                            if (read <= 0) break
-                            output.write(buf, 0, read)
-                            digest.update(buf, 0, read)
-                            downloaded += read
-                            val pct = if (totalBytes > 0L) {
-                                ((downloaded * 100L) / totalBytes).toInt().coerceIn(0, 100)
-                            } else -1
-                            if (pct != lastReportedPct) {
-                                lastReportedPct = pct
-                                val snapBytes = downloaded
-                                mainHandler.post { onProgress(pct, snapBytes, totalBytes) }
-                            }
-                        }
-                    }
-                }
-                conn.disconnect()
-
-                val actualSha256 = digest.digest().joinToString("") { "%02x".format(it) }
-                val expectedSha = release.sha256?.trim()?.lowercase()
-                if (!expectedSha.isNullOrEmpty() && expectedSha.length == 64 && actualSha256 != expectedSha) {
-                    partFile.delete()
-                    throw IllegalStateException("APK SHA-256 mismatch (expected ${expectedSha.take(10)}..., got ${actualSha256.take(10)}...)")
-                }
-
-                if (finalFile.exists()) finalFile.delete()
-                if (!partFile.renameTo(finalFile)) {
-                    partFile.copyTo(finalFile, overwrite = true)
-                    partFile.delete()
-                }
-
+                val finalFile = downloadAndVerifyApkFile(release, onProgress)
                 mainHandler.post {
                     triggerPackageInstall(
                         apkFile = finalFile,
@@ -234,6 +264,139 @@ class AppUpdater(private val context: Context) {
                 mainHandler.post { onError(e.message ?: "Download failed") }
             }
         }
+    }
+
+    private fun downloadAndVerifyApkFile(
+        release: UpdateReleaseInfo,
+        onProgress: ((percent: Int, downloadedBytes: Long, totalBytes: Long) -> Unit)?
+    ): File {
+        val updatesDir = File(appContext.cacheDir, "updates").apply { mkdirs() }
+        val tagId = if (release.versionCode > 0) release.versionCode.toString() else release.versionName
+        val partFile = File(updatesDir, "ts-police-update.apk.part")
+        val finalFile = File(updatesDir, "ts-police-update-$tagId.apk")
+        val expectedSha = release.sha256?.trim()?.lowercase()
+
+        // Fast-path: reuse pre-downloaded APK from background job if already SHA-256 verified
+        if (finalFile.exists() && finalFile.length() > 100_000L) {
+            if (expectedSha.isNullOrEmpty() || expectedSha.length != 64 || sha256OfFile(finalFile) == expectedSha) {
+                val len = finalFile.length()
+                if (onProgress != null) {
+                    mainHandler.post { onProgress(100, len, len) }
+                }
+                return finalFile
+            }
+            finalFile.delete()
+        }
+
+        // Clean older cached APKs
+        updatesDir.listFiles()?.forEach { if (it != finalFile) it.delete() }
+
+        val conn = openFollowingRedirects(release.apkUrl, acceptHeader = "application/octet-stream")
+        val totalBytes = conn.contentLengthLong
+        val digest = MessageDigest.getInstance("SHA-256")
+
+        conn.inputStream.use { input ->
+            FileOutputStream(partFile).use { output ->
+                val buf = ByteArray(16 * 1024)
+                var downloaded = 0L
+                var lastReportedPct = -1
+                while (true) {
+                    val read = input.read(buf)
+                    if (read <= 0) break
+                    output.write(buf, 0, read)
+                    digest.update(buf, 0, read)
+                    downloaded += read
+                    if (onProgress != null) {
+                        val pct = if (totalBytes > 0L) {
+                            ((downloaded * 100L) / totalBytes).toInt().coerceIn(0, 100)
+                        } else -1
+                        if (pct != lastReportedPct) {
+                            lastReportedPct = pct
+                            val snapBytes = downloaded
+                            mainHandler.post { onProgress(pct, snapBytes, totalBytes) }
+                        }
+                    }
+                }
+            }
+        }
+        conn.disconnect()
+
+        val actualSha256 = digest.digest().joinToString("") { "%02x".format(it) }
+        if (!expectedSha.isNullOrEmpty() && expectedSha.length == 64 && actualSha256 != expectedSha) {
+            partFile.delete()
+            throw IllegalStateException(
+                "APK SHA-256 mismatch (expected ${expectedSha.take(10)}..., got ${actualSha256.take(10)}...)"
+            )
+        }
+
+        if (finalFile.exists()) finalFile.delete()
+        if (!partFile.renameTo(finalFile)) {
+            partFile.copyTo(finalFile, overwrite = true)
+            partFile.delete()
+        }
+        return finalFile
+    }
+
+    private fun sha256OfFile(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(16 * 1024)
+            while (true) {
+                val read = input.read(buf)
+                if (read <= 0) break
+                digest.update(buf, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun postBackgroundUpdateNotification(release: UpdateReleaseInfo) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                appContext,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) return
+        }
+
+        val versionKey = "${release.versionCode}:${release.versionName}"
+        if (prefs.getString(KEY_LAST_NOTIFIED_VERSION, null) == versionKey) {
+            return
+        }
+
+        val nm = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        val channel = NotificationChannel(
+            UPDATE_CHANNEL_ID,
+            "TS Police App Updates",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Alerts you when a new TS Police 1.6km Tracker OTA update is downloaded and ready to install"
+        }
+        nm.createNotificationChannel(channel)
+
+        val openIntent = Intent(appContext, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_INSTALL_UPDATE_ON_OPEN, true)
+        }
+        val pending = PendingIntent.getActivity(
+            appContext,
+            UPDATE_NOTIFICATION_ID,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(appContext, UPDATE_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentTitle("Update v${release.versionName} Ready to Install")
+            .setContentText(release.changelog)
+            .setStyle(NotificationCompat.BigTextStyle().bigText("${release.changelog}\n\nTap to install now (your run history is preserved)."))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(pending)
+            .build()
+
+        nm.notify(UPDATE_NOTIFICATION_ID, notification)
+        prefs.edit().putString(KEY_LAST_NOTIFIED_VERSION, versionKey).apply()
     }
 
     /**

@@ -5,6 +5,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- High-precision GPS + Fused location for live speed, pace & 1.6km distance -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
@@ -55,6 +56,12 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="location" />
+
+        <service
+            android:name=".update.UpdateCheckJobService"
+            android:enabled="true"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

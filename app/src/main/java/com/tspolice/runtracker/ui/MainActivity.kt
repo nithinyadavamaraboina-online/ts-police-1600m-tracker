@@ -12,6 +12,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.SystemClock
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -54,6 +55,8 @@ class MainActivity : AppCompatActivity() {
     private var latestDiscoveredRelease: UpdateReleaseInfo? = null
     private var currentlyRecording = false
     private var activityVisible = false
+    private var lastAutoUpdateCheckElapsedMs = -10_000_000L
+    private var activeUpdateDialog: AlertDialog? = null
 
     // Top-level tab containers
     private lateinit var stateAudioChip: TextView
@@ -148,14 +151,13 @@ class MainActivity : AppCompatActivity() {
         bindService(svcIntent, serviceConnection, Context.BIND_AUTO_CREATE)
 
         requestNeededPermissionsIfMissing(silentCheckOnly = false)
+        appUpdater.syncBackgroundUpdateSchedule()
+    }
 
-        if (appUpdater.autoCheckOnLaunch) {
-            window.decorView.postDelayed({
-                if (!isFinishing && !currentlyRecording) {
-                    performUpdateCheck(manualUserTrigger = false)
-                }
-            }, 1400L)
-        }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        consumeInstallFromNotificationIntent(intent)
     }
 
     override fun onStart() {
@@ -168,7 +170,30 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         if (appUpdater.resumePendingInstallIfPermitted()) {
             Toast.makeText(this, "Launching update installer...", Toast.LENGTH_SHORT).show()
+            return
         }
+        if (consumeInstallFromNotificationIntent(intent)) {
+            return
+        }
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (appUpdater.autoCheckOnLaunch && !currentlyRecording && (nowElapsed - lastAutoUpdateCheckElapsedMs) >= 120_000L) {
+            lastAutoUpdateCheckElapsedMs = nowElapsed
+            window.decorView.postDelayed({
+                if (!isFinishing && !currentlyRecording) {
+                    performUpdateCheck(manualUserTrigger = false)
+                }
+            }, 900L)
+        }
+    }
+
+    private fun consumeInstallFromNotificationIntent(targetIntent: Intent?): Boolean {
+        if (targetIntent?.getBooleanExtra(AppUpdater.EXTRA_INSTALL_UPDATE_ON_OPEN, false) == true) {
+            targetIntent.removeExtra(AppUpdater.EXTRA_INSTALL_UPDATE_ON_OPEN)
+            lastAutoUpdateCheckElapsedMs = SystemClock.elapsedRealtime()
+            performUpdateCheck(manualUserTrigger = false, autoInstallWhenFound = true)
+            return true
+        }
+        return false
     }
 
     override fun onStop() {
@@ -178,6 +203,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        activeUpdateDialog?.dismiss()
         trackingService?.removeTelemetryListener(telemetryListener)
         if (serviceBound) {
             unbindService(serviceConnection)
@@ -899,7 +925,7 @@ class MainActivity : AppCompatActivity() {
         updateCard.addView(updateStatusText)
 
         val autoUpdateSwitch = Switch(this).apply {
-            text = "Auto-check for updates when app opens"
+            text = "Background & Launch Auto-Update (Checks every 15 min + Notification)"
             setTextColor(0xFFE2E8F0.toInt())
             textSize = 13f
             isChecked = appUpdater.autoCheckOnLaunch
@@ -1399,8 +1425,9 @@ class MainActivity : AppCompatActivity() {
     // =========================================================================
     // GITHUB OTA AUTO-UPDATE UI FLOW
     // =========================================================================
-    private fun performUpdateCheck(manualUserTrigger: Boolean) {
+    private fun performUpdateCheck(manualUserTrigger: Boolean, autoInstallWhenFound: Boolean = false) {
         if (manualUserTrigger) {
+            lastAutoUpdateCheckElapsedMs = SystemClock.elapsedRealtime()
             checkUpdateBtn.isEnabled = false
             checkUpdateBtn.text = "Checking GitHub Releases..."
         }
@@ -1419,7 +1446,9 @@ class MainActivity : AppCompatActivity() {
                         "Update ready: v${result.installedVersionName} → v${result.release.versionName}"
                     updateStatusText.setTextColor(0xFF38BDF8.toInt())
 
-                    if (manualUserTrigger || !currentlyRecording) {
+                    if (autoInstallWhenFound && !currentlyRecording) {
+                        startUpdateDownloadAndInstall(result.release)
+                    } else if (manualUserTrigger || !currentlyRecording) {
                         showUpdateAvailableDialog(result.installedVersionName, result.release)
                     }
                 }
@@ -1450,7 +1479,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showUpdateAvailableDialog(currentVersion: String, release: UpdateReleaseInfo) {
-        AlertDialog.Builder(this)
+        activeUpdateDialog?.dismiss()
+        activeUpdateDialog = AlertDialog.Builder(this)
             .setTitle("New App Update: v${release.versionName}")
             .setMessage(
                 "Installed: v$currentVersion\nAvailable: v${release.versionName}\n\n" +
