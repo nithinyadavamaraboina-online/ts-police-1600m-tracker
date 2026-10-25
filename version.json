@@ -1,0 +1,8 @@
+{
+    "versionCode":  1,
+    "versionName":  "1.0.0",
+    "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
+    "sha256":  "57db3b0eb939e036f00315a8f4831761194463172a304626490e0ce26e6234c4",
+    "changelog":  "Initial release: Auto Run/Jog/Walk/Standing sensor fusion, 1.6km TS Police 7:15 benchmark \u0026 400m voice coach, daily progression ETA forecaster, and GitHub OTA auto-updater.",
+    "publishedAt":  "2026-10-25T16:27:15Z"
+}

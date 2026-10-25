@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.TsPoliceTracker" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">#10B981</item>
+        <item name="colorOnPrimary">#04130D</item>
+        <item name="colorSecondary">#38BDF8</item>
+        <item name="android:statusBarColor">#090D16</item>
+        <item name="android:navigationBarColor">#090D16</item>
+        <item name="android:windowBackground">#090D16</item>
+    </style>
+</resources>

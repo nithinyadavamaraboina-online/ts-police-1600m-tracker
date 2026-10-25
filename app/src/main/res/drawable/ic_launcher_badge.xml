@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Dark tactical background -->
+    <path
+        android:fillColor="#0B1324"
+        android:pathData="M0,0h108v108h-108z" />
+    <!-- Shield outline -->
+    <path
+        android:fillColor="#132238"
+        android:strokeColor="#10B981"
+        android:strokeWidth="3.5"
+        android:pathData="M54,14 L86,26 L86,54 C86,75 72,89 54,96 C36,89 22,75 22,54 L22,26 Z" />
+    <!-- Inner speed track arc -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#38BDF8"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M35,60 A20,20 0 1,1 73,60" />
+    <!-- Lightning / Runner bolt -->
+    <path
+        android:fillColor="#F59E0B"
+        android:pathData="M57,33 L43,55 L53,55 L49,75 L66,50 L55,50 Z" />
+</vector>
