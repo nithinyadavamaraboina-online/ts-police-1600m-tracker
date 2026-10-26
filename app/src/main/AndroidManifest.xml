@@ -22,6 +22,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- Samsung Health -> Android Health Connect Read Permissions for Accuracy Comparison & Calibration -->
     <uses-permission android:name="android.permission.health.READ_STEPS" />

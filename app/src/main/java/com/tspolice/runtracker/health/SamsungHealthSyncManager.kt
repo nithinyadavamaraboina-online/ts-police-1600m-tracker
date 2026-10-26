@@ -384,12 +384,68 @@ class SamsungHealthSyncManager(
                     currentStrideScale = currentScale
                 )
                 repository.strideCalibrationScale = currentScale
+                if (snapshot.steps >= 200 && snapshot.distanceMeters >= 110.0) {
+                    repository.hasSamsungStrideCalibration = true
+                }
             }
 
-            // Optionally import non-overlapping Samsung Health / Galaxy Watch runs (>= 600m) into Progress & 7:15 ETA
+            // Backfill non-overlapping Samsung Health / Galaxy Watch runs (>= 600m) from the last 14 days
+            // so newly connected users get an instant 2-week 7:15 ETA trend curve!
             var importedCount = 0
-            if (repository.autoImportSamsungRuns) {
-                for (w in runWorkouts) {
+            if (repository.autoImportSamsungRuns && canReadExercise) {
+                val twoWeekStart = today.minusDays(14).atStartOfDay(zone).toInstant()
+                val historyExercises = runCatching {
+                    client.readRecords(
+                        ReadRecordsRequest(
+                            ExerciseSessionRecord::class,
+                            timeRangeFilter = TimeRangeFilter.between(twoWeekStart, nowInstant),
+                            dataOriginFilter = targetOrigins
+                        )
+                    ).records
+                }.getOrDefault(scopedExercises)
+
+                val candidateWorkouts = mutableListOf<ExternalRunWorkout>()
+                candidateWorkouts.addAll(runWorkouts)
+
+                for (ex in historyExercises) {
+                    if (ex.exerciseType != ExerciseSessionRecord.EXERCISE_TYPE_RUNNING &&
+                        ex.exerciseType != ExerciseSessionRecord.EXERCISE_TYPE_RUNNING_TREADMILL
+                    ) continue
+                    val extId = ex.metadata.id.ifBlank { "${sourcePkg}_${ex.startTime.toEpochMilli()}" }
+                    if (candidateWorkouts.any { it.externalId == extId } || repository.isExternalWorkoutImported(extId)) continue
+                    val durSec = (ex.endTime.toEpochMilli() - ex.startTime.toEpochMilli()) / 1000.0
+                    if (durSec < 60.0) continue
+                    val sessionAgg = runCatching {
+                        client.aggregate(
+                            AggregateRequest(
+                                metrics = setOf(DistanceRecord.DISTANCE_TOTAL, StepsRecord.COUNT_TOTAL),
+                                timeRangeFilter = TimeRangeFilter.between(ex.startTime, ex.endTime),
+                                dataOriginFilter = targetOrigins
+                            )
+                        )
+                    }.getOrNull()
+                    val exDistM = sessionAgg?.get(DistanceRecord.DISTANCE_TOTAL)?.inMeters ?: 0.0
+                    if (exDistM >= 600.0) {
+                        val exSteps = sessionAgg?.get(StepsRecord.COUNT_TOTAL)?.toDouble() ?: 0.0
+                        val avgCad = if (exSteps > 0.0) (exSteps / durSec) * 60.0 else 164.0
+                        val avgSpd = exDistM / durSec
+                        candidateWorkouts.add(
+                            ExternalRunWorkout(
+                                externalId = extId,
+                                sourcePackage = sourcePkg,
+                                startedAtEpochMs = ex.startTime.toEpochMilli(),
+                                dateIso = ex.startTime.atZone(zone).toLocalDate().toString(),
+                                durationSec = durSec,
+                                distanceMeters = exDistM,
+                                maxSpeedMps = (avgSpd * 1.08).coerceAtMost(GaitClassifier.MAX_HUMAN_RUNNING_SPEED_MPS),
+                                avgCadenceSpm = avgCad.coerceIn(130.0, 210.0),
+                                title = ex.title?.takeIf { it.isNotBlank() } ?: "$sourceLabel Run"
+                            )
+                        )
+                    }
+                }
+
+                for (w in candidateWorkouts) {
                     if (w.distanceMeters >= 600.0 &&
                         !repository.isExternalWorkoutImported(w.externalId) &&
                         !repository.hasSessionNear(w.startedAtEpochMs)

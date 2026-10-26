@@ -69,6 +69,66 @@ enum class PtTrialPhase {
 }
 
 /**
+ * Smart 3-state pocket audio mode so casual indoor walking never embarrasses the user,
+ * while 1.6km PT Trials and outdoor runs still get loud, clear voice coaching.
+ */
+enum class PocketAudioMode(val shortLabel: String, val description: String) {
+    SMART_TRACK(
+        shortLabel = "Smart Audio",
+        description = "Speaks during PT Trials & Jog/Run only (silent when walking indoors)"
+    ),
+    ALL_STATES(
+        shortLabel = "All States",
+        description = "Speaks every Stand / Walk / Jog / Run change in pocket (Test Mode)"
+    ),
+    MUTED(
+        shortLabel = "Muted",
+        description = "State-change announcements muted"
+    );
+
+    fun nextMode(): PocketAudioMode = when (this) {
+        SMART_TRACK -> ALL_STATES
+        ALL_STATES -> MUTED
+        MUTED -> SMART_TRACK
+    }
+
+    fun shouldAnnounceTransition(
+        previousState: MotionState,
+        newState: MotionState,
+        ptTrialPhase: PtTrialPhase,
+        inOpenRunBout: Boolean
+    ): Boolean = when (this) {
+        MUTED -> false
+        ALL_STATES -> true
+        SMART_TRACK -> {
+            ptTrialPhase != PtTrialPhase.IDLE ||
+                newState.isJogOrRun() ||
+                previousState.isJogOrRun() ||
+                inOpenRunBout
+        }
+    }
+}
+
+enum class IntervalPhase {
+    IDLE,
+    RUNNING_REP,
+    REST_COUNTDOWN,
+    COMPLETED
+}
+
+data class IntervalWorkoutState(
+    val phase: IntervalPhase = IntervalPhase.IDLE,
+    val currentRep: Int = 1,
+    val totalReps: Int = 6,
+    val repDistanceMeters: Double = 0.0,
+    val repDurationSec: Double = 0.0,
+    val restRemainingSec: Double = 0.0,
+    val targetRepSec: Double = 104.0,
+    val restDurationSec: Double = 90.0,
+    val completedRepSplitsSec: List<Double> = emptyList()
+)
+
+/**
  * Always-on whole-day automatic activity summary (00:00 -> 23:59 local date).
  * Automatically accumulates Walking vs Jogging + Running without pressing any Start button.
  */
@@ -107,6 +167,10 @@ enum class RunMode(val title: String, val subtitle: String) {
     MANUAL_LOG(
         title = "Manual Stopwatch Entry",
         subtitle = "Logged from track stopwatch"
+    ),
+    INTERVAL_400M(
+        title = "400m Speed Intervals",
+        subtitle = "Guided 400m track reps with rest recovery"
     )
 }
 
@@ -143,7 +207,9 @@ data class LiveTelemetry(
     val first1600mSplitSec: Double? = null,
     val lapSplits: List<LapSplit> = emptyList(),
     val dailySummary: DailyActivitySummary = DailyActivitySummary(),
-    val justFinishedSessionId: Long? = null
+    val justFinishedSessionId: Long? = null,
+    val isLowPowerStandby: Boolean = false,
+    val intervalState: IntervalWorkoutState = IntervalWorkoutState()
 )
 
 data class RunSessionRecord(
@@ -284,6 +350,75 @@ object TsPoliceBenchmark {
         } else {
             String.format("%s%.1fs", sign, absVal)
         }
+    }
+
+    data class MeritEvaluation(
+        val qualified: Boolean,
+        val points: Int,
+        val maxPoints: Int = 100,
+        val tierLabel: String,
+        val nextTierTimeSec: Double?,
+        val nextTierPoints: Int?
+    )
+
+    /**
+     * Evaluates Telangana State Police (TSLPRB) 1,600m PET Merit Gradation brackets
+     * (crucial for AR / TSSP / Battalion selection where faster times earn higher merit marks).
+     */
+    fun evaluateMerit1600m(
+        equiv1600mSec: Double,
+        targetTimeSec: Double = DEFAULT_TARGET_TIME_SEC
+    ): MeritEvaluation {
+        if (!equiv1600mSec.isFinite() || equiv1600mSec <= 0.0) {
+            return MeritEvaluation(false, 0, 100, "No Baseline Yet", targetTimeSec, 40)
+        }
+        // Standard TSLPRB Men 1600m gradation brackets (<= 435s qualifying + merit tiers up to 100 pts)
+        val brackets = listOf(
+            315.0 to (100 to "100 pts • Top Merit (≤5:15)"),
+            330.0 to (90 to "90 pts • Elite Tier (≤5:30)"),
+            345.0 to (80 to "80 pts • High Merit (≤5:45)"),
+            360.0 to (72 to "72 pts • Strong Merit (≤6:00)"),
+            375.0 to (65 to "65 pts • Competitive (≤6:15)"),
+            390.0 to (58 to "58 pts • Solid Merit (≤6:30)"),
+            405.0 to (52 to "52 pts • Merit Tier (≤6:45)"),
+            420.0 to (46 to "46 pts • Pass + Bonus (≤7:00)"),
+            435.0 to (40 to "40 pts • PET Qualified (≤7:15)")
+        )
+        for (i in brackets.indices) {
+            val (cutoff, info) = brackets[i]
+            if (equiv1600mSec <= cutoff) {
+                val prev = if (i > 0) brackets[i - 1] else null
+                return MeritEvaluation(
+                    qualified = equiv1600mSec <= targetTimeSec,
+                    points = info.first,
+                    tierLabel = info.second,
+                    nextTierTimeSec = prev?.first,
+                    nextTierPoints = prev?.second?.first
+                )
+            }
+        }
+        // Handle custom relaxed cutoffs (e.g. Ex-Servicemen 9:30 = 570s)
+        if (equiv1600mSec <= targetTimeSec) {
+            return MeritEvaluation(
+                qualified = true,
+                points = 40,
+                tierLabel = "Qualified (≤${formatDuration(targetTimeSec)})",
+                nextTierTimeSec = 435.0,
+                nextTierPoints = 40
+            )
+        }
+        return MeritEvaluation(
+            qualified = false,
+            points = 0,
+            tierLabel = "${(equiv1600mSec - targetTimeSec).roundToInt()}s Above Cutoff",
+            nextTierTimeSec = targetTimeSec,
+            nextTierPoints = 40
+        )
+    }
+
+    fun heightStrideScale(heightCm: Int): Double {
+        if (heightCm <= 0) return 1.0
+        return (heightCm / 172.0).coerceIn(0.86, 1.16)
     }
 }
 

@@ -6,6 +6,7 @@ import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.MotionSignalProcessor
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.MotionStateAudioCue
+import com.tspolice.runtracker.domain.PocketAudioMode
 import com.tspolice.runtracker.domain.ProgressionForecaster
 import com.tspolice.runtracker.domain.PtTrialPhase
 import com.tspolice.runtracker.domain.RunMode
@@ -484,6 +485,114 @@ class TrackerDomainTest {
         val watchScale = SamsungHealthComparator.computeCalibratedStrideScale(partialPhoneDay, fullWatchDay, currentStrideScale = 1.0)
         assertTrue("Watch-only extra steps must keep per-step stride scale near ~1.02x, got $watchScale",
             watchScale in 0.98..1.08)
+    }
+
+    @Test
+    fun `smart pocket audio stays silent on casual indoor walking while speaking during runs and pt trials`() {
+        // SMART_TRACK: silent on everyday STANDING <-> WALKING when idle
+        assertFalse(
+            PocketAudioMode.SMART_TRACK.shouldAnnounceTransition(
+                previousState = MotionState.STANDING,
+                newState = MotionState.WALKING,
+                ptTrialPhase = PtTrialPhase.IDLE,
+                inOpenRunBout = false
+            )
+        )
+        assertFalse(
+            PocketAudioMode.SMART_TRACK.shouldAnnounceTransition(
+                previousState = MotionState.WALKING,
+                newState = MotionState.STANDING,
+                ptTrialPhase = PtTrialPhase.IDLE,
+                inOpenRunBout = false
+            )
+        )
+
+        // SMART_TRACK: speaks immediately when breaking into JOGGING/RUNNING or during an armed/running PT trial
+        assertTrue(
+            PocketAudioMode.SMART_TRACK.shouldAnnounceTransition(
+                previousState = MotionState.WALKING,
+                newState = MotionState.JOGGING,
+                ptTrialPhase = PtTrialPhase.IDLE,
+                inOpenRunBout = false
+            )
+        )
+        assertTrue(
+            PocketAudioMode.SMART_TRACK.shouldAnnounceTransition(
+                previousState = MotionState.STANDING,
+                newState = MotionState.WALKING,
+                ptTrialPhase = PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN,
+                inOpenRunBout = false
+            )
+        )
+
+        // ALL_STATES speaks every transition; MUTED speaks none
+        assertTrue(
+            PocketAudioMode.ALL_STATES.shouldAnnounceTransition(
+                previousState = MotionState.STANDING,
+                newState = MotionState.WALKING,
+                ptTrialPhase = PtTrialPhase.IDLE,
+                inOpenRunBout = false
+            )
+        )
+        assertFalse(
+            PocketAudioMode.MUTED.shouldAnnounceTransition(
+                previousState = MotionState.JOGGING,
+                newState = MotionState.TARGET_PACE,
+                ptTrialPhase = PtTrialPhase.RUNNING_TRIAL,
+                inOpenRunBout = true
+            )
+        )
+    }
+
+    @Test
+    fun `dt normalized accelerometer filter preserves cadence and rms across 20hz screen off and 100hz rates`() {
+        val freqHz = 2.8 // 168 spm running footstrikes
+
+        fun runSimulation(stepMs: Long): Pair<Double, Double> {
+            val dsp = MotionSignalProcessor()
+            var tMs = 0L
+            while (tMs <= 6000L) {
+                val tSec = tMs / 1000.0
+                val ay = (9.81 + 6.5 * sin(2.0 * Math.PI * freqHz * tSec)).toFloat()
+                dsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
+                tMs += stepMs
+            }
+            return dsp.getCadenceSpm(6000L) to dsp.getDynamicAccelRms(6000L)
+        }
+
+        val (cadence20Hz, rms20Hz) = runSimulation(50L)   // 20 Hz Samsung screen-off pocket throttling
+        val (cadence50Hz, rms50Hz) = runSimulation(20L)   // 50 Hz standard rate
+        val (cadence100Hz, rms100Hz) = runSimulation(10L) // 100 Hz fast OEM sensor rate
+
+        assertTrue("20Hz screen-off cadence should be ~168 spm, got $cadence20Hz", cadence20Hz in 152.0..184.0)
+        assertTrue("50Hz cadence should be ~168 spm, got $cadence50Hz", cadence50Hz in 152.0..184.0)
+        assertTrue("100Hz cadence should be ~168 spm, got $cadence100Hz", cadence100Hz in 152.0..184.0)
+        assertTrue("20Hz RMS ($rms20Hz), 50Hz RMS ($rms50Hz) and 100Hz RMS ($rms100Hz) should stay closely matched",
+            kotlin.math.abs(rms20Hz - rms50Hz) < 0.85 && kotlin.math.abs(rms50Hz - rms100Hz) < 0.85 && rms20Hz > 3.0)
+    }
+
+    @Test
+    fun `tslprb 1600m merit gradation points and runner height stride baseline compute accurately`() {
+        val topMerit = TsPoliceBenchmark.evaluateMerit1600m(312.0) // 5:12
+        assertTrue(topMerit.qualified)
+        assertEquals(100, topMerit.points)
+
+        val borderPass = TsPoliceBenchmark.evaluateMerit1600m(434.2) // 7:14.2
+        assertTrue(borderPass.qualified)
+        assertEquals(40, borderPass.points)
+        assertEquals(420.0, borderPass.nextTierTimeSec ?: 0.0, 0.01)
+
+        val missedCutoff = TsPoliceBenchmark.evaluateMerit1600m(452.0) // 7:32
+        assertFalse(missedCutoff.qualified)
+        assertEquals(0, missedCutoff.points)
+
+        val exServicemenPass = TsPoliceBenchmark.evaluateMerit1600m(540.0, targetTimeSec = 570.0) // 9:00 <= 9:30
+        assertTrue(exServicemenPass.qualified)
+        assertEquals(40, exServicemenPass.points)
+
+        assertEquals(1.0, TsPoliceBenchmark.heightStrideScale(172), 0.001)
+        assertTrue(TsPoliceBenchmark.heightStrideScale(184) > 1.05)
+        assertTrue(TsPoliceBenchmark.heightStrideScale(160) < 0.95)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

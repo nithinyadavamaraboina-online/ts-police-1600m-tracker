@@ -7,23 +7,20 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.SystemClock
-import android.text.InputType
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.widget.Button
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -34,12 +31,13 @@ import com.tspolice.runtracker.data.RunRepository
 import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.HealthSyncStatus
+import com.tspolice.runtracker.domain.IntervalPhase
 import com.tspolice.runtracker.domain.LiveTelemetry
 import com.tspolice.runtracker.domain.MotionState
+import com.tspolice.runtracker.domain.PocketAudioMode
 import com.tspolice.runtracker.domain.ProgressionForecaster
 import com.tspolice.runtracker.domain.PtTrialPhase
 import com.tspolice.runtracker.domain.RunMode
-import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
@@ -52,7 +50,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
-import java.time.ZoneId
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -79,52 +76,57 @@ class MainActivity : AppCompatActivity() {
     private var lastHealthSyncElapsedMs = -120_000L
     private var lastSamsungRenderKey = ""
 
-    // Tracker sub-tab state: 0 = Always-On All-Day Open Mode (default), 1 = 1.6 km PT Trial
+    // Tracker sub-tab: 0 = Today (All-Day Auto), 1 = 1.6K PT Trial, 2 = 400m Intervals
     private var activeTrackerSubTab = 0
+    private var selectedIntervalReps = 6
     private var lastRenderedPtPhase: PtTrialPhase = PtTrialPhase.IDLE
+    private var lastRenderedIntervalPhase: IntervalPhase = IntervalPhase.IDLE
     private var cachedPastDailyLogs: List<DailyActivitySummary> = emptyList()
     private var lastDailyHistoryRenderMs = -60_000L
     private var lastDailyHistoryKey = ""
 
-    // Top-level tab containers
-    private lateinit var stateAudioChip: TextView
+    // Header & Root Navigation views
+    private lateinit var headerSubtitleText: TextView
+    private lateinit var headerAudioPill: LinearLayout
+    private lateinit var headerAudioIcon: VectorIconView
+    private lateinit var headerAudioLabel: TextView
     private lateinit var updateBanner: TextView
     private lateinit var tabTrackerContainer: ScrollView
     private lateinit var tabProgressContainer: ScrollView
     private lateinit var tabGuideContainer: ScrollView
-    private val navTabViews = mutableListOf<TextView>()
+    private val navTabViews = mutableListOf<BottomNavTabView>()
 
-    // Tab 1: Sub-Tab Switcher & Containers
+    // Tab 1: Banners, Sub-Tab Switcher & Containers
     private lateinit var permissionBanner: LinearLayout
-    private lateinit var subTabOpenBtn: TextView
+    private lateinit var batteryGuardBanner: LinearLayout
+    private lateinit var subTabTodayBtn: TextView
     private lateinit var subTabPtBtn: TextView
+    private lateinit var subTabIntervalsBtn: TextView
     private lateinit var openAllDayContainer: LinearLayout
     private lateinit var ptTrialContainer: LinearLayout
+    private lateinit var intervalsContainer: LinearLayout
 
-    // Tab 1A: Always-On All-Day Open Mode views
+    // Tab 1A: Today (Always-On All-Day Auto) views
     private lateinit var allDayLiveChip: TextView
-    private lateinit var allDayStateBadge: TextView
-    private lateinit var allDayStatusSub: TextView
+    private lateinit var dailyRingsView: DailyActivityRingsView
     private lateinit var dailyJogRunTimeVal: TextView
     private lateinit var dailyJogRunDistSub: TextView
-    private lateinit var dailyJogRunSplitSub: TextView
     private lateinit var dailyWalkTimeVal: TextView
     private lateinit var dailyWalkDistSub: TextView
-    private lateinit var dailyWalkStepsSub: TextView
+    private lateinit var allDayGaitPill: TextView
+    private lateinit var launchPtFromOpenBtn: TextView
     private lateinit var dailyMaxPaceVal: TextView
     private lateinit var dailyMaxPaceSub: TextView
     private lateinit var dailyMaxCadenceVal: TextView
     private lateinit var dailyMaxCadenceSub: TextView
     private lateinit var openLivePaceVal: TextView
     private lateinit var openLivePaceSub: TextView
-    private lateinit var openLiveCadenceVal: TextView
-    private lateinit var openLiveCadenceSub: TextView
     private lateinit var dailyTotalDistVal: TextView
     private lateinit var dailyTotalDistSub: TextView
-    private lateinit var openGpsStatusVal: TextView
-    private lateinit var openGpsStatusSub: TextView
     private lateinit var dailyGaitBar: GaitBreakdownBarView
     private lateinit var dailyGaitLegendText: TextView
+
+    // Samsung Health Comparison Card views
     private lateinit var samsungSyncBadge: TextView
     private lateinit var samsungHeadlineText: TextView
     private lateinit var samsungDetailText: TextView
@@ -144,16 +146,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var samRowStrideTracker: TextView
     private lateinit var samRowStrideSamsung: TextView
     private lateinit var samRowStrideDelta: TextView
-    private lateinit var samsungPrimaryBtn: Button
-    private lateinit var samsungSecondaryBtn: Button
-    private lateinit var launchPtFromOpenBtn: Button
+    private lateinit var samsungPrimaryBtn: TextView
+    private lateinit var samsungSecondaryBtn: TextView
     private lateinit var dailyHistoryListLayout: LinearLayout
 
-    // Tab 1B: 1.6 km PT Trial views (starts ONLY when Jogging or Running)
+    // Tab 1B: 1.6 km PT Trial views
+    private lateinit var ptGpsReadinessPill: TextView
     private lateinit var paceArcGauge: PaceArcGaugeView
-    private lateinit var primaryActionBtn: Button
+    private lateinit var primaryActionBtn: TextView
     private lateinit var ptArmHintText: TextView
-    private lateinit var secondaryActionBtn: Button
+    private lateinit var ptRunningControlsRow: LinearLayout
+    private lateinit var snapLapBtn: TextView
+    private lateinit var finishEarlyBtn: TextView
+    private lateinit var secondaryActionBtn: TextView
     private lateinit var metricPaceVal: TextView
     private lateinit var metricPaceSub: TextView
     private lateinit var metricCadenceVal: TextView
@@ -166,31 +171,44 @@ class MainActivity : AppCompatActivity() {
     private lateinit var gaitLegendText: TextView
     private lateinit var splitsListLayout: LinearLayout
 
-    // Tab 2: Progress & 7:15 ETA views
+    // Tab 1C: Guided 400m Intervals views
+    private lateinit var intervalDialView: IntervalDialView
+    private val intervalRepPresetBtns = mutableListOf<Pair<Int, TextView>>()
+    private lateinit var intervalPrimaryBtn: TextView
+    private lateinit var intervalSecondaryBtn: TextView
+    private lateinit var intervalSplitsLayout: LinearLayout
+
+    // Tab 2: Progress, Merit Score & ETA views
     private lateinit var etaHeadlineText: TextView
+    private lateinit var meritBadgeText: TextView
     private lateinit var etaSubText: TextView
+    private lateinit var coachPrescriptionText: TextView
     private lateinit var kpiPbVal: TextView
     private lateinit var kpiGapVal: TextView
     private lateinit var kpiRateVal: TextView
     private lateinit var kpiImprovedVal: TextView
-    private lateinit var coachPrescriptionText: TextView
     private lateinit var trendChartView: ProgressTrendChartView
-    private lateinit var demoToggleBtn: Button
+    private lateinit var demoToggleBtn: TextView
     private lateinit var sessionsListLayout: LinearLayout
 
-    // Tab 3: Benchmark & Sensor Diagnostics views
-    private lateinit var allDayAutoSwitch: Switch
-    private lateinit var stateAudioSwitch: Switch
-    private lateinit var autoCalibrateSamsungSwitch: Switch
-    private lateinit var autoImportSamsungRunsSwitch: Switch
+    // Tab 3: Settings, Profile & Lab views
+    private lateinit var batteryStatusBadge: TextView
+    private lateinit var batteryStatusBtn: TextView
+    private lateinit var heightValText: TextView
+    private lateinit var targetPresetButtons: List<Pair<Double, TextView>>
+    private lateinit var thresholdPresetButtons: List<Pair<Double, TextView>>
+    private lateinit var audioModeButtons: List<Pair<PocketAudioMode, TextView>>
+    private lateinit var allDayAutoRow: ModernSettingRow
+    private lateinit var voiceCoachRow: ModernSettingRow
+    private lateinit var stepFallbackRow: ModernSettingRow
+    private lateinit var autoCalSamsungRow: ModernSettingRow
+    private lateinit var autoImportSamsungRow: ModernSettingRow
     private lateinit var diagGpsText: TextView
     private lateinit var diagStepText: TextView
     private lateinit var diagStrideCalText: TextView
     private lateinit var diagStateText: TextView
     private lateinit var updateStatusText: TextView
-    private lateinit var checkUpdateBtn: Button
-    private lateinit var targetPresetButtons: List<Pair<Double, TextView>>
-    private lateinit var thresholdPresetButtons: List<Pair<Double, TextView>>
+    private lateinit var checkUpdateBtn: TextView
 
     private val healthPermissionLauncher = registerForActivityResult(
         SamsungHealthSyncManager.createPermissionRequestContract()
@@ -201,7 +219,7 @@ class MainActivity : AppCompatActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        updatePermissionBanner()
+        updateBanners()
         startTrackingServiceSafely()
         trackingService?.refreshPermissionsAndSensors()
     }
@@ -226,7 +244,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).roundToInt()
+    private fun dp(v: Float): Int = AthleticTheme.dp(this, v)
+    private fun dp(v: Int): Int = AthleticTheme.dp(this, v.toFloat())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -241,10 +260,11 @@ class MainActivity : AppCompatActivity() {
         setContentView(buildRootLayout())
         selectTab(0)
         selectTrackerSubTab(0)
+        refreshSettingsHighlights()
         refreshCachedDailyHistory(forceRender = true)
         renderSamsungComparisonCard(force = true)
         refreshProgressDashboard()
-        updatePermissionBanner()
+        updateBanners()
 
         val svcIntent = startTrackingServiceSafely()
         bindService(svcIntent, serviceConnection, Context.BIND_AUTO_CREATE)
@@ -283,6 +303,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        updateBanners()
+        refreshBatterySettingsState()
         if (appUpdater.resumePendingInstallIfPermitted()) {
             Toast.makeText(this, "Launching update installer...", Toast.LENGTH_SHORT).show()
             return
@@ -330,79 +352,98 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    // =========================================================================
+    // ROOT SHELL: SLEEK HEADER + CONTENT FRAME + ICON BOTTOM NAV
+    // =========================================================================
     private fun buildRootLayout(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xFF090D16.toInt())
+            setBackgroundColor(AthleticColors.BG_CANVAS)
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
 
-        // Top App Header
+        // Top Athletic Header
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(18), dp(14), dp(18), dp(10))
-            setBackgroundColor(0xFF0D1424.toInt())
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setBackgroundColor(AthleticColors.BG_HEADER)
         }
+
+        val logoIcon = VectorIconView(this, IconKind.TRACK_EMBLEM, AthleticColors.EMERALD_BRIGHT, 36f).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+                marginEnd = dp(11)
+            }
+        }
+        header.addView(logoIcon)
+
         val titleCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         titleCol.addView(TextView(this).apply {
-            text = "TS POLICE 1.6 KM TRACKER"
-            textSize = 17f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFFF8FAFC.toInt())
-            letterSpacing = 0.04f
+            text = "TS POLICE 1.6K"
+            textSize = 16.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            letterSpacing = 0.03f
+            maxLines = 1
         })
-        titleCol.addView(TextView(this).apply {
-            text = "All-Day Auto Mode • 1.6 km PT Trial (< 7:15)"
-            textSize = 12f
-            setTextColor(0xFF94A3B8.toInt())
-        })
-        stateAudioChip = TextView(this).apply {
-            textSize = 11f
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(9), dp(5), dp(9), dp(5))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { marginEnd = dp(6) }
+        headerSubtitleText = TextView(this).apply {
+            text = "PET Coach  •  Cutoff < ${TsPoliceBenchmark.formatDuration(repository.targetTimeSec)}"
+            textSize = 11.5f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            maxLines = 1
+        }
+        titleCol.addView(headerSubtitleText)
+        header.addView(titleCol)
+
+        // Sleek 3-Mode Pocket Audio Capsule
+        headerAudioPill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(11), dp(7), dp(12), dp(7))
+            isClickable = true
+            isFocusable = true
             setOnClickListener {
-                val next = !repository.stateChangeAudioEnabled
-                repository.stateChangeAudioEnabled = next
-                if (::stateAudioSwitch.isInitialized && stateAudioSwitch.isChecked != next) {
-                    stateAudioSwitch.isChecked = next
-                }
-                refreshStateAudioChip()
+                val next = repository.pocketAudioMode.nextMode()
+                repository.pocketAudioMode = next
+                trackingService?.syncPocketForegroundAndWakeLock()
+                refreshSettingsHighlights()
                 trackingService?.previewStateChangeAudio()
+                Toast.makeText(this@MainActivity, "${next.shortLabel}: ${next.description}", Toast.LENGTH_SHORT).show()
             }
         }
-        val goalChip = TextView(this).apply {
-            text = "GOAL < 7:15"
-            textSize = 11.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF10B981.toInt())
-            setPadding(dp(10), dp(5), dp(10), dp(5))
-            background = roundedBox(0x1E10B981, 0xFF10B981.toInt(), dp(12))
+        headerAudioIcon = VectorIconView(this, IconKind.AUDIO_SMART, AthleticColors.CYAN_BRIGHT, 16f).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(16), dp(16)).apply { marginEnd = dp(6) }
         }
-        header.addView(titleCol)
-        header.addView(stateAudioChip)
-        header.addView(goalChip)
-        root.addView(header)
+        headerAudioLabel = TextView(this).apply {
+            text = "Smart"
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+        }
+        headerAudioPill.addView(headerAudioIcon)
+        headerAudioPill.addView(headerAudioLabel)
+        header.addView(headerAudioPill)
 
-        // OTA Update Banner (visible whenever a newer release is available on GitHub)
+        root.addView(header)
+        root.addView(View(this).apply {
+            setBackgroundColor(AthleticColors.DIVIDER)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1f).coerceAtLeast(1))
+        })
+
+        // OTA Update Banner
         updateBanner = TextView(this).apply {
             visibility = View.GONE
             gravity = Gravity.CENTER
             textSize = 12.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF04130D.toInt())
-            setBackgroundColor(0xFF38BDF8.toInt())
-            setPadding(dp(14), dp(8), dp(14), dp(8))
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            setBackgroundColor(AthleticColors.CYAN_BRIGHT)
+            setPadding(dp(14), dp(9), dp(14), dp(9))
             setOnClickListener {
                 latestDiscoveredRelease?.let { rel ->
                     val (_, curName) = appUpdater.getInstalledVersion()
@@ -414,11 +455,7 @@ class MainActivity : AppCompatActivity() {
 
         // Content Frame
         val contentFrame = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
         tabTrackerContainer = buildTrackerTab()
         tabProgressContainer = buildProgressTab()
@@ -429,28 +466,30 @@ class MainActivity : AppCompatActivity() {
         contentFrame.addView(tabGuideContainer)
         root.addView(contentFrame)
 
-        // Bottom Navigation Bar
+        // Top hairline above Bottom Navigation Bar
+        root.addView(View(this).apply {
+            setBackgroundColor(AthleticColors.DIVIDER)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1f).coerceAtLeast(1))
+        })
+
+        // Sleek Icon Bottom Navigation Bar
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(0xFF0F172A.toInt())
-            setPadding(dp(8), dp(8), dp(8), dp(10))
+            setBackgroundColor(AthleticColors.BG_NAV)
+            setPadding(dp(8), dp(2), dp(8), dp(4))
         }
-        val tabs = listOf("ALL-DAY & PT", "PROGRESS & ETA", "PET & SENSORS")
-        tabs.forEachIndexed { index, label ->
-            val tv = TextView(this).apply {
-                text = label
-                gravity = Gravity.CENTER
-                textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(6), dp(10), dp(6), dp(10))
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginStart = dp(4)
-                    marginEnd = dp(4)
-                }
+        val navSpec = listOf(
+            IconKind.NAV_TRACKER to "Tracker",
+            IconKind.NAV_PROGRESS to "Progress",
+            IconKind.NAV_SETTINGS to "Coach & Lab"
+        )
+        navSpec.forEachIndexed { index, (icon, label) ->
+            val tabView = BottomNavTabView(this, icon, label).apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 setOnClickListener { selectTab(index) }
             }
-            navTabViews.add(tv)
-            bottomBar.addView(tv)
+            navTabViews.add(tabView)
+            bottomBar.addView(tabView)
         }
         root.addView(bottomBar)
         return root
@@ -461,15 +500,8 @@ class MainActivity : AppCompatActivity() {
         tabProgressContainer.visibility = if (index == 1) View.VISIBLE else View.GONE
         tabGuideContainer.visibility = if (index == 2) View.VISIBLE else View.GONE
 
-        navTabViews.forEachIndexed { i, tv ->
-            if (i == index) {
-                tv.setTextColor(0xFF04130D.toInt())
-                tv.background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(10))
-            } else {
-                tv.setTextColor(0xFF94A3B8.toInt())
-                tv.background = roundedBox(0x00000000, 0x00000000, dp(10))
-            }
-        }
+        navTabViews.forEachIndexed { i, tv -> tv.setActive(i == index) }
+
         if (index == 0) {
             refreshCachedDailyHistory(forceRender = true)
             if (!currentlyRecording && (SystemClock.elapsedRealtime() - lastHealthSyncElapsedMs) >= 45_000L) {
@@ -477,110 +509,157 @@ class MainActivity : AppCompatActivity() {
             }
         } else if (index == 1) {
             refreshProgressDashboard()
+        } else if (index == 2) {
+            refreshBatterySettingsState()
+            refreshSettingsHighlights()
         }
     }
 
     private fun selectTrackerSubTab(subIndex: Int) {
-        activeTrackerSubTab = subIndex.coerceIn(0, 1)
-        val isOpen = activeTrackerSubTab == 0
-        openAllDayContainer.visibility = if (isOpen) View.VISIBLE else View.GONE
-        ptTrialContainer.visibility = if (!isOpen) View.VISIBLE else View.GONE
+        activeTrackerSubTab = subIndex.coerceIn(0, 2)
+        openAllDayContainer.visibility = if (activeTrackerSubTab == 0) View.VISIBLE else View.GONE
+        ptTrialContainer.visibility = if (activeTrackerSubTab == 1) View.VISIBLE else View.GONE
+        intervalsContainer.visibility = if (activeTrackerSubTab == 2) View.VISIBLE else View.GONE
 
-        subTabOpenBtn.background = roundedBox(
-            if (isOpen) 0xFF10B981.toInt() else 0x00000000,
-            if (isOpen) 0xFF10B981.toInt() else 0x00000000,
-            dp(9)
-        )
-        subTabOpenBtn.setTextColor(if (isOpen) 0xFF04130D.toInt() else 0xFF94A3B8.toInt())
-
-        subTabPtBtn.background = roundedBox(
-            if (!isOpen) 0xFF38BDF8.toInt() else 0x00000000,
-            if (!isOpen) 0xFF38BDF8.toInt() else 0x00000000,
-            dp(9)
-        )
-        subTabPtBtn.setTextColor(if (!isOpen) 0xFF04130D.toInt() else 0xFF94A3B8.toInt())
+        fun styleSeg(btn: TextView, active: Boolean, activeColor: Int) {
+            if (active) {
+                btn.background = AthleticTheme.solidPill(this, activeColor, activeColor, 11f, 0f)
+                btn.setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            } else {
+                btn.background = null
+                btn.setTextColor(AthleticColors.TEXT_SECONDARY)
+            }
+        }
+        styleSeg(subTabTodayBtn, activeTrackerSubTab == 0, AthleticColors.EMERALD_BRIGHT)
+        styleSeg(subTabPtBtn, activeTrackerSubTab == 1, AthleticColors.CYAN_BRIGHT)
+        styleSeg(subTabIntervalsBtn, activeTrackerSubTab == 2, AthleticColors.AMBER_BRIGHT)
     }
 
     // =========================================================================
-    // TAB 1: ALWAYS-ON ALL-DAY OPEN MODE + 1.6 KM PT TRIAL
+    // TAB 1: TODAY (ALL-DAY AUTO)  |  1.6K PT TRIAL  |  400M INTERVALS
     // =========================================================================
     private fun buildTrackerTab(): ScrollView {
-        val scroll = ScrollView(this)
+        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(28))
+            setPadding(dp(16), dp(14), dp(16), dp(28))
         }
 
-        // Permission prompt strip (hidden when permissions granted)
+        // 1. Sensor/GPS Permission Banner
         permissionBanner = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundedBox(0x28F59E0B, 0xFFF59E0B.toInt(), dp(12))
+            setPadding(dp(14), dp(11), dp(12), dp(11))
+            background = AthleticTheme.gradientCard(
+                this@MainActivity,
+                AthleticColors.HERO_AMBER_TOP,
+                AthleticColors.HERO_AMBER_BOTTOM,
+                AthleticColors.HERO_AMBER_BORDER,
+                14f
+            )
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            ).apply { bottomMargin = dp(10) }
         }
         permissionBanner.addView(TextView(this).apply {
-            text = "Enable GPS & Motion Sensors for 24/7 All-Day Walk/Jog/Run tracking"
+            text = "Grant GPS & Step Sensor access for accurate 1.6 km & daily tracking"
             textSize = 12f
             setTextColor(0xFFFDE68A.toInt())
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(10)
+            }
         })
-        permissionBanner.addView(Button(this).apply {
-            text = "ALLOW"
-            textSize = 11.5f
-            setOnClickListener { requestNeededPermissionsIfMissing(silentCheckOnly = false) }
-        })
+        permissionBanner.addView(
+            AthleticTheme.createButton(this, "Enable", AthleticTheme.ButtonStyle.WARNING_AMBER, 36f).apply {
+                textSize = 12f
+                setPadding(dp(14), dp(7), dp(14), dp(7))
+                setOnClickListener { requestNeededPermissionsIfMissing(silentCheckOnly = false) }
+            }
+        )
         col.addView(permissionBanner)
 
-        // Sub-Tab Switcher: [All-Day Auto (Open)] vs [1.6 km PT Trial]
-        val modeRow = LinearLayout(this).apply {
+        // 2. Samsung / OneUI Background Battery Guard Banner (hidden once unrestricted)
+        batteryGuardBanner = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            background = roundedBox(0xFF111827.toInt(), 0xFF1E293B.toInt(), dp(12))
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setPadding(dp(14), dp(10), dp(12), dp(10))
+            background = AthleticTheme.gradientCard(
+                this@MainActivity,
+                AthleticColors.HERO_CYAN_TOP,
+                AthleticColors.HERO_CYAN_BOTTOM,
+                AthleticColors.HERO_CYAN_BORDER,
+                14f
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
+        }
+        batteryGuardBanner.addView(TextView(this).apply {
+            text = "Keep pocket tracking alive on Samsung One UI (prevent Deep Sleep)"
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(10)
+            }
+        })
+        batteryGuardBanner.addView(
+            AthleticTheme.createButton(this, "Allow", AthleticTheme.ButtonStyle.PRIMARY_CYAN, 36f).apply {
+                textSize = 12f
+                setPadding(dp(14), dp(7), dp(14), dp(7))
+                setOnClickListener { requestIgnoreBatteryOptimizationsSafely() }
+            }
+        )
+        col.addView(batteryGuardBanner)
+
+        // 3. Recessed 3-Segment Capsule Switcher: [Today] | [1.6K Trial] | [Intervals]
+        val segTrack = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                AthleticColors.SURFACE_RECESSED,
+                AthleticColors.BORDER_SUBTLE,
+                14f
+            )
             setPadding(dp(4), dp(4), dp(4), dp(4))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            ).apply { bottomMargin = dp(14) }
         }
-        subTabOpenBtn = TextView(this).apply {
-            text = "All-Day Auto (Open)"
+        fun segItem(label: String, idx: Int) = TextView(this).apply {
+            text = label
             gravity = Gravity.CENTER
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(8), dp(10), dp(8), dp(10))
+            textSize = 12.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setPadding(dp(6), dp(10), dp(6), dp(10))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { selectTrackerSubTab(0) }
+            setOnClickListener { selectTrackerSubTab(idx) }
         }
-        subTabPtBtn = TextView(this).apply {
-            text = "1.6 km PT Trial"
-            gravity = Gravity.CENTER
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(8), dp(10), dp(8), dp(10))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { selectTrackerSubTab(1) }
-        }
-        modeRow.addView(subTabOpenBtn)
-        modeRow.addView(subTabPtBtn)
-        col.addView(modeRow)
+        subTabTodayBtn = segItem("Today", 0)
+        subTabPtBtn = segItem("1.6K Trial", 1)
+        subTabIntervalsBtn = segItem("400m Coach", 2)
+        segTrack.addView(subTabTodayBtn)
+        segTrack.addView(subTabPtBtn)
+        segTrack.addView(subTabIntervalsBtn)
+        col.addView(segTrack)
 
         openAllDayContainer = buildOpenAllDaySubView()
         ptTrialContainer = buildPtTrialSubView()
+        intervalsContainer = buildIntervalsSubView()
 
         col.addView(openAllDayContainer)
         col.addView(ptTrialContainer)
+        col.addView(intervalsContainer)
 
         scroll.addView(col)
         return scroll
     }
 
     /**
-     * Sub-View 0: Always-On Open All-Day Auto Mode (Default — Zero Start Button Needed!).
-     * Automatically tracks whole-day Walking time, combined Jogging + Running time (with Jog/Run breakdown),
-     * Max Pace, Max Cadence, Live Pace, Live Cadence, Total Distance, and Total Steps.
+     * Sub-View 0: Today — Concentric Activity Rings + Bento Grid + Samsung Health Calibration.
      */
     private fun buildOpenAllDaySubView(): LinearLayout {
         val box = LinearLayout(this).apply {
@@ -591,228 +670,127 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // 1. Live Auto-Detection Status Card
-        val liveCard = cardContainer().apply {
-            background = roundedBox(0xFF0F1D2E.toInt(), 0xFF10B981.toInt(), dp(15))
-        }
-        val topStatusRow = LinearLayout(this).apply {
+        // 1. Hero Concentric Rings Card
+        val heroCard = cardContainer(
+            topColor = AthleticColors.HERO_EMERALD_TOP,
+            bottomColor = AthleticColors.HERO_EMERALD_BOTTOM,
+            borderColor = AthleticColors.HERO_EMERALD_BORDER
+        )
+
+        val topRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        topStatusRow.addView(TextView(this).apply {
-            text = "OPEN MODE • ALWAYS-ON WHOLE-DAY AUTO"
-            textSize = 11f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF10B981.toInt())
-            letterSpacing = 0.04f
+        topRow.addView(AthleticTheme.sectionLabel(this, "TODAY'S MOVEMENT  •  AUTO-DETECT", AthleticColors.EMERALD_BRIGHT).apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         allDayLiveChip = TextView(this).apply {
-            text = "24/7 ACTIVE"
-            textSize = 10.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF04130D.toInt())
-            setPadding(dp(8), dp(3), dp(8), dp(3))
-            background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(10))
+            text = "SMART 24/7"
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            setPadding(dp(9), dp(3.5f), dp(9), dp(3.5f))
+            background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.EMERALD_BRIGHT, AthleticColors.EMERALD_BRIGHT, 10f, 0f)
         }
-        topStatusRow.addView(allDayLiveChip)
-        liveCard.addView(topStatusRow)
+        topRow.addView(allDayLiveChip)
+        heroCard.addView(topRow)
 
-        allDayStateBadge = TextView(this).apply {
-            text = "AUTO-PAUSED • STANDING"
-            textSize = 18f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFFF8FAFC.toInt())
-            setPadding(0, dp(8), 0, dp(4))
-        }
-        liveCard.addView(allDayStateBadge)
-
-        allDayStatusSub = TextView(this).apply {
-            text = "No Start button needed — automatically counts your whole-day Walk & Jog+Run time (ignores sitting & bike)."
-            textSize = 12f
-            setTextColor(0xFF94A3B8.toInt())
-        }
-        liveCard.addView(allDayStatusSub)
-        box.addView(liveCard)
-
-        // 2. Two Hero Cards Side-by-Side: [JOG + RUN TODAY (Combined)] & [WALKING TODAY]
-        val heroRow = LinearLayout(this).apply {
+        // Rings + Metrics Split Row
+        val ringsSplit = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, dp(10))
         }
-
-        // Left Hero: Combined Jog + Run Today
-        val jogRunCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            background = roundedBox(0xFF111827.toInt(), 0xFF10B981.toInt(), dp(14))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = dp(5)
+        dailyRingsView = DailyActivityRingsView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(126), dp(126)).apply {
+                marginEnd = dp(16)
             }
         }
-        jogRunCard.addView(TextView(this).apply {
-            text = "JOG + RUN TODAY"
-            textSize = 11f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF10B981.toInt())
+        ringsSplit.addView(dailyRingsView)
+
+        val rightStats = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        // Jog + Run block
+        rightStats.addView(TextView(this).apply {
+            text = "JOG + RUN COMBINED"
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            letterSpacing = 0.05f
         })
         dailyJogRunTimeVal = TextView(this).apply {
             text = "0:00"
-            textSize = 25f
-            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-            setTextColor(0xFFF8FAFC.toInt())
-            setPadding(0, dp(4), 0, dp(2))
+            textSize = 27f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
         }
         dailyJogRunDistSub = TextView(this).apply {
-            text = "0 m combined"
-            textSize = 12.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF34D399.toInt())
+            text = "0 m  •  Jog 0:00 / Run 0:00"
+            textSize = 11.5f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, 0, 0, dp(10))
         }
-        dailyJogRunSplitSub = TextView(this).apply {
-            text = "Jog 0:00 • Run 0:00"
-            textSize = 11f
-            setTextColor(0xFF94A3B8.toInt())
-            setPadding(0, dp(3), 0, 0)
-        }
-        jogRunCard.addView(dailyJogRunTimeVal)
-        jogRunCard.addView(dailyJogRunDistSub)
-        jogRunCard.addView(dailyJogRunSplitSub)
+        rightStats.addView(dailyJogRunTimeVal)
+        rightStats.addView(dailyJogRunDistSub)
 
-        // Right Hero: Walking Today
-        val walkCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            background = roundedBox(0xFF111827.toInt(), 0xFF38BDF8.toInt(), dp(14))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(5)
-            }
-        }
-        walkCard.addView(TextView(this).apply {
-            text = "WALKING TODAY"
-            textSize = 11f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF38BDF8.toInt())
+        // Walking block
+        rightStats.addView(TextView(this).apply {
+            text = "WALKING TIME"
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            letterSpacing = 0.05f
         })
         dailyWalkTimeVal = TextView(this).apply {
             text = "0:00"
-            textSize = 25f
-            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-            setTextColor(0xFFF8FAFC.toInt())
-            setPadding(0, dp(4), 0, dp(2))
+            textSize = 23f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
         }
         dailyWalkDistSub = TextView(this).apply {
-            text = "0 m walked"
-            textSize = 12.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF7DD3FC.toInt())
+            text = "0 m walked today"
+            textSize = 11.5f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
         }
-        dailyWalkStepsSub = TextView(this).apply {
-            text = "0 steps today"
-            textSize = 11f
-            setTextColor(0xFF94A3B8.toInt())
-            setPadding(0, dp(3), 0, 0)
-        }
-        walkCard.addView(dailyWalkTimeVal)
-        walkCard.addView(dailyWalkDistSub)
-        walkCard.addView(dailyWalkStepsSub)
+        rightStats.addView(dailyWalkTimeVal)
+        rightStats.addView(dailyWalkDistSub)
 
-        heroRow.addView(jogRunCard)
-        heroRow.addView(walkCard)
-        box.addView(heroRow)
+        ringsSplit.addView(rightStats)
+        heroCard.addView(ringsSplit)
 
-        // 3. 3x2 Peak & Live Metrics Grid (Max Pace, Max Cadence, Live Pace, Live Cadence, Total Distance, GPS/Step)
-        val peakRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
-        }
-        val maxPaceTile = metricTile("MAX PACE TODAY", "--:-- /km", "Peak 0.0 km/h")
-        dailyMaxPaceVal = maxPaceTile.second
-        dailyMaxPaceSub = maxPaceTile.third
-        val maxCadTile = metricTile("MAX CADENCE", "0 spm", "Peak stride rate")
-        dailyMaxCadenceVal = maxCadTile.second
-        dailyMaxCadenceSub = maxCadTile.third
-        peakRow.addView(maxPaceTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
-        peakRow.addView(maxCadTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
-        box.addView(peakRow)
-
-        val liveRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
-        }
-        val livePaceTile = metricTile("LIVE PACE NOW", "--:-- /km", "0.0 km/h")
-        openLivePaceVal = livePaceTile.second
-        openLivePaceSub = livePaceTile.third
-        val liveCadTile = metricTile("LIVE CADENCE", "0 spm", "0.0 m/s² motion")
-        openLiveCadenceVal = liveCadTile.second
-        openLiveCadenceSub = liveCadTile.third
-        liveRow.addView(livePaceTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
-        liveRow.addView(liveCadTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
-        box.addView(liveRow)
-
-        val totalsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
-        }
-        val totDistTile = metricTile("TOTAL DISTANCE", "0 m", "0 total steps")
-        dailyTotalDistVal = totDistTile.second
-        dailyTotalDistSub = totDistTile.third
-        val gpsTile = metricTile("GPS & STEP ENGINE", "Step-Stride", "Indoor / Pocket ready")
-        openGpsStatusVal = gpsTile.second
-        openGpsStatusSub = gpsTile.third
-        totalsRow.addView(totDistTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
-        totalsRow.addView(gpsTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
-        box.addView(totalsRow)
-
-        // 4. Whole-Day Gait Share Bar
-        val dayGaitCard = cardContainer()
-        dayGaitCard.addView(sectionHeader("TODAY'S WHOLE-DAY MOVEMENT BREAKDOWN"))
-        dailyGaitBar = GaitBreakdownBarView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(14)
-            ).apply { topMargin = dp(8); bottomMargin = dp(8) }
-        }
-        dayGaitCard.addView(dailyGaitBar)
-        dailyGaitLegendText = TextView(this).apply {
-            text = "Jog+Run 0:00 (Run 0:00 • Jog 0:00)  •  Walk 0:00"
+        // Live Gait + Battery Saver Status Pill inside Hero Card
+        allDayGaitPill = TextView(this).apply {
+            text = "Standing  •  Smart Battery Saver Ready"
             textSize = 12f
-            setTextColor(0xFFCBD5E1.toInt())
-        }
-        dayGaitCard.addView(dailyGaitLegendText)
-        box.addView(dayGaitCard)
-
-        // 5. Samsung Health Sync, Side-by-Side Comparison & Personal Stride Auto-Calibration Card
-        box.addView(buildSamsungComparisonCard())
-
-        // 6. 1-Tap CTA to Arm & Launch 1.6 km PT Trial
-        launchPtFromOpenBtn = Button(this).apply {
-            text = "START 1.6 KM PT TRIAL (Starts Only When You Jog/Run) →"
-            textSize = 13.5f
-            typeface = Typeface.DEFAULT_BOLD
-            isAllCaps = false
-            setTextColor(0xFF04130D.toInt())
-            background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(13))
-            setPadding(dp(14), dp(13), dp(14), dp(13))
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = AthleticTheme.solidPill(this@MainActivity, 0x33000000, AthleticColors.BORDER_SUBTLE, 11f)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            )
+        }
+        heroCard.addView(allDayGaitPill)
+        box.addView(heroCard)
+
+        // 2. Immediate 1-Tap Track Trial CTA (placed high for instant thumb access!)
+        launchPtFromOpenBtn = AthleticTheme.createButton(
+            this,
+            "Arm 1.6 km PT Trial (Launches on Jog/Run)  →",
+            AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
+            52f
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(14) }
             setOnClickListener {
                 selectTrackerSubTab(1)
-                if (trackingService?.let { lastRenderedPtPhase == PtTrialPhase.IDLE } != false) {
+                if (lastRenderedPtPhase == PtTrialPhase.IDLE) {
                     requestNeededPermissionsIfMissing(silentCheckOnly = false)
                     trackingService?.armPtTrial()
                 }
@@ -820,12 +798,67 @@ class MainActivity : AppCompatActivity() {
         }
         box.addView(launchPtFromOpenBtn)
 
-        // 7. Recent Whole-Day Activity Log Card
+        // 3. Clean 2x2 Bento Grid (Peak Pace, Peak Cadence, Live Speed, Total Distance)
+        val bentoRow1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
+        }
+        val maxPaceTile = metricTile("PEAK PACE TODAY", "--:-- /km", "Max 0.0 km/h", AthleticColors.EMERALD_BRIGHT)
+        dailyMaxPaceVal = maxPaceTile.second
+        dailyMaxPaceSub = maxPaceTile.third
+        val maxCadTile = metricTile("PEAK CADENCE", "0 spm", "Goal ≥168 spm", AthleticColors.CYAN_BRIGHT)
+        dailyMaxCadenceVal = maxCadTile.second
+        dailyMaxCadenceSub = maxCadTile.third
+        bentoRow1.addView(maxPaceTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
+        bentoRow1.addView(maxCadTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
+        box.addView(bentoRow1)
+
+        val bentoRow2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(14) }
+        }
+        val livePaceTile = metricTile("LIVE PACE NOW", "--:-- /km", "0 spm live")
+        openLivePaceVal = livePaceTile.second
+        openLivePaceSub = livePaceTile.third
+        val totDistTile = metricTile("TOTAL DISTANCE", "0 m", "Step-Stride Ready")
+        dailyTotalDistVal = totDistTile.second
+        dailyTotalDistSub = totDistTile.third
+        bentoRow2.addView(livePaceTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
+        bentoRow2.addView(totDistTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
+        box.addView(bentoRow2)
+
+        // 4. Whole-Day Gait Share Card
+        val dayGaitCard = cardContainer()
+        dayGaitCard.addView(AthleticTheme.sectionLabel(this, "MOVEMENT INTENSITY SHARE"))
+        dailyGaitBar = GaitBreakdownBarView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(12)).apply {
+                topMargin = dp(10); bottomMargin = dp(9)
+            }
+        }
+        dayGaitCard.addView(dailyGaitBar)
+        dailyGaitLegendText = TextView(this).apply {
+            text = "Run 0:00  •  Jog 0:00  •  Walk 0:00"
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+        }
+        dayGaitCard.addView(dailyGaitLegendText)
+        box.addView(dayGaitCard)
+
+        // 5. Samsung Health Sync & Personal Stride Calibration Card
+        box.addView(buildSamsungComparisonCard())
+
+        // 6. Recent Whole-Day Activity Timeline
         val dailyLogCard = cardContainer()
-        dailyLogCard.addView(sectionHeader("DAILY WHOLE-DAY ACTIVITY LOG"))
+        dailyLogCard.addView(AthleticTheme.sectionLabel(this, "RECENT DAILY TOTALS"))
         dailyHistoryListLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(8), 0, 0)
+            setPadding(0, dp(10), 0, 0)
         }
         dailyLogCard.addView(dailyHistoryListLayout)
         box.addView(dailyLogCard)
@@ -834,113 +867,109 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildSamsungComparisonCard(): LinearLayout {
-        val card = cardContainer().apply {
-            background = roundedBox(0xFF0E172A.toInt(), 0xFF38BDF8.toInt(), dp(14))
-        }
+        val card = cardContainer(
+            topColor = AthleticColors.HERO_CYAN_TOP,
+            bottomColor = AthleticColors.HERO_CYAN_BOTTOM,
+            borderColor = AthleticColors.HERO_CYAN_BORDER
+        )
 
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        headerRow.addView(TextView(this).apply {
-            text = "SAMSUNG HEALTH SYNC & ACCURACY"
-            textSize = 11.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF38BDF8.toInt())
-            letterSpacing = 0.04f
+        headerRow.addView(AthleticTheme.sectionLabel(this, "SAMSUNG HEALTH CALIBRATION", AthleticColors.CYAN_BRIGHT).apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         samsungSyncBadge = TextView(this).apply {
             text = "CONNECT"
-            textSize = 10.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF04130D.toInt())
-            setPadding(dp(8), dp(3), dp(8), dp(3))
-            background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(10))
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            setPadding(dp(9), dp(3.5f), dp(9), dp(3.5f))
+            background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.CYAN_BRIGHT, AthleticColors.CYAN_BRIGHT, 10f, 0f)
         }
         headerRow.addView(samsungSyncBadge)
         card.addView(headerRow)
 
         samsungHeadlineText = TextView(this).apply {
-            text = "Sync Samsung Health for Side-by-Side Calibration"
-            textSize = 14.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFFF8FAFC.toInt())
-            setPadding(0, dp(6), 0, dp(3))
+            text = "Sync Samsung Health for Ground-Truth Stride"
+            textSize = 15f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(8), 0, dp(3))
         }
         samsungDetailText = TextView(this).apply {
-            text = "Compares Steps, Distance, Walk & Jog+Run time via Android Health Connect and calibrates your personal stride length."
+            text = "Compares Steps, Distance & Runs via Health Connect (backfills 14 days of Watch/Samsung runs)."
             textSize = 12f
-            setTextColor(0xFF94A3B8.toInt())
-            setPadding(0, 0, 0, dp(8))
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, 0, 0, dp(10))
         }
         card.addView(samsungHeadlineText)
         card.addView(samsungDetailText)
 
-        // Side-by-side comparison table (Metric | TS Tracker | Samsung | Delta / Match)
         samsungCompareTable = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            background = roundedBox(0xFF090F1D.toInt(), 0xFF1E293B.toInt(), dp(10))
-            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 12f)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
+            ).apply { bottomMargin = dp(12) }
         }
 
         val tblHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, 0, 0, dp(5))
+            setPadding(0, 0, 0, dp(6))
         }
         fun hdrCell(txt: String, weight: Float, alignEnd: Boolean = false) = TextView(this).apply {
             text = txt
             textSize = 10f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = AthleticTheme.FONT_SANS_BOLD
             gravity = if (alignEnd) Gravity.END else Gravity.START
-            setTextColor(0xFF64748B.toInt())
+            setTextColor(AthleticColors.TEXT_MUTED)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, weight)
         }
         tblHeader.addView(hdrCell("METRIC", 1.05f))
-        tblHeader.addView(hdrCell("TS APP", 0.95f, alignEnd = true))
+        tblHeader.addView(hdrCell("TRACKER", 0.95f, alignEnd = true))
         tblHeader.addView(hdrCell("SAMSUNG", 0.95f, alignEnd = true))
-        tblHeader.addView(hdrCell("ACCURACY", 1.15f, alignEnd = true))
+        tblHeader.addView(hdrCell("MATCH", 1.15f, alignEnd = true))
         samsungCompareTable.addView(tblHeader)
 
         fun buildCompareRow(label: String): Triple<TextView, TextView, TextView> {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(4), 0, dp(4))
+                setPadding(0, dp(5), 0, dp(5))
             }
             val lblTv = TextView(this).apply {
                 text = label
-                textSize = 11.5f
-                setTextColor(0xFFCBD5E1.toInt())
+                textSize = 12f
+                setTextColor(AthleticColors.TEXT_SECONDARY)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.05f)
             }
             val trkTv = TextView(this).apply {
                 text = "--"
                 textSize = 12f
                 gravity = Gravity.END
-                typeface = Typeface.MONOSPACE
-                setTextColor(0xFFF8FAFC.toInt())
+                typeface = AthleticTheme.FONT_TABULAR_BOLD
+                setTextColor(AthleticColors.TEXT_PRIMARY)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f)
             }
             val samTv = TextView(this).apply {
                 text = "--"
                 textSize = 12f
                 gravity = Gravity.END
-                typeface = Typeface.MONOSPACE
-                setTextColor(0xFF7DD3FC.toInt())
+                typeface = AthleticTheme.FONT_TABULAR_BOLD
+                setTextColor(AthleticColors.CYAN_BRIGHT)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f)
             }
             val dltTv = TextView(this).apply {
                 text = "--"
                 textSize = 11f
                 gravity = Gravity.END
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(0xFF10B981.toInt())
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setTextColor(AthleticColors.EMERALD_BRIGHT)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.15f)
             }
             row.addView(lblTv)
@@ -952,59 +981,29 @@ class MainActivity : AppCompatActivity() {
         }
 
         val rSteps = buildCompareRow("Steps")
-        samRowStepsTracker = rSteps.first
-        samRowStepsSamsung = rSteps.second
-        samRowStepsDelta = rSteps.third
-
+        samRowStepsTracker = rSteps.first; samRowStepsSamsung = rSteps.second; samRowStepsDelta = rSteps.third
         val rDist = buildCompareRow("Distance")
-        samRowDistTracker = rDist.first
-        samRowDistSamsung = rDist.second
-        samRowDistDelta = rDist.third
-
-        val rWalk = buildCompareRow("Walk Time")
-        samRowWalkTracker = rWalk.first
-        samRowWalkSamsung = rWalk.second
-        samRowWalkDelta = rWalk.third
-
+        samRowDistTracker = rDist.first; samRowDistSamsung = rDist.second; samRowDistDelta = rDist.third
+        val rWalk = buildCompareRow("Walk")
+        samRowWalkTracker = rWalk.first; samRowWalkSamsung = rWalk.second; samRowWalkDelta = rWalk.third
         val rRun = buildCompareRow("Jog + Run")
-        samRowRunTracker = rRun.first
-        samRowRunSamsung = rRun.second
-        samRowRunDelta = rRun.third
-
+        samRowRunTracker = rRun.first; samRowRunSamsung = rRun.second; samRowRunDelta = rRun.third
         val rStride = buildCompareRow("Stride")
-        samRowStrideTracker = rStride.first
-        samRowStrideSamsung = rStride.second
-        samRowStrideDelta = rStride.third
+        samRowStrideTracker = rStride.first; samRowStrideSamsung = rStride.second; samRowStrideDelta = rStride.third
 
         card.addView(samsungCompareTable)
 
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
-        samsungPrimaryBtn = Button(this).apply {
-            text = "Connect Samsung Health"
+        samsungPrimaryBtn = AthleticTheme.createButton(this, "Connect Samsung Health", AthleticTheme.ButtonStyle.PRIMARY_EMERALD, 44f).apply {
             textSize = 12.5f
-            typeface = Typeface.DEFAULT_BOLD
-            isAllCaps = false
-            setTextColor(0xFF04130D.toInt())
-            background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(10))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.15f).apply {
-                marginEnd = dp(5)
-            }
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f).apply { marginEnd = dp(5) }
         }
-        samsungSecondaryBtn = Button(this).apply {
-            text = "Samsung Settings"
-            textSize = 12f
-            isAllCaps = false
-            setTextColor(0xFFCBD5E1.toInt())
-            background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(10))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f).apply {
-                marginStart = dp(5)
-            }
+        samsungSecondaryBtn = AthleticTheme.createButton(this, "Settings", AthleticTheme.ButtonStyle.SECONDARY_SLATE, 44f).apply {
+            textSize = 12.5f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f).apply { marginStart = dp(5) }
         }
         btnRow.addView(samsungPrimaryBtn)
         btnRow.addView(samsungSecondaryBtn)
@@ -1014,132 +1013,171 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Sub-View 1: Dedicated 1.6 km TS Police PT Trial.
-     * Pressing Start arms the trial at 0:00.0 / 0m; standing & walking are ignored;
-     * the timer & distance start ONLY when Jogging or Running is detected!
+     * Sub-View 1: Official 1.6 km TSLPRB PT Trial Race Cockpit (Unpaused RFID Clock + Pocket Protection).
      */
     private fun buildPtTrialSubView(): LinearLayout {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
 
-        // Gauge Card
         val gaugeCard = cardContainer().apply {
-            setPadding(dp(12), dp(8), dp(12), dp(12))
+            setPadding(dp(14), dp(12), dp(14), dp(14))
         }
+
+        // Top Bar inside Gauge Card: Official Rules Label + Live GPS Lock Readiness Pill
+        val gaugeTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        gaugeTopRow.addView(AthleticTheme.sectionLabel(this, "OFFICIAL 1,600M RFID CLOCK").apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        ptGpsReadinessPill = TextView(this).apply {
+            text = "CHECKING GPS..."
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setPadding(dp(9), dp(3.5f), dp(9), dp(3.5f))
+            background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 10f)
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+        }
+        gaugeTopRow.addView(ptGpsReadinessPill)
+        gaugeCard.addView(gaugeTopRow)
+
         paceArcGauge = PaceArcGaugeView(this)
         gaugeCard.addView(paceArcGauge)
         col.addView(gaugeCard)
 
-        // PT Trial Action Controls (placed right under Gauge for instant thumb reach!)
-        primaryActionBtn = Button(this).apply {
-            text = "START 1.6 KM PT TRIAL (Starts When You Jog/Run)"
-            textSize = 14.5f
-            typeface = Typeface.DEFAULT_BOLD
-            isAllCaps = false
-            setTextColor(0xFF04130D.toInt())
-            background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(14))
-            setPadding(dp(16), dp(14), dp(16), dp(14))
+        // Primary Action Button (IDLE & ARMED states)
+        primaryActionBtn = AthleticTheme.createButton(
+            this,
+            "ARM 1.6 KM PT TRIAL (Starts on Jog/Run)",
+            AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
+            54f
+        ).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = dp(8) }
         }
+        col.addView(primaryActionBtn)
+
+        // Active Running Controls Row: [+ Snap 400m Lap] & [Finish Early] (Pocket-Safe Confirmation!)
+        ptRunningControlsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+        snapLapBtn = AthleticTheme.createButton(this, "+ Snap 400m Lap", AthleticTheme.ButtonStyle.PRIMARY_CYAN, 50f).apply {
+            textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(5) }
+            setOnClickListener {
+                val snapped = trackingService?.snapNext400mLap() == true
+                if (!snapped) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Snap Lap works within 90m of the next 400m line.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+        finishEarlyBtn = AthleticTheme.createButton(this, "Finish & Save", AthleticTheme.ButtonStyle.DANGER_CRIMSON, 50f).apply {
+            textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(5) }
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Finish 1.6 km PT Trial Early?")
+                    .setMessage("Save your partial trial now, or keep running until 1,600 meters?")
+                    .setPositiveButton("Finish & Save") { _, _ ->
+                        val id = trackingService?.finishWorkout(forceSave = true)
+                        if (id != null) {
+                            Toast.makeText(this@MainActivity, "PT Trial saved to Progress!", Toast.LENGTH_LONG).show()
+                            refreshProgressDashboard()
+                            selectTab(1)
+                        } else {
+                            Toast.makeText(this@MainActivity, "Trial too short to save (<50m).", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    .setNegativeButton("Keep Running", null)
+                    .show()
+            }
+        }
+        ptRunningControlsRow.addView(snapLapBtn)
+        ptRunningControlsRow.addView(finishEarlyBtn)
+        col.addView(ptRunningControlsRow)
+
         ptArmHintText = TextView(this).apply {
-            text = "Tap Start, put phone in pocket & walk to the line — timer stays at 0:00 until you start jogging or running."
+            text = "Put phone in pocket & walk to start line — clock stays at 0:00 until you start jogging or running."
             textSize = 12f
             gravity = Gravity.CENTER
-            setTextColor(0xFF94A3B8.toInt())
-            setPadding(dp(6), 0, dp(6), dp(10))
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(dp(8), 0, dp(8), dp(10))
         }
-        secondaryActionBtn = Button(this).apply {
-            text = "← Back to All-Day Open Mode"
+        col.addView(ptArmHintText)
+
+        secondaryActionBtn = AthleticTheme.createButton(this, "← Back to Today Overview", AthleticTheme.ButtonStyle.SUBTLE_OUTLINE, 44f).apply {
             textSize = 12.5f
-            isAllCaps = false
-            setTextColor(0xFF38BDF8.toInt())
-            background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(12))
-            setPadding(dp(14), dp(10), dp(14), dp(10))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            ).apply { bottomMargin = dp(14) }
         }
-        col.addView(primaryActionBtn)
-        col.addView(ptArmHintText)
         col.addView(secondaryActionBtn)
 
-        // 2x2 Live PT Trial Sensor Metrics Grid
+        // 2x2 Live Telemetry Grid
         val gridRow1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(10) }
         }
-        val paceTile = metricTile("LIVE PACE", "--:-- /km", "0.0 km/h")
-        metricPaceVal = paceTile.second
-        metricPaceSub = paceTile.third
-        val cadTile = metricTile("STEP CADENCE", "0 spm", "0 steps today")
-        metricCadenceVal = cadTile.second
-        metricCadenceSub = cadTile.third
-        gridRow1.addView(paceTile.first.apply {
-            (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5)
-        })
-        gridRow1.addView(cadTile.first.apply {
-            (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5)
-        })
+        val paceTile = metricTile("LIVE PACE", "--:-- /km", "0.0 km/h", AthleticColors.EMERALD_BRIGHT)
+        metricPaceVal = paceTile.second; metricPaceSub = paceTile.third
+        val cadTile = metricTile("STEP CADENCE", "0 spm", "Target ≥168 spm", AthleticColors.CYAN_BRIGHT)
+        metricCadenceVal = cadTile.second; metricCadenceSub = cadTile.third
+        gridRow1.addView(paceTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
+        gridRow1.addView(cadTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
         col.addView(gridRow1)
 
         val gridRow2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(14) }
         }
-        val projTile = metricTile("PROJ. 1.6K TIME", "--:--", "Target 7:15")
-        metricProjVal = projTile.second
-        metricProjSub = projTile.third
-        val sensTile = metricTile("MOTION / GPS", "0.0 m/s²", "Searching GPS...")
-        metricSensorVal = sensTile.second
-        metricSensorSub = sensTile.third
-        gridRow2.addView(projTile.first.apply {
-            (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5)
-        })
-        gridRow2.addView(sensTile.first.apply {
-            (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5)
-        })
+        val projTile = metricTile("PROJ. 1.6K FINISH", "--:--", "Target < 7:15")
+        metricProjVal = projTile.second; metricProjSub = projTile.third
+        val sensTile = metricTile("CURVE / GPS FUSION", "0.0 m/s²", "Checking sky lock...")
+        metricSensorVal = sensTile.second; metricSensorSub = sensTile.third
+        gridRow2.addView(projTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
+        gridRow2.addView(sensTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
         col.addView(gridRow2)
 
-        // PT Trial Gait Share Card
+        // PT Trial Gait Breakdown Card
         val gaitCard = cardContainer()
-        gaitCard.addView(sectionHeader("PT TRIAL GAIT BREAKDOWN"))
+        gaitCard.addView(AthleticTheme.sectionLabel(this, "TRIAL GAIT & STOPPED PENALTY"))
         gaitBar = GaitBreakdownBarView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(14)
-            ).apply { topMargin = dp(8); bottomMargin = dp(8) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(12))
+                .apply { topMargin = dp(10); bottomMargin = dp(9) }
         }
         gaitCard.addView(gaitBar)
         gaitLegendText = TextView(this).apply {
-            text = "Run 0:00  •  Jog 0:00  •  Walk 0:00  •  Auto-Pause 0:00"
+            text = "Run 0:00  •  Jog 0:00  •  Walk 0:00  •  Stopped 0:00"
             textSize = 12f
-            setTextColor(0xFFCBD5E1.toInt())
+            setTextColor(AthleticColors.TEXT_SECONDARY)
         }
         gaitCard.addView(gaitLegendText)
         col.addView(gaitCard)
 
-        // Live 400m Track Splits Card
+        // Live 400m Track Lap Splits Card
         val splitsCard = cardContainer()
-        splitsCard.addView(sectionHeader("400M TRACK LAP SPLITS (TARGET 1:48.8 / LAP)"))
+        splitsCard.addView(AthleticTheme.sectionLabel(this, "400M TRACK LAP SPLITS"))
         splitsListLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(6), 0, 0)
+            setPadding(0, dp(8), 0, 0)
         }
         splitsCard.addView(splitsListLayout)
         col.addView(splitsCard)
@@ -1147,68 +1185,186 @@ class MainActivity : AppCompatActivity() {
         return col
     }
 
-    // =========================================================================
-    // TAB 2: DAILY PROGRESS & DAYS-TO-7:15 FORECAST
-    // =========================================================================
-    private fun buildProgressTab(): ScrollView {
-        val scroll = ScrollView(this)
+    /**
+     * Sub-View 2: Guided 400m Speed-Endurance Interval Coach (4x400m / 6x400m / 8x400m + 90s Recovery).
+     */
+    private fun buildIntervalsSubView(): LinearLayout {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(28))
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
 
-        // Hero Forecast Card
-        val heroCard = cardContainer().apply {
-            background = roundedBox(0xFF0F1D2E.toInt(), 0xFF10B981.toInt(), dp(16))
-        }
-        heroCard.addView(TextView(this).apply {
-            text = "PRACTICE IMPROVEMENT & TARGET REACH ETA"
-            textSize = 11.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF10B981.toInt())
-            letterSpacing = 0.05f
+        val dialCard = cardContainer(
+            topColor = AthleticColors.HERO_AMBER_TOP,
+            bottomColor = AthleticColors.SURFACE_BOTTOM,
+            borderColor = AthleticColors.HERO_AMBER_BORDER
+        )
+        dialCard.addView(AthleticTheme.sectionLabel(this, "GUIDED 400M TRACK SPEED WORKOUT", AthleticColors.AMBER_BRIGHT))
+        dialCard.addView(TextView(this).apply {
+            text = "Builds VO2max & prevents shin splints from running all-out 1.6 km trials every day."
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, dp(8))
         })
+
+        // Rep count selector: 4x400m | 6x400m | 8x400m
+        val repRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 11f)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(8) }
+        }
+        intervalRepPresetBtns.clear()
+        for (reps in listOf(4, 6, 8)) {
+            val tv = TextView(this).apply {
+                text = "$reps × 400m"
+                gravity = Gravity.CENTER
+                textSize = 12f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setPadding(dp(6), dp(8), dp(6), dp(8))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    selectedIntervalReps = reps
+                    refreshIntervalRepPresets()
+                }
+            }
+            intervalRepPresetBtns.add(reps to tv)
+            repRow.addView(tv)
+        }
+        dialCard.addView(repRow)
+        refreshIntervalRepPresets()
+
+        intervalDialView = IntervalDialView(this)
+        dialCard.addView(intervalDialView)
+
+        intervalPrimaryBtn = AthleticTheme.createButton(
+            this,
+            "Start 6 × 400m Interval Session",
+            AthleticTheme.ButtonStyle.WARNING_AMBER,
+            52f
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(8) }
+            setOnClickListener {
+                requestNeededPermissionsIfMissing(silentCheckOnly = false)
+                trackingService?.startIntervalWorkout(selectedIntervalReps, 90.0)
+            }
+        }
+        dialCard.addView(intervalPrimaryBtn)
+
+        intervalSecondaryBtn = AthleticTheme.createButton(
+            this,
+            "Stop Intervals",
+            AthleticTheme.ButtonStyle.SUBTLE_OUTLINE,
+            44f
+        ).apply {
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(8) }
+        }
+        dialCard.addView(intervalSecondaryBtn)
+        col.addView(dialCard)
+
+        val repSplitsCard = cardContainer()
+        repSplitsCard.addView(AthleticTheme.sectionLabel(this, "COMPLETED 400M REP SPLITS"))
+        intervalSplitsLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        repSplitsCard.addView(intervalSplitsLayout)
+        col.addView(repSplitsCard)
+
+        return col
+    }
+
+    private fun refreshIntervalRepPresets() {
+        for ((reps, tv) in intervalRepPresetBtns) {
+            val active = reps == selectedIntervalReps
+            if (active) {
+                tv.background = AthleticTheme.solidPill(this, AthleticColors.AMBER_BRIGHT, AthleticColors.AMBER_BRIGHT, 8f, 0f)
+                tv.setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            } else {
+                tv.background = null
+                tv.setTextColor(AthleticColors.TEXT_SECONDARY)
+            }
+        }
+        if (::intervalPrimaryBtn.isInitialized && lastRenderedIntervalPhase == IntervalPhase.IDLE) {
+            intervalPrimaryBtn.text = "Start $selectedIntervalReps × 400m Interval Session"
+        }
+    }
+
+    // =========================================================================
+    // TAB 2: PROGRESS, TSLPRB MERIT SCORE & DAYS-TO-TARGET ETA
+    // =========================================================================
+    private fun buildProgressTab(): ScrollView {
+        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(28))
+        }
+
+        // Hero Forecast & Merit Card
+        val heroCard = cardContainer(
+            topColor = AthleticColors.HERO_EMERALD_TOP,
+            bottomColor = AthleticColors.HERO_EMERALD_BOTTOM,
+            borderColor = AthleticColors.HERO_EMERALD_BORDER
+        )
+        val topRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        topRow.addView(AthleticTheme.sectionLabel(this, "TARGET ETA & TSLPRB MERIT", AthleticColors.EMERALD_BRIGHT).apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        meritBadgeText = TextView(this).apply {
+            text = "0 / 100 PTS"
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setPadding(dp(9), dp(3.5f), dp(9), dp(3.5f))
+            background = AthleticTheme.solidPill(this@MainActivity, 0x3310B981, AthleticColors.EMERALD_BRIGHT, 10f)
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+        }
+        topRow.addView(meritBadgeText)
+        heroCard.addView(topRow)
+
         etaHeadlineText = TextView(this).apply {
             text = "-- Days to 7:15"
-            textSize = 26f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFFF8FAFC.toInt())
-            setPadding(0, dp(6), 0, dp(4))
+            textSize = 27f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(8), 0, dp(4))
         }
         etaSubText = TextView(this).apply {
             text = "Loading progression..."
             textSize = 13f
-            setTextColor(0xFFCBD5E1.toInt())
+            setTextColor(AthleticColors.TEXT_SECONDARY)
         }
         heroCard.addView(etaHeadlineText)
         heroCard.addView(etaSubText)
 
-        // Coach prescription box inside hero
         coachPrescriptionText = TextView(this).apply {
             text = ""
-            textSize = 12.5f
-            setTextColor(0xFF93C5FD.toInt())
+            textSize = 12f
+            setTextColor(AthleticColors.CYAN_BRIGHT)
             setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundedBox(0x1E38BDF8, 0x4438BDF8, dp(10))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(10) }
+            background = AthleticTheme.solidPill(this@MainActivity, 0x2238BDF8, AthleticColors.HERO_CYAN_BORDER, 11f)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(12) }
         }
         heroCard.addView(coachPrescriptionText)
         col.addView(heroCard)
 
-        // 4 KPI Summary Grid
+        // 2x2 KPI Bento Grid
         val kpiRow1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(10) }
         }
-        val pbTile = metricTile("1.6K PERSONAL BEST", "--:--", "Best 1600m time")
+        val pbTile = metricTile("1.6K PERSONAL BEST", "--:--", "Best 1,600m time", AthleticColors.EMERALD_BRIGHT)
         kpiPbVal = pbTile.second
-        val gapTile = metricTile("GAP TO 7:15", "--", "Seconds to shave")
+        val gapTile = metricTile("GAP TO CUTOFF", "--", "Seconds to shave", AthleticColors.AMBER_BRIGHT)
         kpiGapVal = gapTile.second
         kpiRow1.addView(pbTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(5) })
         kpiRow1.addView(gapTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
@@ -1216,12 +1372,10 @@ class MainActivity : AppCompatActivity() {
 
         val kpiRow2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(14) }
         }
-        val rateTile = metricTile("IMPROVEMENT RATE", "--", "Weekly pace gain")
+        val rateTile = metricTile("WEEKLY GAIN", "--", "Pace improvement", AthleticColors.CYAN_BRIGHT)
         kpiRateVal = rateTile.second
         val impTile = metricTile("TOTAL SHAVED", "--", "Since Day 1")
         kpiImprovedVal = impTile.second
@@ -1229,52 +1383,41 @@ class MainActivity : AppCompatActivity() {
         kpiRow2.addView(impTile.first.apply { (layoutParams as LinearLayout.LayoutParams).marginStart = dp(5) })
         col.addView(kpiRow2)
 
-        // Trend & Projection Chart Card
+        // Cubic-Bezier Trend Chart Card
         val chartCard = cardContainer()
-        chartCard.addView(sectionHeader("DAILY 1.6 KM CURVE & 7:15 PROJECTION"))
+        chartCard.addView(AthleticTheme.sectionLabel(this, "1.6 KM PROGRESSION & TARGET FORECAST"))
         trendChartView = ProgressTrendChartView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(220)
-            ).apply { topMargin = dp(6) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(228))
+                .apply { topMargin = dp(6) }
         }
         chartCard.addView(trendChartView)
         chartCard.addView(TextView(this).apply {
-            text = "Blue dots = 1.6km PT Trials  •  Amber = Auto Open Runs  •  Dashed line = Forecast to 7:15"
+            text = "Cyan = 1.6K Trials  •  Amber = Auto/Intervals  •  Green = Qualified  •  Dashed = ETA"
             textSize = 11f
-            setTextColor(0xFF64748B.toInt())
+            setTextColor(AthleticColors.TEXT_MUTED)
             setPadding(0, dp(4), 0, 0)
         })
         col.addView(chartCard)
 
-        // Action Buttons (+ Manual Track Time & Sample Data Toggle)
+        // 3-Button Action Strip: [+ Log Run] | [Sample Data] | [Backup]
         val actionsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(14) }
         }
-        val manualBtn = Button(this).apply {
-            text = "+ Log Track Time"
+        val manualBtn = AthleticTheme.createButton(this, "+ Log Time", AthleticTheme.ButtonStyle.PRIMARY_CYAN, 44f).apply {
             textSize = 12.5f
-            isAllCaps = false
-            setTextColor(0xFF04130D.toInt())
-            typeface = Typeface.DEFAULT_BOLD
-            background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(12))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = dp(6)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.05f).apply { marginEnd = dp(4) }
+            setOnClickListener {
+                SessionDialogs.showManualRunDialog(this@MainActivity, repository) {
+                    refreshProgressDashboard()
+                }
             }
-            setOnClickListener { showManualRunDialog() }
         }
-        demoToggleBtn = Button(this).apply {
-            text = "Load Sample Data"
+        demoToggleBtn = AthleticTheme.createButton(this, "Sample Data", AthleticTheme.ButtonStyle.SECONDARY_SLATE, 44f).apply {
             textSize = 12.5f
-            isAllCaps = false
-            setTextColor(0xFFCBD5E1.toInt())
-            background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(12))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(6)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.05f).apply {
+                marginStart = dp(4); marginEnd = dp(4)
             }
             setOnClickListener {
                 if (repository.hasDemoSessions()) {
@@ -1288,16 +1431,27 @@ class MainActivity : AppCompatActivity() {
                 refreshProgressDashboard()
             }
         }
+        val backupBtn = AthleticTheme.createButton(this, "Backup", AthleticTheme.ButtonStyle.SUBTLE_OUTLINE, 44f).apply {
+            textSize = 12.5f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.85f).apply { marginStart = dp(4) }
+            setOnClickListener {
+                SessionDialogs.showBackupAndRestoreDialog(this@MainActivity, repository) {
+                    refreshCachedDailyHistory(forceRender = true)
+                    refreshProgressDashboard()
+                }
+            }
+        }
         actionsRow.addView(manualBtn)
         actionsRow.addView(demoToggleBtn)
+        actionsRow.addView(backupBtn)
         col.addView(actionsRow)
 
-        // Daily Sessions History Card
+        // Recorded Sessions History Card (Tap any row for 4x400m Splits & Merit Score!)
         val historyCard = cardContainer()
-        historyCard.addView(sectionHeader("RECORDED 1.6 KM PT TRIALS & AUTO RUNS"))
+        historyCard.addView(AthleticTheme.sectionLabel(this, "TRAINING LOG  •  TAP ANY RUN FOR SPLITS"))
         sessionsListLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(8), 0, 0)
+            setPadding(0, dp(10), 0, 0)
         }
         historyCard.addView(sessionsListLayout)
         col.addView(historyCard)
@@ -1307,99 +1461,80 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // TAB 3: TS POLICE PET SPLITS & SENSOR CALIBRATION
+    // TAB 3: COACH, RUNNER PROFILE, POCKET AUDIO & SENSOR LAB
     // =========================================================================
     private fun buildGuideAndSensorsTab(): ScrollView {
-        val scroll = ScrollView(this)
+        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(28))
+            setPadding(dp(16), dp(14), dp(16), dp(28))
         }
 
-        // Benchmark Split Table Card
-        val tableCard = cardContainer()
-        tableCard.addView(sectionHeader("TS POLICE 1600M (1.6 KM) PACING SPLITS"))
-        tableCard.addView(TextView(this).apply {
-            text = "Even-split checkpoints on a standard 400m ground to beat 7 min 15 sec (435s):"
-            textSize = 12.5f
-            setTextColor(0xFF94A3B8.toInt())
-            setPadding(0, dp(4), 0, dp(10))
-        })
-        val splitRows = listOf(
-            Triple("200 m (Half Lap)", "0:54.4", "13.24 km/h"),
-            Triple("400 m (Lap 1)", "1:48.8", "4:31.9 /km"),
-            Triple("800 m (Lap 2 • Halfway)", "3:37.5", "Stay relaxed"),
-            Triple("1,200 m (Lap 3 • Push)", "5:26.3", "Hold cadence >168"),
-            Triple("1,600 m (Finish Cutoff)", "7:15.0", "QUALIFYING MARK")
-        )
-        for ((dist, split, note) in splitRows) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(dp(10), dp(8), dp(10), dp(8))
-                background = roundedBox(0xFF0B1120.toInt(), 0xFF1E293B.toInt(), dp(8))
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(6) }
-            }
-            row.addView(TextView(this).apply {
-                text = dist
-                textSize = 12.5f
-                setTextColor(0xFFE2E8F0.toInt())
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f)
-            })
-            row.addView(TextView(this).apply {
-                text = split
-                textSize = 13f
-                typeface = Typeface.MONOSPACE
-                setTextColor(0xFF10B981.toInt())
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.7f)
-            })
-            row.addView(TextView(this).apply {
-                text = note
-                textSize = 11.5f
-                gravity = Gravity.END
-                setTextColor(0xFF94A3B8.toInt())
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            })
-            tableCard.addView(row)
+        // 1. Samsung / Android Background Protection Card
+        val batCard = cardContainer()
+        val batTop = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
-        col.addView(tableCard)
-
-        // Target Time & Tracking Preferences Card
-        val settingsCard = cardContainer()
-        settingsCard.addView(sectionHeader("TARGET CUTOFF, ALL-DAY AUTO & AUDIO"))
-        settingsCard.addView(TextView(this).apply {
-            text = "1.6 km Target Cutoff Time:"
-            textSize = 12.5f
-            setTextColor(0xFFCBD5E1.toInt())
-            setPadding(0, dp(8), 0, dp(6))
+        batTop.addView(AthleticTheme.sectionLabel(this, "SAMSUNG / ANDROID BACKGROUND GUARD").apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
+        batteryStatusBadge = TextView(this).apply {
+            text = "CHECKING"
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setPadding(dp(8), dp(3f), dp(8), dp(3f))
+        }
+        batTop.addView(batteryStatusBadge)
+        batCard.addView(batTop)
+        batCard.addView(TextView(this).apply {
+            text = "Prevents One UI 'Deep Sleeping Apps' from killing pocket tracking while smart idle duty-cycling saves battery."
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(6), 0, dp(10))
+        })
+        batteryStatusBtn = AthleticTheme.createButton(
+            this,
+            "Allow Unrestricted Background Tracking",
+            AthleticTheme.ButtonStyle.PRIMARY_CYAN,
+            44f
+        ).apply {
+            textSize = 12.5f
+            setOnClickListener { requestIgnoreBatteryOptimizationsSafely() }
+        }
+        batCard.addView(batteryStatusBtn)
+        col.addView(batCard)
 
+        // 2. Runner Profile, TSLPRB Target & Height Calibration Card
+        val profileCard = cardContainer()
+        profileCard.addView(AthleticTheme.sectionLabel(this, "RUNNER PROFILE & TSLPRB TARGET CUTOFF"))
+
+        profileCard.addView(TextView(this).apply {
+            text = "1,600m Target Cutoff / Merit Goal:"
+            textSize = 12.5f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(10), 0, dp(6))
+        })
         val targetPresetRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(12) }
         }
         val presets = listOf(
-            435.0 to "7:15 (PET)",
-            420.0 to "7:00",
-            390.0 to "6:30",
-            360.0 to "6:00"
+            435.0 to "7:15 PET",
+            390.0 to "6:30 Merit",
+            360.0 to "6:00 Elite",
+            570.0 to "9:30 Ex-S"
         )
         val tBtns = mutableListOf<Pair<Double, TextView>>()
         for ((sec, label) in presets) {
             val btn = TextView(this).apply {
                 text = label
                 gravity = Gravity.CENTER
-                textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(6), dp(9), dp(6), dp(9))
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginEnd = dp(4)
-                }
+                textSize = 11.5f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setPadding(dp(4), dp(10), dp(4), dp(10))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) }
                 setOnClickListener {
                     repository.targetTimeSec = sec
                     trackingService?.syncThresholdsFromPrefs()
@@ -1411,20 +1546,67 @@ class MainActivity : AppCompatActivity() {
             targetPresetRow.addView(btn)
         }
         targetPresetButtons = tBtns
-        settingsCard.addView(targetPresetRow)
+        profileCard.addView(targetPresetRow)
 
-        settingsCard.addView(TextView(this).apply {
-            text = "Jogging → Running Auto-Classification Threshold:"
+        // Runner Height Stepper Row (Biomechanical Stride Baseline)
+        val heightRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(4), 0, dp(10))
+        }
+        val heightLblCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        heightLblCol.addView(TextView(this).apply {
+            text = "Runner Height (Stride Baseline)"
+            textSize = 13.5f
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+        })
+        heightLblCol.addView(TextView(this).apply {
+            text = "Sets natural stride before Samsung Health calibration"
+            textSize = 11.5f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+        })
+        heightRow.addView(heightLblCol)
+
+        fun stepBtn(symbol: String, delta: Int) = AthleticTheme.createButton(
+            this,
+            symbol,
+            AthleticTheme.ButtonStyle.SECONDARY_SLATE,
+            36f
+        ).apply {
+            minWidth = dp(38)
+            setPadding(dp(12), dp(4), dp(12), dp(4))
+            setOnClickListener {
+                repository.runnerHeightCm = (repository.runnerHeightCm + delta).coerceIn(145, 205)
+                heightValText.text = "${repository.runnerHeightCm} cm"
+                trackingService?.syncThresholdsFromPrefs()
+                renderSamsungComparisonCard(force = true)
+            }
+        }
+        heightValText = TextView(this).apply {
+            text = "${repository.runnerHeightCm} cm"
+            textSize = 13.5f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            setPadding(dp(10), 0, dp(10), 0)
+        }
+        heightRow.addView(stepBtn("−", -2))
+        heightRow.addView(heightValText)
+        heightRow.addView(stepBtn("+", +2))
+        profileCard.addView(heightRow)
+
+        profileCard.addView(TextView(this).apply {
+            text = "Jogging → Running Speed Threshold:"
             textSize = 12.5f
-            setTextColor(0xFFCBD5E1.toInt())
+            setTextColor(AthleticColors.TEXT_SECONDARY)
             setPadding(0, dp(4), 0, dp(6))
         })
         val threshRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
         val threshPresets = listOf(
             2.85 to "5:50 /km",
@@ -1436,12 +1618,10 @@ class MainActivity : AppCompatActivity() {
             val btn = TextView(this).apply {
                 text = label
                 gravity = Gravity.CENTER
-                textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
+                textSize = 11.5f
+                typeface = AthleticTheme.FONT_SANS_BOLD
                 setPadding(dp(6), dp(9), dp(6), dp(9))
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginEnd = dp(4)
-                }
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) }
                 setOnClickListener {
                     repository.runningThresholdMps = mps
                     trackingService?.syncThresholdsFromPrefs()
@@ -1452,97 +1632,216 @@ class MainActivity : AppCompatActivity() {
             threshRow.addView(btn)
         }
         thresholdPresetButtons = thBtns
-        settingsCard.addView(threshRow)
+        profileCard.addView(threshRow)
+        col.addView(profileCard)
 
-        // Switches for All-Day Auto Mode, State-Change Audio, Voice Coach & Indoor Step Fallback
-        allDayAutoSwitch = Switch(this).apply {
-            text = "All-Day 24/7 Open Auto Mode (Counts whole-day Walk & Jog+Run)"
-            setTextColor(0xFFE2E8F0.toInt())
-            textSize = 13f
-            isChecked = repository.allDayTrackingEnabled
-            setPadding(0, dp(6), 0, dp(6))
-            setOnCheckedChangeListener { _, checked ->
-                repository.allDayTrackingEnabled = checked
-                trackingService?.syncPocketForegroundAndWakeLock()
-            }
-        }
-        stateAudioSwitch = Switch(this).apply {
-            text = "Pocket & Screen-Off State Audio (Speaks Stand/Walk/Jog/Run in pocket)"
-            setTextColor(0xFFE2E8F0.toInt())
-            textSize = 13f
-            isChecked = repository.stateChangeAudioEnabled
-            setPadding(0, dp(6), 0, dp(6))
-            setOnCheckedChangeListener { _, checked ->
-                repository.stateChangeAudioEnabled = checked
-                trackingService?.syncPocketForegroundAndWakeLock()
-                refreshStateAudioChip()
-            }
-        }
-        val voiceSwitch = Switch(this).apply {
-            text = "Voice Split Coach (400m & 1600m TTS audio)"
-            setTextColor(0xFFE2E8F0.toInt())
-            textSize = 13f
-            isChecked = repository.voiceCoachEnabled
-            setPadding(0, dp(6), 0, dp(6))
-            setOnCheckedChangeListener { _, checked -> repository.voiceCoachEnabled = checked }
-        }
-        val stepFallbackSwitch = Switch(this).apply {
-            text = "Step-Stride Distance Fallback when GPS is indoors/weak"
-            setTextColor(0xFFE2E8F0.toInt())
-            textSize = 13f
-            isChecked = repository.indoorStepFallbackEnabled
-            setPadding(0, dp(6), 0, dp(6))
-            setOnCheckedChangeListener { _, checked -> repository.indoorStepFallbackEnabled = checked }
-        }
-        autoCalibrateSamsungSwitch = Switch(this).apply {
-            text = "Auto-Calibrate Personal Stride Length from Samsung Health"
-            setTextColor(0xFFE2E8F0.toInt())
-            textSize = 13f
-            isChecked = repository.autoCalibrateFromSamsung
-            setPadding(0, dp(6), 0, dp(6))
-            setOnCheckedChangeListener { _, checked ->
-                repository.autoCalibrateFromSamsung = checked
-                trackingService?.syncThresholdsFromPrefs()
-                renderSamsungComparisonCard(force = true)
-            }
-        }
-        autoImportSamsungRunsSwitch = Switch(this).apply {
-            text = "Auto-Import Samsung Health / Watch Runs (>= 600m) to 7:15 ETA"
-            setTextColor(0xFFE2E8F0.toInt())
-            textSize = 13f
-            isChecked = repository.autoImportSamsungRuns
-            setPadding(0, dp(6), 0, dp(8))
-            setOnCheckedChangeListener { _, checked -> repository.autoImportSamsungRuns = checked }
-        }
-        val testStateAudioBtn = Button(this).apply {
-            text = "Test State Change Audio Cue"
-            textSize = 12.5f
-            isAllCaps = false
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFFE2E8F0.toInt())
-            background = roundedBox(0xFF1E293B.toInt(), 0xFF38BDF8.toInt(), dp(10))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(8) }
-            setOnClickListener {
-                trackingService?.previewStateChangeAudio(MotionState.TARGET_PACE)
-            }
-        }
-        val resetTodayDailyBtn = Button(this).apply {
-            text = "Reset Today's All-Day Counters"
+        // 3. Pocket Audio 3-Mode Selector & Modern Pill Toggles Card
+        val audioAndTogglesCard = cardContainer()
+        audioAndTogglesCard.addView(AthleticTheme.sectionLabel(this, "POCKET AUDIO & SMART TRACKING"))
+        audioAndTogglesCard.addView(TextView(this).apply {
+            text = "Pocket Voice Mode (Smart Audio stays quiet during indoor walks):"
             textSize = 12f
-            isAllCaps = false
-            setTextColor(0xFF94A3B8.toInt())
-            background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(10))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(8) }
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(8), 0, dp(6))
+        })
+
+        val audioSegRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 12f)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(10) }
+        }
+        val aBtns = mutableListOf<Pair<PocketAudioMode, TextView>>()
+        for (mode in PocketAudioMode.values()) {
+            val tv = TextView(this).apply {
+                text = mode.shortLabel
+                gravity = Gravity.CENTER
+                textSize = 12f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setPadding(dp(6), dp(9), dp(6), dp(9))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    repository.pocketAudioMode = mode
+                    trackingService?.syncPocketForegroundAndWakeLock()
+                    refreshSettingsHighlights()
+                    trackingService?.previewStateChangeAudio()
+                }
+            }
+            aBtns.add(mode to tv)
+            audioSegRow.addView(tv)
+        }
+        audioModeButtons = aBtns
+        audioAndTogglesCard.addView(audioSegRow)
+
+        audioAndTogglesCard.addView(
+            AthleticTheme.createButton(this, "Test Voice Coach Cue", AthleticTheme.ButtonStyle.SECONDARY_SLATE, 42f).apply {
+                textSize = 12.5f
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    .apply { bottomMargin = dp(8) }
+                setOnClickListener { trackingService?.previewStateChangeAudio(MotionState.TARGET_PACE) }
+            }
+        )
+
+        audioAndTogglesCard.addView(AthleticTheme.hairlineDivider(this, 4f))
+
+        allDayAutoRow = ModernSettingRow(
+            this,
+            "24/7 Smart All-Day Auto Tracking",
+            "Counts Walk & Jog+Run automatically; sleeps GPS when stationary",
+            repository.allDayTrackingEnabled
+        ) { checked ->
+            repository.allDayTrackingEnabled = checked
+            trackingService?.syncPocketForegroundAndWakeLock()
+        }
+        audioAndTogglesCard.addView(allDayAutoRow)
+        audioAndTogglesCard.addView(AthleticTheme.hairlineDivider(this, 2f))
+
+        voiceCoachRow = ModernSettingRow(
+            this,
+            "Track Split & Final-200m Kick Coach",
+            "Calls out 400m splits, 1,400m sprint kick & 1,600m finish verdict",
+            repository.voiceCoachEnabled
+        ) { checked -> repository.voiceCoachEnabled = checked }
+        audioAndTogglesCard.addView(voiceCoachRow)
+        audioAndTogglesCard.addView(AthleticTheme.hairlineDivider(this, 2f))
+
+        stepFallbackRow = ModernSettingRow(
+            this,
+            "Step-Stride Indoor & Curve Assist",
+            "Uses calibrated stride length indoors or when stadium GPS weakens",
+            repository.indoorStepFallbackEnabled
+        ) { checked -> repository.indoorStepFallbackEnabled = checked }
+        audioAndTogglesCard.addView(stepFallbackRow)
+        audioAndTogglesCard.addView(AthleticTheme.hairlineDivider(this, 2f))
+
+        autoCalSamsungRow = ModernSettingRow(
+            this,
+            "Samsung Health Stride Auto-Calibration",
+            "Tunes personal stride multiplier from Samsung Health ground truth",
+            repository.autoCalibrateFromSamsung
+        ) { checked ->
+            repository.autoCalibrateFromSamsung = checked
+            trackingService?.syncThresholdsFromPrefs()
+            renderSamsungComparisonCard(force = true)
+        }
+        audioAndTogglesCard.addView(autoCalSamsungRow)
+        audioAndTogglesCard.addView(AthleticTheme.hairlineDivider(this, 2f))
+
+        autoImportSamsungRow = ModernSettingRow(
+            this,
+            "14-Day Samsung / Watch Run Sync",
+            "Imports non-overlapping ≥600m runs into 7:15 ETA forecast",
+            repository.autoImportSamsungRuns
+        ) { checked -> repository.autoImportSamsungRuns = checked }
+        audioAndTogglesCard.addView(autoImportSamsungRow)
+
+        col.addView(audioAndTogglesCard)
+
+        // 4. Even-Split Pacing Reference Table Card
+        val tableCard = cardContainer()
+        tableCard.addView(AthleticTheme.sectionLabel(this, "EVEN-SPLIT CHECKPOINTS FOR 7:15 (435s)"))
+        val splitRows = listOf(
+            Triple("200 m (Half Lap)", "0:54.4", "13.24 km/h"),
+            Triple("400 m (Lap 1)", "1:48.8", "4:31.9 /km"),
+            Triple("800 m (Lap 2 • Half)", "3:37.5", "Controlled rhythm"),
+            Triple("1,200 m (Lap 3)", "5:26.3", "Hold ≥168 spm"),
+            Triple("1,400 m (Kick Bell)", "6:20.6", "All-out 200m sprint!"),
+            Triple("1,600 m (Finish)", "7:15.0", "QUALIFIED (40+ pts)")
+        )
+        val tableWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        for ((dist, split, note) in splitRows) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(11), dp(8), dp(11), dp(8))
+                background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 9f)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    .apply { bottomMargin = dp(5) }
+            }
+            row.addView(TextView(this).apply {
+                text = dist
+                textSize = 12f
+                typeface = AthleticTheme.FONT_SANS_MEDIUM
+                setTextColor(AthleticColors.TEXT_PRIMARY)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f)
+            })
+            row.addView(TextView(this).apply {
+                text = split
+                textSize = 12.5f
+                typeface = AthleticTheme.FONT_TABULAR_BOLD
+                setTextColor(AthleticColors.EMERALD_BRIGHT)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.7f)
+            })
+            row.addView(TextView(this).apply {
+                text = note
+                textSize = 11f
+                gravity = Gravity.END
+                setTextColor(AthleticColors.TEXT_SECONDARY)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.05f)
+            })
+            tableWrap.addView(row)
+        }
+        tableCard.addView(tableWrap)
+        col.addView(tableCard)
+
+        // 5. Live Sensor Diagnostics & Maintenance Card
+        val diagCard = cardContainer()
+        diagCard.addView(AthleticTheme.sectionLabel(this, "SENSOR FUSION DIAGNOSTICS & DATA"))
+        diagGpsText = TextView(this).apply {
+            text = "GPS Engine: Checking..."
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(8), 0, dp(3))
+        }
+        diagStepText = TextView(this).apply {
+            text = "Step / dt-Filter Engine: Checking..."
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(2), 0, dp(3))
+        }
+        diagStrideCalText = TextView(this).apply {
+            text = String.format("Effective Stride Scale: %.2fx", repository.effectiveStrideScale())
+            textSize = 12f
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            setPadding(0, dp(2), 0, dp(3))
+        }
+        diagStateText = TextView(this).apply {
+            text = "Live Gait Verdict: STANDING"
+            textSize = 12f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            setPadding(0, dp(2), 0, dp(10))
+        }
+        diagCard.addView(diagGpsText)
+        diagCard.addView(diagStepText)
+        diagCard.addView(diagStrideCalText)
+        diagCard.addView(diagStateText)
+
+        val maintRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        val backupBtn2 = AthleticTheme.createButton(this, "Backup / Restore", AthleticTheme.ButtonStyle.SECONDARY_SLATE, 42f).apply {
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(5) }
+            setOnClickListener {
+                SessionDialogs.showBackupAndRestoreDialog(this@MainActivity, repository) {
+                    refreshCachedDailyHistory(forceRender = true)
+                    refreshProgressDashboard()
+                }
+            }
+        }
+        val resetDailyBtn = AthleticTheme.createButton(this, "Reset Today", AthleticTheme.ButtonStyle.SUBTLE_OUTLINE, 42f).apply {
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(5) }
             setOnClickListener {
                 AlertDialog.Builder(this@MainActivity)
-                    .setTitle("Reset today's whole-day counters?")
-                    .setMessage("This resets today's Walk & Jog+Run counters to 0:00 (saved 1.6 km sessions are untouched).")
+                    .setTitle("Reset Today's Daily Counters?")
+                    .setMessage("Resets today's Walk & Jog+Run counters to 0:00 (saved 1.6 km runs are untouched).")
                     .setPositiveButton("Reset Today") { _, _ ->
                         trackingService?.resetTodayDailySummary()
                         refreshCachedDailyHistory(forceRender = true)
@@ -1551,113 +1850,55 @@ class MainActivity : AppCompatActivity() {
                     .show()
             }
         }
-        val resetStrideCalBtn = Button(this).apply {
-            text = "Reset Personal Stride Calibration (1.00x)"
-            textSize = 12f
-            isAllCaps = false
-            setTextColor(0xFF94A3B8.toInt())
-            background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(10))
-            setOnClickListener {
-                repository.strideCalibrationScale = 1.0
-                trackingService?.syncThresholdsFromPrefs()
-                renderSamsungComparisonCard(force = true)
-                Toast.makeText(this@MainActivity, "Stride calibration reset to 1.00x", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        settingsCard.addView(allDayAutoSwitch)
-        settingsCard.addView(stateAudioSwitch)
-        settingsCard.addView(voiceSwitch)
-        settingsCard.addView(stepFallbackSwitch)
-        settingsCard.addView(autoCalibrateSamsungSwitch)
-        settingsCard.addView(autoImportSamsungRunsSwitch)
-        settingsCard.addView(testStateAudioBtn)
-        settingsCard.addView(resetTodayDailyBtn)
-        settingsCard.addView(resetStrideCalBtn)
-        col.addView(settingsCard)
-
-        // Live Sensor Diagnostics Card
-        val diagCard = cardContainer()
-        diagCard.addView(sectionHeader("LIVE HARDWARE SENSOR FUSION DIAGNOSTICS"))
-        diagGpsText = TextView(this).apply {
-            text = "GPS Receiver: Checking..."
-            textSize = 12.5f
-            setTextColor(0xFFCBD5E1.toInt())
-            setPadding(0, dp(8), 0, dp(4))
-        }
-        diagStepText = TextView(this).apply {
-            text = "Step / Cadence Engine: Checking..."
-            textSize = 12.5f
-            setTextColor(0xFFCBD5E1.toInt())
-            setPadding(0, dp(2), 0, dp(4))
-        }
-        diagStrideCalText = TextView(this).apply {
-            text = String.format("Samsung Health Stride Scale: %.2fx", repository.strideCalibrationScale)
-            textSize = 12.5f
-            setTextColor(0xFF38BDF8.toInt())
-            setPadding(0, dp(2), 0, dp(4))
-        }
-        diagStateText = TextView(this).apply {
-            text = "Classifier Verdict: STANDING"
-            textSize = 12.5f
-            setTextColor(0xFF10B981.toInt())
-            setPadding(0, dp(2), 0, dp(4))
-        }
-        diagCard.addView(diagGpsText)
-        diagCard.addView(diagStepText)
-        diagCard.addView(diagStrideCalText)
-        diagCard.addView(diagStateText)
+        maintRow.addView(backupBtn2)
+        maintRow.addView(resetDailyBtn)
+        diagCard.addView(maintRow)
         col.addView(diagCard)
 
-        // OTA Auto-Update Card
+        // 6. GitHub OTA Auto-Update Card
         val updateCard = cardContainer()
-        updateCard.addView(sectionHeader("APP VERSION & GITHUB OTA AUTO-UPDATE"))
+        updateCard.addView(AthleticTheme.sectionLabel(this, "APP VERSION & GITHUB OTA AUTO-UPDATE"))
         val (instCode, instName) = appUpdater.getInstalledVersion()
         updateStatusText = TextView(this).apply {
-            text = "Installed: v$instName (Build $instCode) • Source: GitHub Releases"
+            text = "Installed: v$instName (Build $instCode)  •  GitHub Releases OTA"
             textSize = 12.5f
-            setTextColor(0xFFCBD5E1.toInt())
+            setTextColor(AthleticColors.TEXT_SECONDARY)
             setPadding(0, dp(8), 0, dp(6))
         }
         updateCard.addView(updateStatusText)
 
-        val autoUpdateSwitch = Switch(this).apply {
-            text = "Background & Launch Auto-Update (Checks every 15 min + Notification)"
-            setTextColor(0xFFE2E8F0.toInt())
-            textSize = 13f
-            isChecked = appUpdater.autoCheckOnLaunch
-            setPadding(0, dp(4), 0, dp(10))
-            setOnCheckedChangeListener { _, checked -> appUpdater.autoCheckOnLaunch = checked }
-        }
-        updateCard.addView(autoUpdateSwitch)
+        val autoUpdateRow = ModernSettingRow(
+            this,
+            "Automatic OTA Update Checks",
+            "Checks GitHub Releases in background & notifies on new builds",
+            appUpdater.autoCheckOnLaunch
+        ) { checked -> appUpdater.autoCheckOnLaunch = checked }
+        updateCard.addView(autoUpdateRow)
 
-        checkUpdateBtn = Button(this).apply {
-            text = "Check for App Updates Now"
+        checkUpdateBtn = AthleticTheme.createButton(
+            this,
+            "Check for App Updates Now",
+            AthleticTheme.ButtonStyle.PRIMARY_CYAN,
+            46f
+        ).apply {
             textSize = 13f
-            isAllCaps = false
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF04130D.toInt())
-            background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(10))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(8) }
             setOnClickListener { performUpdateCheck(manualUserTrigger = true) }
         }
         updateCard.addView(checkUpdateBtn)
         col.addView(updateCard)
 
-        refreshSettingsHighlights()
+        refreshBatterySettingsState()
         scroll.addView(col)
         return scroll
     }
 
     // =========================================================================
-    // LIVE RENDERING & STATE UPDATES
+    // LIVE TELEMETRY RENDERING
     // =========================================================================
-    private fun formatDistanceShort(meters: Double): String {
-        return if (meters >= 1000.0) {
-            String.format("%.2f km", meters / 1000.0)
-        } else {
-            "${meters.toInt()} m"
-        }
-    }
+    private fun formatDistanceShort(meters: Double): String =
+        if (meters >= 1000.0) String.format("%.2f km", meters / 1000.0) else "${meters.toInt()} m"
 
     private fun refreshCachedDailyHistory(forceRender: Boolean = false) {
         val today = LocalDate.now().toString()
@@ -1679,354 +1920,427 @@ class MainActivity : AppCompatActivity() {
         lastDailyHistoryKey = key
         lastDailyHistoryRenderMs = nowMs
 
-        val rows = mutableListOf(todaySummary)
-        rows.addAll(cachedPastDailyLogs)
-
+        val rows = mutableListOf(todaySummary).apply { addAll(cachedPastDailyLogs) }
         dailyHistoryListLayout.removeAllViews()
         for ((idx, day) in rows.withIndex()) {
             val isToday = idx == 0
             val card = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(dp(11), dp(9), dp(11), dp(9))
-                background = roundedBox(
-                    if (isToday) 0xFF0F1D2E.toInt() else 0xFF0B1120.toInt(),
-                    if (isToday) 0xFF1E3A5F.toInt() else 0xFF1E293B.toInt(),
-                    dp(10)
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = AthleticTheme.solidPill(
+                    this@MainActivity,
+                    if (isToday) 0xFF0E1D30.toInt() else AthleticColors.SURFACE_RECESSED,
+                    if (isToday) AthleticColors.HERO_CYAN_BORDER else AthleticColors.BORDER_SUBTLE,
+                    11f
                 )
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(7) }
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    .apply { bottomMargin = dp(7) }
             }
-
             val top = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            val dateTag = when {
-                isToday -> "TODAY (${day.dateIso})"
-                day.isDemo -> "${day.dateIso} • DEMO"
-                else -> day.dateIso
-            }
             top.addView(TextView(this).apply {
-                text = dateTag
+                text = when {
+                    isToday -> "TODAY  •  ${day.dateIso}"
+                    day.isDemo -> "${day.dateIso}  •  SAMPLE"
+                    else -> day.dateIso
+                }
                 textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(if (isToday) 0xFF38BDF8.toInt() else 0xFFE2E8F0.toInt())
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setTextColor(if (isToday) AthleticColors.CYAN_BRIGHT else AthleticColors.TEXT_PRIMARY)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
             top.addView(TextView(this).apply {
-                text = "${formatDistanceShort(day.totalDistanceMeters)} • ${day.totalSteps} steps"
+                text = "${formatDistanceShort(day.totalDistanceMeters)}  •  ${day.totalSteps} steps"
                 textSize = 12f
-                typeface = Typeface.MONOSPACE
-                setTextColor(0xFFCBD5E1.toInt())
+                typeface = AthleticTheme.FONT_TABULAR_BOLD
+                setTextColor(AthleticColors.TEXT_PRIMARY)
             })
             card.addView(top)
-
             card.addView(TextView(this).apply {
-                text = "Jog+Run ${TsPoliceBenchmark.formatDuration(day.jogRunCombinedSec)}  •  " +
-                    "Walk ${TsPoliceBenchmark.formatDuration(day.walkingSec)}  •  " +
-                    "Max ${TsPoliceBenchmark.formatPacePerKm(day.maxSpeedMps)} (${day.maxCadenceSpm.roundToInt()} spm)"
+                text = "Jog+Run ${TsPoliceBenchmark.formatDuration(day.jogRunCombinedSec)}   •   " +
+                    "Walk ${TsPoliceBenchmark.formatDuration(day.walkingSec)}   •   " +
+                    "Peak ${TsPoliceBenchmark.formatPacePerKm(day.maxSpeedMps)}"
                 textSize = 11.5f
-                setTextColor(0xFF94A3B8.toInt())
-                setPadding(0, dp(3), 0, 0)
+                setTextColor(AthleticColors.TEXT_SECONDARY)
+                setPadding(0, dp(4), 0, 0)
             })
-
             dailyHistoryListLayout.addView(card)
         }
     }
 
     private fun renderLiveTelemetry(snap: LiveTelemetry) {
         currentlyRecording = snap.isRecording
-        refreshStateAudioChip()
+        refreshHeaderAudioPill()
         val targetSec = repository.targetTimeSec
         val daily = snap.dailySummary
 
-        // Auto-switch to the 1.6 km PT Trial view whenever a PT Trial transitions into ARMED or RUNNING
+        // Auto-switch sub-tab when PT Trial or Interval session activates
         if (snap.ptTrialPhase != lastRenderedPtPhase) {
-            if (snap.ptTrialPhase != PtTrialPhase.IDLE) {
-                selectTrackerSubTab(1)
-            }
+            if (snap.ptTrialPhase != PtTrialPhase.IDLE) selectTrackerSubTab(1)
             lastRenderedPtPhase = snap.ptTrialPhase
         }
+        if (snap.intervalState.phase != lastRenderedIntervalPhase) {
+            if (snap.intervalState.phase != IntervalPhase.IDLE) selectTrackerSubTab(2)
+            lastRenderedIntervalPhase = snap.intervalState.phase
+        }
 
-        // Update sub-tab badge label if PT Trial is active
         subTabPtBtn.text = when (snap.ptTrialPhase) {
-            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> "1.6 km PT (READY)"
-            PtTrialPhase.RUNNING_TRIAL -> "1.6 km PT (LIVE)"
-            PtTrialPhase.IDLE -> "1.6 km PT Trial"
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> "1.6K (Armed)"
+            PtTrialPhase.RUNNING_TRIAL -> "1.6K (LIVE)"
+            PtTrialPhase.IDLE -> "1.6K Trial"
+        }
+        subTabIntervalsBtn.text = if (snap.intervalState.phase != IntervalPhase.IDLE) {
+            "400m (${snap.intervalState.currentRep}/${snap.intervalState.totalReps})"
+        } else {
+            "400m Coach"
         }
 
         // =====================================================================
-        // A. RENDER ALWAYS-ON ALL-DAY OPEN MODE (SUB-VIEW 0)
+        // A. RENDER TODAY (SUB-VIEW 0)
         // =====================================================================
         val allDayOn = repository.allDayTrackingEnabled
-        allDayLiveChip.text = if (allDayOn) "24/7 ACTIVE" else "PAUSED"
-        allDayLiveChip.background = roundedBox(
-            if (allDayOn) 0xFF10B981.toInt() else 0xFF475569.toInt(),
-            if (allDayOn) 0xFF10B981.toInt() else 0xFF475569.toInt(),
-            dp(10)
-        )
-        allDayStateBadge.text = snap.motionState.badgeText
-        allDayStateBadge.setTextColor(
-            if (snap.motionState == MotionState.STANDING) 0xFFCBD5E1.toInt() else snap.motionState.colorArgb
-        )
-        allDayStatusSub.text = when (snap.ptTrialPhase) {
-            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN ->
-                "1.6 km PT Trial is ARMED & waiting for Jog/Run • Whole-day counters remain active."
-            PtTrialPhase.RUNNING_TRIAL ->
-                "1.6 km PT Trial in progress (${snap.distanceMeters.toInt()}m / 1,600m) • Tap '1.6 km PT' above."
-            PtTrialPhase.IDLE ->
-                "No Start button needed — automatically counts whole-day Walk & Jog+Run time (ignores sitting & bike)."
+        allDayLiveChip.text = when {
+            !allDayOn -> "PAUSED"
+            snap.isLowPowerStandby -> "BATTERY SAVER"
+            snap.isGpsLocked -> "GPS ACTIVE"
+            else -> "24/7 ACTIVE"
         }
+        val chipCol = if (allDayOn) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_MUTED
+        allDayLiveChip.background = AthleticTheme.solidPill(this, chipCol, chipCol, 10f, 0f)
 
-        // Hero Cards: Combined Jog + Run Today & Walking Today
+        dailyRingsView.updateMetrics(daily.jogRunCombinedSec, daily.totalSteps)
         dailyJogRunTimeVal.text = TsPoliceBenchmark.formatDuration(daily.jogRunCombinedSec)
-        dailyJogRunDistSub.text = "${formatDistanceShort(daily.jogRunCombinedMeters)} jog + run"
-        dailyJogRunSplitSub.text =
-            "Jog ${TsPoliceBenchmark.formatDuration(daily.joggingSec)} • Run ${TsPoliceBenchmark.formatDuration(daily.runningSec)}"
-
+        dailyJogRunDistSub.text = "${formatDistanceShort(daily.jogRunCombinedMeters)}  •  Jog ${TsPoliceBenchmark.formatDuration(daily.joggingSec)} / Run ${TsPoliceBenchmark.formatDuration(daily.runningSec)}"
         dailyWalkTimeVal.text = TsPoliceBenchmark.formatDuration(daily.walkingSec)
-        dailyWalkDistSub.text = "${formatDistanceShort(daily.walkingMeters)} walked"
-        dailyWalkStepsSub.text = "${daily.totalSteps} steps today"
+        dailyWalkDistSub.text = "${formatDistanceShort(daily.walkingMeters)} walked today"
 
-        // 3x2 Peak & Live Tiles
-        dailyMaxPaceVal.text = TsPoliceBenchmark.formatPacePerKm(daily.maxSpeedMps)
-        dailyMaxPaceSub.text = String.format("Peak %.1f km/h today", daily.maxSpeedMps * 3.6)
-
-        dailyMaxCadenceVal.text = "${daily.maxCadenceSpm.roundToInt()} spm"
-        dailyMaxCadenceSub.text = if (daily.maxCadenceSpm >= 165.0) "Target stride reached!" else "Peak stride rate today"
-
-        openLivePaceVal.text = TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)
-        openLivePaceSub.text = String.format("%.1f km/h live speed", snap.currentSpeedMps * 3.6)
-
-        openLiveCadenceVal.text = "${snap.cadenceSpm.roundToInt()} spm"
-        openLiveCadenceSub.text = String.format("%.1f m/s² motion", snap.dynamicAccelRms)
-
-        dailyTotalDistVal.text = formatDistanceShort(daily.totalDistanceMeters)
-        dailyTotalDistSub.text = "${daily.totalSteps} total steps"
-
-        openGpsStatusVal.text = if (snap.isGpsLocked) "GPS Locked" else "Step-Stride"
-        openGpsStatusVal.setTextColor(if (snap.isGpsLocked) 0xFF10B981.toInt() else 0xFF38BDF8.toInt())
-        openGpsStatusSub.text = when {
-            snap.isGpsLocked && snap.gpsAccuracyMeters != null ->
-                String.format("±%.0fm sky lock", snap.gpsAccuracyMeters)
-            snap.gpsAccuracyMeters != null ->
-                String.format("±%.0fm • Step active", snap.gpsAccuracyMeters)
-            else -> "Pocket / Indoor active"
+        allDayGaitPill.text = when {
+            snap.ptTrialPhase == PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN ->
+                "1.6 km PT Trial Armed  •  Waiting for first Jog/Run stride"
+            snap.ptTrialPhase == PtTrialPhase.RUNNING_TRIAL ->
+                "1.6 km PT Trial Live: ${snap.distanceMeters.toInt()}m / 1,600m"
+            snap.isLowPowerStandby ->
+                "Standing  •  GPS Sleeping (0% Battery Drain — Wakes on Steps)"
+            snap.motionState == MotionState.STANDING ->
+                "Standing (Auto-Paused)  •  Step-Stride Ready"
+            else ->
+                "${snap.motionState.label}  •  ${TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)} (${snap.cadenceSpm.roundToInt()} spm)"
         }
-
-        // Whole-Day Gait Bar
-        dailyGaitBar.setDurations(daily.runningSec, daily.joggingSec, daily.walkingSec, 0.0)
-        dailyGaitLegendText.text =
-            "Combined Jog+Run ${TsPoliceBenchmark.formatDuration(daily.jogRunCombinedSec)} " +
-                "(Run ${TsPoliceBenchmark.formatDuration(daily.runningSec)} • Jog ${TsPoliceBenchmark.formatDuration(daily.joggingSec)})  •  " +
-                "Walk ${TsPoliceBenchmark.formatDuration(daily.walkingSec)}"
+        allDayGaitPill.setTextColor(
+            if (snap.motionState == MotionState.STANDING) AthleticColors.TEXT_SECONDARY else snap.motionState.colorArgb
+        )
 
         launchPtFromOpenBtn.text = when (snap.ptTrialPhase) {
-            PtTrialPhase.IDLE -> "START 1.6 KM PT TRIAL (Starts Only When You Jog/Run) →"
-            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> "1.6 KM PT TRIAL ARMED • VIEW / CANCEL →"
-            PtTrialPhase.RUNNING_TRIAL -> "VIEW LIVE 1.6 KM PT TRIAL (${snap.distanceMeters.toInt()}m) →"
+            PtTrialPhase.IDLE -> "Arm 1.6 km PT Trial (Launches on Jog/Run)  →"
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> "1.6 km PT Trial Armed  •  Open Cockpit  →"
+            PtTrialPhase.RUNNING_TRIAL -> "View Live 1.6 km PT Trial (${snap.distanceMeters.toInt()}m)  →"
         }
+
+        dailyMaxPaceVal.text = TsPoliceBenchmark.formatPacePerKm(daily.maxSpeedMps)
+        dailyMaxPaceSub.text = String.format("Max %.1f km/h today", daily.maxSpeedMps * 3.6)
+        dailyMaxCadenceVal.text = "${daily.maxCadenceSpm.roundToInt()} spm"
+        dailyMaxCadenceSub.text = if (daily.maxCadenceSpm >= 168.0) "Target stride hit!" else "Peak stride rate"
+        openLivePaceVal.text = TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)
+        openLivePaceSub.text = "${snap.cadenceSpm.roundToInt()} spm live cadence"
+        dailyTotalDistVal.text = formatDistanceShort(daily.totalDistanceMeters)
+        dailyTotalDistSub.text = if (snap.isGpsLocked) {
+            "GPS ±${snap.gpsAccuracyMeters?.toInt() ?: 0}m + Stride"
+        } else {
+            "Calibrated Stride (${String.format("%.2fx", repository.effectiveStrideScale())})"
+        }
+
+        dailyGaitBar.setDurations(daily.runningSec, daily.joggingSec, daily.walkingSec, 0.0)
+        dailyGaitLegendText.text =
+            "Run ${TsPoliceBenchmark.formatDuration(daily.runningSec)}   •   " +
+                "Jog ${TsPoliceBenchmark.formatDuration(daily.joggingSec)}   •   " +
+                "Walk ${TsPoliceBenchmark.formatDuration(daily.walkingSec)}"
 
         latestDailySummaryForCompare = daily
         renderSamsungComparisonCard(force = false)
         renderDailyHistoryCards(daily)
 
         // =====================================================================
-        // B. RENDER 1.6 KM PT TRIAL (SUB-VIEW 1)
+        // B. RENDER 1.6 KM PT TRIAL COCKPIT (SUB-VIEW 1)
         // =====================================================================
+        val acc = snap.gpsAccuracyMeters
+        when {
+            snap.isGpsLocked && acc != null && acc <= 12f -> {
+                ptGpsReadinessPill.text = "TRACK GPS READY ±${acc.toInt()}m"
+                ptGpsReadinessPill.setTextColor(AthleticColors.EMERALD_BRIGHT)
+                ptGpsReadinessPill.background = AthleticTheme.solidPill(this, 0x2210B981, AthleticColors.HERO_EMERALD_BORDER, 10f)
+            }
+            acc != null && acc <= 26f -> {
+                ptGpsReadinessPill.text = "GPS WARMING ±${acc.toInt()}m"
+                ptGpsReadinessPill.setTextColor(AthleticColors.AMBER_BRIGHT)
+                ptGpsReadinessPill.background = AthleticTheme.solidPill(this, 0x22F59E0B, AthleticColors.HERO_AMBER_BORDER, 10f)
+            }
+            else -> {
+                ptGpsReadinessPill.text = "STRIDE FUSION READY"
+                ptGpsReadinessPill.setTextColor(AthleticColors.CYAN_BRIGHT)
+                ptGpsReadinessPill.background = AthleticTheme.solidPill(this, 0x2238BDF8, AthleticColors.HERO_CYAN_BORDER, 10f)
+            }
+        }
+
         paceArcGauge.updateState(
             distanceMeters = snap.distanceMeters,
             activeDurationSec = snap.activeDurationSec,
             targetSec = targetSec,
             motionState = snap.motionState,
             recording = snap.ptTrialPhase == PtTrialPhase.RUNNING_TRIAL,
-            armed = snap.ptTrialPhase == PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN
+            armed = snap.ptTrialPhase == PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN,
+            pausedPenaltySec = snap.pausedDurationSec
         )
 
         metricPaceVal.text = TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)
         metricPaceSub.text = String.format("%.1f km/h ground speed", snap.currentSpeedMps * 3.6)
-
-        metricCadenceVal.text = String.format("%d spm", snap.cadenceSpm.roundToInt())
+        metricCadenceVal.text = "${snap.cadenceSpm.roundToInt()} spm"
         metricCadenceSub.text = "${snap.totalSteps} steps today"
 
         val projSec = if (snap.ptTrialPhase == PtTrialPhase.RUNNING_TRIAL) {
-            TsPoliceBenchmark.projected1600mFinishSec(
-                snap.distanceMeters,
-                snap.activeDurationSec,
-                snap.currentSpeedMps
-            )
+            TsPoliceBenchmark.projected1600mFinishSec(snap.distanceMeters, snap.activeDurationSec, snap.currentSpeedMps)
         } else null
         metricProjVal.text = if (projSec != null) TsPoliceBenchmark.formatDuration(projSec) else "--:--"
         metricProjVal.setTextColor(
             when {
-                projSec == null -> 0xFFF8FAFC.toInt()
-                projSec <= targetSec -> 0xFF10B981.toInt()
-                else -> 0xFFF59E0B.toInt()
+                projSec == null -> AthleticColors.TEXT_PRIMARY
+                projSec <= targetSec -> AthleticColors.EMERALD_BRIGHT
+                else -> AthleticColors.AMBER_BRIGHT
             }
         )
-        metricProjSub.text = "Goal < ${TsPoliceBenchmark.formatDuration(targetSec)}"
+        metricProjSub.text = "Cutoff < ${TsPoliceBenchmark.formatDuration(targetSec)}"
 
-        metricSensorVal.text = String.format("%.1f m/s² RMS", snap.dynamicAccelRms)
-        metricSensorSub.text = when {
-            snap.isGpsLocked && snap.gpsAccuracyMeters != null ->
-                String.format("GPS Locked (±%.0fm)", snap.gpsAccuracyMeters)
-            snap.gpsAccuracyMeters != null ->
-                String.format("GPS Weak (±%.0fm) • Step Est.", snap.gpsAccuracyMeters)
-            else -> "Indoor / Step-Stride Mode"
+        metricSensorVal.text = String.format("%.1f m/s²", snap.dynamicAccelRms)
+        metricSensorSub.text = if (snap.isGpsLocked && acc != null) {
+            "Curve-Adjusted GPS (±${acc.toInt()}m)"
+        } else {
+            "Calibrated Stride Mode"
         }
 
-        // PT Trial Gait breakdown bar
         gaitBar.setDurations(snap.runningSec, snap.joggingSec, snap.walkingSec, snap.pausedDurationSec)
         gaitLegendText.text =
             "Run ${TsPoliceBenchmark.formatDuration(snap.runningSec)}  •  " +
                 "Jog ${TsPoliceBenchmark.formatDuration(snap.joggingSec)}  •  " +
                 "Walk ${TsPoliceBenchmark.formatDuration(snap.walkingSec)}  •  " +
-                "Pause ${TsPoliceBenchmark.formatDuration(snap.pausedDurationSec)}"
+                "Stopped ${TsPoliceBenchmark.formatDuration(snap.pausedDurationSec)}"
 
-        // PT Trial Action Buttons across IDLE -> ARMED_WAITING_FOR_JOG_RUN -> RUNNING_TRIAL
         when (snap.ptTrialPhase) {
             PtTrialPhase.IDLE -> {
-                primaryActionBtn.text = "START 1.6 KM PT TRIAL (Starts When You Jog/Run)"
-                primaryActionBtn.setTextColor(0xFF04130D.toInt())
-                primaryActionBtn.background = roundedBox(0xFF10B981.toInt(), 0xFF10B981.toInt(), dp(14))
+                primaryActionBtn.visibility = View.VISIBLE
+                ptRunningControlsRow.visibility = View.GONE
+                primaryActionBtn.text = "ARM 1.6 KM PT TRIAL (Starts on Jog/Run)"
+                AthleticTheme.applyButtonStyle(this, primaryActionBtn, AthleticTheme.ButtonStyle.PRIMARY_EMERALD)
                 primaryActionBtn.setOnClickListener {
                     requestNeededPermissionsIfMissing(silentCheckOnly = false)
                     trackingService?.armPtTrial()
                 }
                 ptArmHintText.text =
-                    "Tap Start, put phone in pocket & walk to the line — timer stays at 0:00 until you start jogging or running."
-                ptArmHintText.setTextColor(0xFF94A3B8.toInt())
+                    "Arm trial, pocket your phone & walk to the line — official unpaused clock starts at 0:00 on your first jog/run stride."
+                ptArmHintText.setTextColor(AthleticColors.TEXT_SECONDARY)
 
                 secondaryActionBtn.visibility = View.VISIBLE
-                secondaryActionBtn.text = "← Back to All-Day Open Mode"
-                secondaryActionBtn.setTextColor(0xFF38BDF8.toInt())
-                secondaryActionBtn.background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(12))
+                secondaryActionBtn.text = "← Back to Today Overview"
                 secondaryActionBtn.setOnClickListener { selectTrackerSubTab(0) }
             }
 
             PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> {
-                primaryActionBtn.text = "WAITING FOR JOG / RUN... (Tap to Cancel)"
-                primaryActionBtn.setTextColor(0xFF04130D.toInt())
-                primaryActionBtn.background = roundedBox(0xFFF59E0B.toInt(), 0xFFF59E0B.toInt(), dp(14))
+                primaryActionBtn.visibility = View.VISIBLE
+                ptRunningControlsRow.visibility = View.GONE
+                primaryActionBtn.text = "ARMED • WAITING FOR JOG / RUN..."
+                AthleticTheme.applyButtonStyle(this, primaryActionBtn, AthleticTheme.ButtonStyle.WARNING_AMBER)
+                // Pocket Mis-Tap Protection: confirm before disarming!
                 primaryActionBtn.setOnClickListener {
-                    trackingService?.cancelPtTrial()
+                    AlertDialog.Builder(this)
+                        .setTitle("Disarm 1.6 km PT Trial?")
+                        .setMessage("Keep the trial armed while your phone is in your pocket, or cancel?")
+                        .setPositiveButton("Cancel Trial") { _, _ -> trackingService?.cancelPtTrial() }
+                        .setNegativeButton("Keep Armed", null)
+                        .show()
                 }
                 ptArmHintText.text =
-                    "Detected now: ${snap.motionState.label} • Standing & Walking ignored. Start jogging or running to launch!"
-                ptArmHintText.setTextColor(0xFFFDE68A.toInt())
-
+                    "Live Gait: ${snap.motionState.label}  •  Standing & Walking ignored. Start jogging or running to launch!"
+                ptArmHintText.setTextColor(AthleticColors.AMBER_BRIGHT)
                 secondaryActionBtn.visibility = View.GONE
             }
 
             PtTrialPhase.RUNNING_TRIAL -> {
-                primaryActionBtn.text = "FINISH EARLY & SAVE PT TRIAL"
-                primaryActionBtn.setTextColor(0xFFF8FAFC.toInt())
-                primaryActionBtn.background = roundedBox(0xFFEF4444.toInt(), 0xFFEF4444.toInt(), dp(14))
-                primaryActionBtn.setOnClickListener {
-                    val id = trackingService?.finishWorkout(forceSave = true)
-                    if (id != null) {
-                        Toast.makeText(this, "PT Trial saved! Updating your 7:15 ETA forecast.", Toast.LENGTH_LONG).show()
-                        refreshProgressDashboard()
-                        selectTab(1)
-                    } else {
-                        Toast.makeText(this, "Trial too short to log (<50m).", Toast.LENGTH_SHORT).show()
-                    }
-                }
+                primaryActionBtn.visibility = View.GONE
+                ptRunningControlsRow.visibility = View.VISIBLE
                 ptArmHintText.text =
-                    "Auto-finishes & saves at 1,600 m • Calls out every 400 m lap split"
-                ptArmHintText.setTextColor(0xFF34D399.toInt())
+                    "Auto-finishes at 1,600m  •  400m splits + 1,400m kick bell  •  Official unpaused clock"
+                ptArmHintText.setTextColor(AthleticColors.EMERALD_BRIGHT)
 
                 secondaryActionBtn.visibility = View.VISIBLE
-                secondaryActionBtn.text = "Cancel PT Trial (Don't Save)"
-                secondaryActionBtn.setTextColor(0xFF94A3B8.toInt())
-                secondaryActionBtn.background = roundedBox(0xFF111827.toInt(), 0xFF334155.toInt(), dp(12))
+                secondaryActionBtn.text = "Discard Trial Without Saving"
                 secondaryActionBtn.setOnClickListener {
                     AlertDialog.Builder(this)
-                        .setTitle("Cancel current 1.6 km PT Trial?")
-                        .setMessage("This stops the 1.6 km stopwatch without saving (whole-day open tracking stays intact).")
-                        .setPositiveButton("Cancel Trial") { _, _ -> trackingService?.cancelPtTrial() }
+                        .setTitle("Discard Active 1.6 km PT Trial?")
+                        .setMessage("This aborts the current 1.6 km trial without saving.")
+                        .setPositiveButton("Discard Trial") { _, _ -> trackingService?.cancelPtTrial() }
                         .setNegativeButton("Keep Running", null)
                         .show()
                 }
             }
         }
 
-        // Auto-completion jump to Progress tab when 1.6km PT trial finishes hands-free!
+        // Auto-jump to Progress tab when a PT Trial or Interval session completes hands-free!
         if (snap.ptTrialPhase == PtTrialPhase.IDLE &&
+            snap.intervalState.phase == IntervalPhase.IDLE &&
             snap.justFinishedSessionId != null &&
             snap.justFinishedSessionId != lastHandledFinishId
         ) {
             lastHandledFinishId = snap.justFinishedSessionId
             refreshProgressDashboard()
-            Toast.makeText(this, "1.6 km PT Trial Complete! Saved to Progress.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Session Complete! Saved to Progress & Merit Forecast.", Toast.LENGTH_LONG).show()
             selectTab(1)
         }
 
-        // Render 400m splits
+        // Render Live 400m Lap Splits
         splitsListLayout.removeAllViews()
         if (snap.lapSplits.isEmpty()) {
             splitsListLayout.addView(TextView(this).apply {
-                text = "Splits record automatically every 400m (400m • 800m • 1200m • 1600m)."
+                text = "Splits record automatically at 400m • 800m • 1,200m • 1,600m (or tap '+ Snap 400m Lap' at the chalk line)."
                 textSize = 12f
-                setTextColor(0xFF64748B.toInt())
+                setTextColor(AthleticColors.TEXT_MUTED)
             })
         } else {
             val targetLap = TsPoliceBenchmark.targetLap400mSec(targetSec)
             for (sp in snap.lapSplits) {
-                val diff = sp.lapDurationSec - targetLap
+                val fast = sp.lapDurationSec <= targetLap
                 val row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    setPadding(dp(8), dp(6), dp(8), dp(6))
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(10), dp(7), dp(10), dp(7))
+                    background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 9f)
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                        .apply { bottomMargin = dp(5) }
                 }
                 row.addView(TextView(this).apply {
                     text = "Lap ${sp.lapNumber} (${sp.distanceMeters.toInt()}m)"
                     textSize = 12.5f
-                    setTextColor(0xFFE2E8F0.toInt())
+                    typeface = AthleticTheme.FONT_SANS_MEDIUM
+                    setTextColor(AthleticColors.TEXT_PRIMARY)
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.1f)
                 })
                 row.addView(TextView(this).apply {
                     text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec, true)
-                    textSize = 12.5f
-                    typeface = Typeface.MONOSPACE
-                    setTextColor(if (diff <= 0.0) 0xFF10B981.toInt() else 0xFFF59E0B.toInt())
+                    textSize = 13f
+                    typeface = AthleticTheme.FONT_TABULAR_BOLD
+                    setTextColor(if (fast) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.8f)
                 })
                 row.addView(TextView(this).apply {
-                    text = "${sp.dominantState.label.substringBefore(" ")} (${TsPoliceBenchmark.formatDuration(sp.cumulativeSec)})"
+                    text = "Cum ${TsPoliceBenchmark.formatDuration(sp.cumulativeSec)}"
                     textSize = 11.5f
                     gravity = Gravity.END
-                    setTextColor(0xFF94A3B8.toInt())
-                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.1f)
+                    setTextColor(AthleticColors.TEXT_SECONDARY)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f)
                 })
                 splitsListLayout.addView(row)
             }
         }
 
-        // Tab 3 diagnostics
-        diagGpsText.text = if (snap.isGpsLocked) {
-            "GPS Receiver: LOCKED (±${snap.gpsAccuracyMeters?.toInt() ?: 0}m) • Speed ${String.format("%.2f m/s", snap.currentSpeedMps)}"
+        // =====================================================================
+        // C. RENDER 400M INTERVAL COACH (SUB-VIEW 2)
+        // =====================================================================
+        val iv = snap.intervalState
+        intervalDialView.update(iv)
+        when (iv.phase) {
+            IntervalPhase.IDLE, IntervalPhase.COMPLETED -> {
+                intervalPrimaryBtn.text = "Start $selectedIntervalReps × 400m Interval Session"
+                AthleticTheme.applyButtonStyle(this, intervalPrimaryBtn, AthleticTheme.ButtonStyle.WARNING_AMBER)
+                intervalPrimaryBtn.setOnClickListener {
+                    requestNeededPermissionsIfMissing(silentCheckOnly = false)
+                    trackingService?.startIntervalWorkout(selectedIntervalReps, 90.0)
+                }
+                intervalSecondaryBtn.visibility = View.GONE
+            }
+            IntervalPhase.RUNNING_REP -> {
+                intervalPrimaryBtn.text = "Rep ${iv.currentRep}/${iv.totalReps} in Progress (${iv.repDistanceMeters.toInt()}m / 400m)"
+                AthleticTheme.applyButtonStyle(this, intervalPrimaryBtn, AthleticTheme.ButtonStyle.PRIMARY_EMERALD)
+                intervalPrimaryBtn.setOnClickListener { }
+                intervalSecondaryBtn.visibility = View.VISIBLE
+                intervalSecondaryBtn.text = "Stop Interval Workout"
+                intervalSecondaryBtn.setOnClickListener {
+                    AlertDialog.Builder(this)
+                        .setTitle("Stop 400m Interval Session?")
+                        .setPositiveButton("Stop") { _, _ -> trackingService?.cancelIntervalWorkout() }
+                        .setNegativeButton("Keep Going", null)
+                        .show()
+                }
+            }
+            IntervalPhase.REST_COUNTDOWN -> {
+                intervalPrimaryBtn.text = "Start Rep ${iv.currentRep + 1} Now (Skip Rest)"
+                AthleticTheme.applyButtonStyle(this, intervalPrimaryBtn, AthleticTheme.ButtonStyle.PRIMARY_CYAN)
+                intervalPrimaryBtn.setOnClickListener { trackingService?.skipIntervalRestNow() }
+                intervalSecondaryBtn.visibility = View.VISIBLE
+                intervalSecondaryBtn.text = "End Session"
+                intervalSecondaryBtn.setOnClickListener { trackingService?.cancelIntervalWorkout() }
+            }
+        }
+
+        intervalSplitsLayout.removeAllViews()
+        if (iv.completedRepSplitsSec.isEmpty()) {
+            intervalSplitsLayout.addView(TextView(this).apply {
+                text = "Completed 400m rep times appear here (target ${TsPoliceBenchmark.formatDuration(iv.targetRepSec, true)} / 400m)."
+                textSize = 12f
+                setTextColor(AthleticColors.TEXT_MUTED)
+            })
         } else {
-            "GPS Receiver: Waiting for sky lock (Step-Stride indoor estimation active)"
+            iv.completedRepSplitsSec.forEachIndexed { idx, sec ->
+                val fast = sec <= iv.targetRepSec + 2.0
+                val r = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    setPadding(dp(10), dp(7), dp(10), dp(7))
+                    background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 9f)
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                        .apply { bottomMargin = dp(5) }
+                }
+                r.addView(TextView(this).apply {
+                    text = "Rep ${idx + 1} (400m)"
+                    textSize = 12.5f
+                    setTextColor(AthleticColors.TEXT_PRIMARY)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                r.addView(TextView(this).apply {
+                    text = TsPoliceBenchmark.formatDuration(sec, true)
+                    textSize = 13f
+                    typeface = AthleticTheme.FONT_TABULAR_BOLD
+                    setTextColor(if (fast) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
+                })
+                intervalSplitsLayout.addView(r)
+            }
+        }
+
+        // =====================================================================
+        // D. TAB 3 DIAGNOSTICS
+        // =====================================================================
+        diagGpsText.text = when {
+            snap.isLowPowerStandby -> "GPS Engine: Sleeping (Smart Stationary Battery Saver — 0% GPS Drain)"
+            snap.isGpsLocked -> "GPS Engine: LOCKED (±${snap.gpsAccuracyMeters?.toInt() ?: 0}m) • Curve Compensation Active"
+            else -> "GPS Engine: Standby / Indoor Stride Estimation Active"
         }
         diagStepText.text = if (snap.hasHardwareStepSensor) {
-            "Step Sensor: Hardware TYPE_STEP_DETECTOR + 3-Axis Accel (${snap.cadenceSpm.roundToInt()} spm)"
+            "Step Engine: Hardware Step Detector + dt-Normalized 3-Axis Accel (${snap.cadenceSpm.roundToInt()} spm)"
         } else {
-            "Step Sensor: 3-Axis Accelerometer Peak Detector active (${snap.cadenceSpm.roundToInt()} spm)"
+            "Step Engine: dt-Normalized Bipolar Gait Peak Detector (${snap.cadenceSpm.roundToInt()} spm)"
         }
-        val activeScale = if (repository.autoCalibrateFromSamsung) repository.strideCalibrationScale else 1.0
         diagStrideCalText.text = String.format(
-            "Personal Stride Calibration: %.2fx (%s)",
-            activeScale,
-            if (latestSamsungSnapshot != null) "Calibrated via ${latestSamsungSnapshot!!.sourceLabel}" else "Default biomechanical curve"
+            "Effective Stride Scale: %.2fx (%s)",
+            repository.effectiveStrideScale(),
+            if (repository.hasSamsungStrideCalibration && repository.autoCalibrateFromSamsung) {
+                "Samsung Health Calibrated"
+            } else {
+                "Height ${repository.runnerHeightCm} cm Baseline"
+            }
         )
-        diagStateText.text = "Live Auto-Detected Gait: ${snap.motionState.badgeText}"
+        diagStateText.text = "Live Gait Verdict: ${snap.motionState.badgeText}"
         diagStateText.setTextColor(snap.motionState.colorArgb)
     }
 
     // =========================================================================
-    // SAMSUNG HEALTH SYNC, SIDE-BY-SIDE COMPARISON & STRIDE AUTO-CALIBRATION
+    // SAMSUNG HEALTH RENDERING & SYNC
     // =========================================================================
     private fun formatSignedSeconds(deltaSec: Double): String {
         val rounded = deltaSec.roundToInt()
@@ -2040,7 +2354,7 @@ class MainActivity : AppCompatActivity() {
         if (!::samsungHeadlineText.isInitialized) return
         val daily = latestDailySummaryForCompare
         val sam = latestSamsungSnapshot
-        val scale = if (repository.autoCalibrateFromSamsung) repository.strideCalibrationScale else 1.0
+        val scale = repository.effectiveStrideScale()
 
         val key = "${healthSyncStatus}:${isHealthSyncInFlight}:${daily.totalSteps}:${daily.totalDistanceMeters.toInt()}:" +
             "${daily.walkingSec.toInt()}:${daily.jogRunCombinedSec.toInt()}:${sam?.steps}:${sam?.distanceMeters?.toInt()}:${String.format("%.3f", scale)}"
@@ -2049,8 +2363,7 @@ class MainActivity : AppCompatActivity() {
 
         if (isHealthSyncInFlight) {
             samsungSyncBadge.text = "SYNCING..."
-            samsungSyncBadge.setTextColor(0xFF04130D.toInt())
-            samsungSyncBadge.background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(10))
+            samsungSyncBadge.background = AthleticTheme.solidPill(this, AthleticColors.CYAN_BRIGHT, AthleticColors.CYAN_BRIGHT, 10f, 0f)
             samsungPrimaryBtn.isEnabled = false
             samsungPrimaryBtn.text = "Syncing Health Connect..."
             return
@@ -2061,29 +2374,27 @@ class MainActivity : AppCompatActivity() {
             HealthSyncStatus.NOT_INSTALLED -> {
                 samsungCompareTable.visibility = View.GONE
                 samsungSyncBadge.text = "INSTALL HC"
-                samsungSyncBadge.setTextColor(0xFF04130D.toInt())
-                samsungSyncBadge.background = roundedBox(0xFFF59E0B.toInt(), 0xFFF59E0B.toInt(), dp(10))
+                samsungSyncBadge.background = AthleticTheme.solidPill(this, AthleticColors.AMBER_BRIGHT, AthleticColors.AMBER_BRIGHT, 10f, 0f)
                 samsungHeadlineText.text = "Android Health Connect Needed"
-                samsungDetailText.text = "Install or update Android Health Connect so Samsung Health can share live steps, distance & runs."
+                samsungDetailText.text = "Install or update Health Connect so Samsung Health can share steps, distance & 14-day runs."
                 samsungPrimaryBtn.text = "Get Health Connect"
                 samsungPrimaryBtn.setOnClickListener { healthSyncManager.openSamsungHealthOrHealthConnectSettings() }
                 samsungSecondaryBtn.visibility = View.VISIBLE
-                samsungSecondaryBtn.text = "Retry Check"
+                samsungSecondaryBtn.text = "Retry"
                 samsungSecondaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
             }
 
             HealthSyncStatus.PERMISSION_REQUIRED -> {
                 samsungCompareTable.visibility = View.GONE
                 samsungSyncBadge.text = "CONNECT"
-                samsungSyncBadge.setTextColor(0xFF04130D.toInt())
-                samsungSyncBadge.background = roundedBox(0xFF38BDF8.toInt(), 0xFF38BDF8.toInt(), dp(10))
-                samsungHeadlineText.text = "Connect Samsung Health for Better Accuracy"
+                samsungSyncBadge.background = AthleticTheme.solidPill(this, AthleticColors.CYAN_BRIGHT, AthleticColors.CYAN_BRIGHT, 10f, 0f)
+                samsungHeadlineText.text = "Connect Samsung Health for Ground-Truth Accuracy"
                 samsungDetailText.text =
-                    "Grant Health Connect read access to compare TS Tracker vs Samsung Health side-by-side and auto-calibrate your personal stride."
+                    "Compares Tracker vs Samsung Health side-by-side, calibrates your personal stride & imports past 14 days of Watch/Samsung runs."
                 samsungPrimaryBtn.text = "Connect Samsung Health"
                 samsungPrimaryBtn.setOnClickListener { requestSamsungPermissionsSafely() }
                 samsungSecondaryBtn.visibility = View.VISIBLE
-                samsungSecondaryBtn.text = "Samsung Settings"
+                samsungSecondaryBtn.text = "Samsung App"
                 samsungSecondaryBtn.setOnClickListener {
                     if (!healthSyncManager.openSamsungHealthAppDirectly()) {
                         healthSyncManager.openSamsungHealthOrHealthConnectSettings()
@@ -2093,12 +2404,11 @@ class MainActivity : AppCompatActivity() {
 
             HealthSyncStatus.WAITING_FOR_SAMSUNG_SYNC -> {
                 samsungCompareTable.visibility = View.GONE
-                samsungSyncBadge.text = "ENABLE IN SAMSUNG"
-                samsungSyncBadge.setTextColor(0xFF04130D.toInt())
-                samsungSyncBadge.background = roundedBox(0xFFF59E0B.toInt(), 0xFFF59E0B.toInt(), dp(10))
+                samsungSyncBadge.text = "ENABLE SYNC"
+                samsungSyncBadge.background = AthleticTheme.solidPill(this, AthleticColors.AMBER_BRIGHT, AthleticColors.AMBER_BRIGHT, 10f, 0f)
                 samsungHeadlineText.text = "Turn ON Health Connect inside Samsung Health"
                 samsungDetailText.text =
-                    "In Samsung Health → ⋮ → Settings → Health Connect → Turn ON Allow all, then return here and tap 'Sync Now'."
+                    "In Samsung Health → ⋮ → Settings → Health Connect → Allow all, then tap 'Sync Now'."
                 samsungPrimaryBtn.text = "Open Samsung Health"
                 samsungPrimaryBtn.setOnClickListener {
                     if (!healthSyncManager.openSamsungHealthAppDirectly()) {
@@ -2113,78 +2423,65 @@ class MainActivity : AppCompatActivity() {
             HealthSyncStatus.SYNCED, HealthSyncStatus.ERROR -> {
                 if (sam == null) {
                     samsungCompareTable.visibility = View.GONE
-                    samsungSyncBadge.text = "RETRY"
-                    samsungSyncBadge.setTextColor(0xFF04130D.toInt())
-                    samsungSyncBadge.background = roundedBox(0xFFF59E0B.toInt(), 0xFFF59E0B.toInt(), dp(10))
+                    samsungSyncBadge.text = "SYNC"
                     samsungHeadlineText.text = "Tap Sync Now to Pull Samsung Health Data"
-                    samsungDetailText.text = "Make sure Health Connect permissions are enabled for both Samsung Health and TS Police 1.6K."
-                    samsungPrimaryBtn.text = "Sync & Calibrate Now"
+                    samsungDetailText.text = "Ensure Health Connect permissions are active for Samsung Health and TS Police 1.6K."
+                    samsungPrimaryBtn.text = "Sync & Calibrate"
                     samsungPrimaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
                     samsungSecondaryBtn.visibility = View.VISIBLE
-                    samsungSecondaryBtn.text = "Health Connect"
+                    samsungSecondaryBtn.text = "Settings"
                     samsungSecondaryBtn.setOnClickListener { healthSyncManager.openSamsungHealthOrHealthConnectSettings() }
                     return
                 }
 
-                val report = SamsungHealthComparator.compare(
-                    tracker = daily,
-                    samsung = sam,
-                    currentStrideScale = scale
-                )
+                val report = SamsungHealthComparator.compare(daily, sam, scale)
                 samsungCompareTable.visibility = View.VISIBLE
 
                 val matchBadge = report.overallMatchPercent?.let { String.format("%.0f%% MATCH", it) }
                     ?: String.format("STRIDE %.2fx", scale)
                 val highMatch = (report.overallMatchPercent ?: 100.0) >= 88.0
+                val badgeCol = if (highMatch) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
                 samsungSyncBadge.text = matchBadge
-                samsungSyncBadge.setTextColor(0xFF04130D.toInt())
-                samsungSyncBadge.background = roundedBox(
-                    if (highMatch) 0xFF10B981.toInt() else 0xFFF59E0B.toInt(),
-                    if (highMatch) 0xFF10B981.toInt() else 0xFFF59E0B.toInt(),
-                    dp(10)
-                )
+                samsungSyncBadge.background = AthleticTheme.solidPill(this, badgeCol, badgeCol, 10f, 0f)
 
                 samsungHeadlineText.text = report.headline
                 samsungDetailText.text = report.detailAdvice
 
-                // Populate 5 side-by-side comparison rows
                 samRowStepsTracker.text = "${daily.totalSteps}"
                 samRowStepsSamsung.text = "${sam.steps}"
                 val stSign = if (report.stepsDelta > 0) "+${report.stepsDelta}" else "${report.stepsDelta}"
-                samRowStepsDelta.text = if (report.stepsMatchPercent != null) {
-                    String.format("%.0f%% (%s)", report.stepsMatchPercent, if (report.stepsDelta == 0) "0" else stSign)
-                } else stSign
+                samRowStepsDelta.text = report.stepsMatchPercent?.let {
+                    String.format("%.0f%% (%s)", it, if (report.stepsDelta == 0) "0" else stSign)
+                } ?: stSign
                 samRowStepsDelta.setTextColor(
-                    if ((report.stepsMatchPercent ?: 100.0) >= 88.0) 0xFF10B981.toInt() else 0xFFFBBF24.toInt()
+                    if ((report.stepsMatchPercent ?: 100.0) >= 88.0) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
                 )
 
                 samRowDistTracker.text = formatDistanceShort(daily.totalDistanceMeters)
                 samRowDistSamsung.text = formatDistanceShort(sam.distanceMeters)
                 val dMeters = report.distanceDeltaMeters.roundToInt()
                 val dSign = if (dMeters > 0) "+${dMeters}m" else "${dMeters}m"
-                samRowDistDelta.text = if (report.distanceMatchPercent != null) {
-                    String.format("%.0f%% (%s)", report.distanceMatchPercent, if (abs(dMeters) <= 3) "0m" else dSign)
-                } else dSign
+                samRowDistDelta.text = report.distanceMatchPercent?.let {
+                    String.format("%.0f%% (%s)", it, if (abs(dMeters) <= 3) "0m" else dSign)
+                } ?: dSign
                 samRowDistDelta.setTextColor(
-                    if ((report.distanceMatchPercent ?: 100.0) >= 88.0) 0xFF10B981.toInt() else 0xFFFBBF24.toInt()
+                    if ((report.distanceMatchPercent ?: 100.0) >= 88.0) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
                 )
 
                 samRowWalkTracker.text = TsPoliceBenchmark.formatDuration(daily.walkingSec)
                 samRowWalkSamsung.text = TsPoliceBenchmark.formatDuration(sam.walkingSec)
                 samRowWalkDelta.text = formatSignedSeconds(report.walkSecDelta)
-                samRowWalkDelta.setTextColor(0xFFCBD5E1.toInt())
 
                 samRowRunTracker.text = TsPoliceBenchmark.formatDuration(daily.jogRunCombinedSec)
                 samRowRunSamsung.text = TsPoliceBenchmark.formatDuration(sam.jogRunSec)
                 samRowRunDelta.text = formatSignedSeconds(report.jogRunSecDelta)
-                samRowRunDelta.setTextColor(0xFF34D399.toInt())
 
                 samRowStrideTracker.text = report.trackerStrideM?.let { String.format("%.2f m", it) } ?: "--"
                 samRowStrideSamsung.text = report.samsungStrideM?.let { String.format("%.2f m", it) } ?: "--"
                 samRowStrideDelta.text = String.format("Cal %.2fx", scale)
-                samRowStrideDelta.setTextColor(0xFF38BDF8.toInt())
+                samRowStrideDelta.setTextColor(AthleticColors.CYAN_BRIGHT)
 
-                samsungPrimaryBtn.text = "Sync & Calibrate Now"
+                samsungPrimaryBtn.text = "Sync & Calibrate"
                 samsungPrimaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
 
                 val samsungHasHigherTotals = sam.steps > daily.totalSteps + 25 ||
@@ -2192,21 +2489,17 @@ class MainActivity : AppCompatActivity() {
                 samsungSecondaryBtn.visibility = View.VISIBLE
                 if (samsungHasHigherTotals) {
                     val extraSteps = max(0, sam.steps - daily.totalSteps)
-                    samsungSecondaryBtn.text = if (extraSteps > 0) "Align Today (+$extraSteps)" else "Align Today"
-                    samsungSecondaryBtn.setTextColor(0xFF38BDF8.toInt())
+                    samsungSecondaryBtn.text = if (extraSteps > 0) "Align (+$extraSteps)" else "Align Today"
+                    samsungSecondaryBtn.setTextColor(AthleticColors.CYAN_BRIGHT)
                     samsungSecondaryBtn.setOnClickListener {
                         trackingService?.alignTodayWithSamsungHealth(sam)
                         refreshCachedDailyHistory(forceRender = true)
                         renderSamsungComparisonCard(force = true)
-                        Toast.makeText(
-                            this,
-                            "Aligned today's floor with ${sam.sourceLabel}!",
-                            Toast.LENGTH_SHORT
-                        ).show()
+                        Toast.makeText(this, "Aligned today's floor with ${sam.sourceLabel}!", Toast.LENGTH_SHORT).show()
                     }
                 } else {
                     samsungSecondaryBtn.text = "Health Connect"
-                    samsungSecondaryBtn.setTextColor(0xFFCBD5E1.toInt())
+                    samsungSecondaryBtn.setTextColor(AthleticColors.TEXT_PRIMARY)
                     samsungSecondaryBtn.setOnClickListener {
                         healthSyncManager.openSamsungHealthOrHealthConnectSettings()
                     }
@@ -2243,7 +2536,7 @@ class MainActivity : AppCompatActivity() {
                 refreshProgressDashboard()
                 Toast.makeText(
                     this@MainActivity,
-                    "Synced ${outcome.importedRunCount} Samsung Health run(s) into 7:15 Progress!",
+                    "Imported ${outcome.importedRunCount} Samsung Health run(s) into Progress!",
                     Toast.LENGTH_LONG
                 ).show()
             } else if (userTriggered) {
@@ -2261,10 +2554,10 @@ class MainActivity : AppCompatActivity() {
             AlertDialog.Builder(this)
                 .setTitle("Samsung Health & Health Connect Privacy")
                 .setMessage(
-                    "TS Police 1.6 KM Tracker reads Steps, Distance, Exercise Sessions, Speed, and Cadence from Android Health Connect strictly on-device to:\n\n" +
-                        "1. Compare your daily steps, distance, walk time, and jog/run time side-by-side with Samsung Health.\n" +
-                        "2. Auto-calibrate your personal stride length for higher 1.6 km PET pace & indoor accuracy.\n\n" +
-                        "Your health data stays 100% locally on your phone and is never uploaded to any external server."
+                    "TS Police 1.6K reads Steps, Distance, Exercise Sessions, Speed, and Cadence locally on-device to:\n\n" +
+                        "1. Compare daily steps, distance, walk & run time side-by-side with Samsung Health.\n" +
+                        "2. Auto-calibrate your personal stride length and backfill 14-day run history.\n\n" +
+                        "100% of your health data stays strictly on your phone."
                 )
                 .setPositiveButton("Got It", null)
                 .show()
@@ -2272,7 +2565,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // PROGRESS & TARGET FORECAST REFRESH
+    // PROGRESS, MERIT GRADATION & INTERACTIVE SESSION HISTORY
     // =========================================================================
     private fun refreshProgressDashboard() {
         val sessions = repository.getAllSessions()
@@ -2284,246 +2577,273 @@ class MainActivity : AppCompatActivity() {
         )
 
         val targetFmt = TsPoliceBenchmark.formatDuration(targetSec)
+        val bestMerit = forecast.personalBestSec?.let { TsPoliceBenchmark.evaluateMerit1600m(it, targetSec) }
+        if (bestMerit != null) {
+            meritBadgeText.text = "${bestMerit.points} / 100 MERIT PTS"
+            val mCol = if (bestMerit.qualified) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
+            meritBadgeText.setTextColor(mCol)
+            meritBadgeText.background = AthleticTheme.solidPill(this, (mCol and 0x00FFFFFF) or 0x26000000, mCol, 10f)
+        } else {
+            meritBadgeText.text = "NO BASELINE"
+            meritBadgeText.setTextColor(AthleticColors.TEXT_SECONDARY)
+            meritBadgeText.background = AthleticTheme.solidPill(this, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 10f)
+        }
+
         when (forecast.status) {
             ForecastStatus.NO_DATA -> {
-                etaHeadlineText.text = "Record Day 1 Baseline"
-                etaHeadlineText.setTextColor(0xFFF8FAFC.toInt())
+                etaHeadlineText.text = "Run Day 1 Baseline"
+                etaHeadlineText.setTextColor(AthleticColors.TEXT_PRIMARY)
             }
             ForecastStatus.SINGLE_DAY_BASELINE -> {
                 etaHeadlineText.text = "1 More Run Unlocks ETA"
-                etaHeadlineText.setTextColor(0xFF38BDF8.toInt())
+                etaHeadlineText.setTextColor(AthleticColors.CYAN_BRIGHT)
             }
             ForecastStatus.QUALIFIED -> {
                 etaHeadlineText.text = "QUALIFIED (< $targetFmt!)"
-                etaHeadlineText.setTextColor(0xFF10B981.toInt())
+                etaHeadlineText.setTextColor(AthleticColors.EMERALD_BRIGHT)
             }
             ForecastStatus.ON_TRACK -> {
                 etaHeadlineText.text = "~${forecast.estimatedDaysToTarget} Days to $targetFmt"
-                etaHeadlineText.setTextColor(0xFF10B981.toInt())
+                etaHeadlineText.setTextColor(AthleticColors.EMERALD_BRIGHT)
             }
             ForecastStatus.PLATEAU_OR_SLOWER -> {
                 etaHeadlineText.text = "${String.format("%.0fs", forecast.gapToTargetSec ?: 0.0)} Above $targetFmt"
-                etaHeadlineText.setTextColor(0xFFF59E0B.toInt())
+                etaHeadlineText.setTextColor(AthleticColors.AMBER_BRIGHT)
             }
         }
 
-        etaSubText.text = forecast.coachSummary
+        etaSubText.text = forecast.coachSummary + (bestMerit?.nextTierTimeSec?.let {
+            "\nTSLPRB Merit: ${bestMerit.tierLabel} • Next tier (${bestMerit.nextTierPoints} pts) at ${TsPoliceBenchmark.formatDuration(it)}."
+        } ?: "")
         coachPrescriptionText.text = "Coach Plan: ${forecast.workoutPrescription}"
 
         kpiPbVal.text = forecast.personalBestSec?.let { TsPoliceBenchmark.formatDuration(it, true) } ?: "--:--"
         kpiGapVal.text = forecast.gapToTargetSec?.let {
-            if (it <= 0.0) "0.0s (Met!)" else String.format("-%.1fs needed", it)
+            if (it <= 0.0) "0.0s (Met!)" else String.format("-%.1fs", it)
         } ?: "--"
         kpiRateVal.text = forecast.improvementSecPerWeek?.let {
-            if (it >= 0.0) String.format("-%.1fs / wk", it) else String.format("+%.1fs / wk", -it)
+            if (it >= 0.0) String.format("-%.1fs /wk", it) else String.format("+%.1fs /wk", -it)
         } ?: "--"
         kpiImprovedVal.text = forecast.totalImprovementSec?.let {
             if (it >= 0.0) String.format("%.1fs faster", it) else String.format("%.1fs", it)
         } ?: "--"
 
         trendChartView.setForecast(forecast)
+        demoToggleBtn.text = if (repository.hasDemoSessions()) "Clear Sample" else "Sample Data"
 
-        demoToggleBtn.text = if (repository.hasDemoSessions()) {
-            "Clear Demo Data"
-        } else {
-            "Load Sample Data"
-        }
-
-        // Populate sessions list
         sessionsListLayout.removeAllViews()
         if (sessions.isEmpty()) {
             sessionsListLayout.addView(TextView(this).apply {
-                text = "No sessions yet. Run a 1.6 km PT Trial, jog >= 600m in Open Mode, tap '+ Log Track Time', or tap 'Load Sample Data'."
+                text = "No runs yet. Arm a 1.6 km PT Trial, run 400m Intervals, sync Samsung Health, or tap 'Sample Data'."
                 textSize = 12.5f
-                setTextColor(0xFF64748B.toInt())
+                setTextColor(AthleticColors.TEXT_MUTED)
             })
             return
         }
 
         for (s in sessions) {
+            val merit = TsPoliceBenchmark.evaluateMerit1600m(s.equiv1600mSec, targetSec)
             val rowCard = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(dp(12), dp(10), dp(12), dp(10))
-                background = roundedBox(0xFF0B1120.toInt(), 0xFF1E293B.toInt(), dp(10))
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(8) }
+                isClickable = true
+                isFocusable = true
+                setPadding(dp(13), dp(11), dp(13), dp(11))
+                background = AthleticTheme.rippleSurface(
+                    this@MainActivity,
+                    AthleticColors.SURFACE_RECESSED,
+                    AthleticColors.SURFACE_RECESSED,
+                    if (merit.qualified) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.BORDER_SUBTLE,
+                    12f
+                )
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    .apply { bottomMargin = dp(8) }
+                setOnClickListener {
+                    SessionDialogs.showSessionDetailDialog(this@MainActivity, s, targetSec) {
+                        repository.deleteSession(s.id)
+                        refreshProgressDashboard()
+                    }
+                }
             }
 
             val topLine = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            val tagText = if (s.isDemo) "${s.dateIso} • DEMO" else s.dateIso
+            val modeBadge = when (s.mode) {
+                RunMode.TIMED_1600M -> "1.6K TRIAL"
+                RunMode.INTERVAL_400M -> "INTERVALS"
+                RunMode.MANUAL_LOG -> "STOPWATCH"
+                RunMode.OPEN_PRACTICE -> if (s.notes.startsWith("Synced")) "SAMSUNG" else "AUTO RUN"
+            }
             topLine.addView(TextView(this).apply {
-                text = "$tagText  •  ${String.format("%.2f km", s.distanceMeters / 1000.0)}"
-                textSize = 12.5f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(0xFFE2E8F0.toInt())
+                val demoTag = if (s.isDemo) " • SAMPLE" else ""
+                text = "${s.dateIso}  •  $modeBadge$demoTag"
+                textSize = 12f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setTextColor(AthleticColors.TEXT_PRIMARY)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
-
-            val qualified = s.equiv1600mSec <= targetSec
             topLine.addView(TextView(this).apply {
-                val suffix = if (kotlin.math.abs(s.distanceMeters - 1600.0) <= 50.0) "1.6K" else "1.6K eq"
+                val suffix = if (abs(s.distanceMeters - 1600.0) <= 50.0) "1.6K" else "1.6K eq"
                 text = "${TsPoliceBenchmark.formatDuration(s.equiv1600mSec, true)} ($suffix)"
-                textSize = 13f
-                typeface = Typeface.MONOSPACE
-                setTextColor(if (qualified) 0xFF10B981.toInt() else 0xFF38BDF8.toInt())
+                textSize = 13.5f
+                typeface = AthleticTheme.FONT_TABULAR_BOLD
+                setTextColor(if (merit.qualified) AthleticColors.EMERALD_BRIGHT else AthleticColors.CYAN_BRIGHT)
             })
             rowCard.addView(topLine)
-
-            val totalMove = (s.runningSec + s.joggingSec + s.walkingSec).coerceAtLeast(1.0)
-            val runPct = ((s.runningSec / totalMove) * 100.0).roundToInt()
-            val jogPct = ((s.joggingSec / totalMove) * 100.0).roundToInt()
 
             val bottomLine = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(4), 0, 0)
+                setPadding(0, dp(5), 0, 0)
             }
+            val splitsHint = if (s.lapSplits.isNotEmpty()) "${s.lapSplits.size} splits • " else ""
             bottomLine.addView(TextView(this).apply {
-                text = "Time ${TsPoliceBenchmark.formatDuration(s.activeDurationSec)} • Run $runPct% / Jog $jogPct% • ${s.notes}"
+                text = "${String.format("%.2f km", s.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(s.activeDurationSec)}  •  ${splitsHint}${merit.points} pts"
                 textSize = 11.5f
-                setTextColor(0xFF94A3B8.toInt())
+                setTextColor(AthleticColors.TEXT_SECONDARY)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
-            bottomLine.addView(TextView(this).apply {
-                text = "Delete"
-                textSize = 11.5f
-                setTextColor(0xFFEF4444.toInt())
-                setPadding(dp(8), dp(2), dp(2), dp(2))
+
+            // Safe Delete trash button (always asks confirmation!)
+            val delHitbox = FrameLayout(this).apply {
+                setPadding(dp(8), dp(4), dp(2), dp(4))
+                isClickable = true
+                isFocusable = true
                 setOnClickListener {
-                    repository.deleteSession(s.id)
-                    refreshProgressDashboard()
+                    SessionDialogs.confirmDeleteSession(this@MainActivity, s) {
+                        repository.deleteSession(s.id)
+                        refreshProgressDashboard()
+                    }
                 }
-            })
+                addView(VectorIconView(this@MainActivity, IconKind.TRASH, AthleticColors.CRIMSON, 15f))
+            }
+            bottomLine.addView(delHitbox)
             rowCard.addView(bottomLine)
             sessionsListLayout.addView(rowCard)
         }
     }
 
-    private fun showManualRunDialog() {
-        val form = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(14), dp(20), dp(6))
-        }
-        val dateInput = EditText(this).apply {
-            hint = "Date (YYYY-MM-DD)"
-            setText(LocalDate.now().toString())
-        }
-        val distInput = EditText(this).apply {
-            hint = "Distance in meters (e.g. 1600)"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText("1600")
-        }
-        val minInput = EditText(this).apply {
-            hint = "Minutes (e.g. 7)"
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText("7")
-        }
-        val secInput = EditText(this).apply {
-            hint = "Seconds (e.g. 48.5)"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText("45")
-        }
-        form.addView(TextView(this).apply { text = "Date (YYYY-MM-DD):" })
-        form.addView(dateInput)
-        form.addView(TextView(this).apply { text = "Distance (meters):" })
-        form.addView(distInput)
-        form.addView(TextView(this).apply { text = "Minutes:" })
-        form.addView(minInput)
-        form.addView(TextView(this).apply { text = "Seconds:" })
-        form.addView(secInput)
+    // =========================================================================
+    // SETTINGS, BATTERY OPTIMIZATION & PERMISSIONS
+    // =========================================================================
+    private fun isIgnoringBatteryOpt(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return true
+        return pm.isIgnoringBatteryOptimizations(packageName)
+    }
 
-        AlertDialog.Builder(this)
-            .setTitle("Log Manual Track Stopwatch Time")
-            .setView(form)
-            .setPositiveButton("Save Run") { _, _ ->
-                val dateIso = runCatching { LocalDate.parse(dateInput.text.toString().trim()).toString() }
-                    .getOrDefault(LocalDate.now().toString())
-                val distM = distInput.text.toString().toDoubleOrNull() ?: 1600.0
-                val mins = minInput.text.toString().toIntOrNull() ?: 0
-                val secs = secInput.text.toString().toDoubleOrNull() ?: 0.0
-                val totalSec = mins * 60.0 + secs
-                if (distM >= 200.0 && totalSec >= 30.0) {
-                    val epochMs = LocalDate.parse(dateIso)
-                        .atTime(6, 30)
-                        .atZone(ZoneId.systemDefault())
-                        .toInstant()
-                        .toEpochMilli()
-                    val is1600 = kotlin.math.abs(distM - 1600.0) <= 25.0
-                    repository.insertSession(
-                        RunSessionRecord(
-                            startedAtEpochMs = epochMs,
-                            dateIso = dateIso,
-                            mode = RunMode.MANUAL_LOG,
-                            distanceMeters = distM,
-                            activeDurationSec = totalSec,
-                            pausedDurationSec = 0.0,
-                            first1600mSplitSec = if (is1600) totalSec else null,
-                            equiv1600mSec = TsPoliceBenchmark.computeEquiv1600mSec(
-                                distM,
-                                totalSec,
-                                if (is1600) totalSec else null
-                            ),
-                            avgCadenceSpm = 168.0,
-                            maxSpeedMps = distM / totalSec,
-                            runningSec = totalSec,
-                            joggingSec = 0.0,
-                            walkingSec = 0.0,
-                            notes = "Manual stopwatch entry",
-                            isDemo = false
-                        )
-                    )
-                    refreshProgressDashboard()
-                } else {
-                    Toast.makeText(this, "Enter valid distance (>=200m) and duration.", Toast.LENGTH_SHORT).show()
-                }
+    private fun requestIgnoreBatteryOptimizationsSafely() {
+        if (isIgnoringBatteryOpt()) {
+            Toast.makeText(this, "Unrestricted background battery is already active!", Toast.LENGTH_SHORT).show()
+            return
+        }
+        runCatching {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$packageName")
             }
-            .setNegativeButton("Cancel", null)
-            .show()
+            startActivity(intent)
+        }.onFailure {
+            runCatching {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            }
+        }
+    }
+
+    private fun refreshBatterySettingsState() {
+        if (!::batteryStatusBadge.isInitialized) return
+        val unrestricted = isIgnoringBatteryOpt()
+        if (unrestricted) {
+            batteryStatusBadge.text = "UNRESTRICTED ✓"
+            batteryStatusBadge.setTextColor(AthleticColors.EMERALD_BRIGHT)
+            batteryStatusBadge.background = AthleticTheme.solidPill(this, 0x2210B981, AthleticColors.HERO_EMERALD_BORDER, 9f)
+            batteryStatusBtn.text = "Background Battery Protection Active"
+            AthleticTheme.applyButtonStyle(this, batteryStatusBtn, AthleticTheme.ButtonStyle.SECONDARY_SLATE)
+        } else {
+            batteryStatusBadge.text = "RESTRICTED"
+            batteryStatusBadge.setTextColor(AthleticColors.AMBER_BRIGHT)
+            batteryStatusBadge.background = AthleticTheme.solidPill(this, 0x22F59E0B, AthleticColors.HERO_AMBER_BORDER, 9f)
+            batteryStatusBtn.text = "Allow Unrestricted Background Tracking"
+            AthleticTheme.applyButtonStyle(this, batteryStatusBtn, AthleticTheme.ButtonStyle.PRIMARY_CYAN)
+        }
     }
 
     private fun refreshSettingsHighlights() {
         val curTarget = repository.targetTimeSec
-        for ((sec, btn) in targetPresetButtons) {
-            val active = kotlin.math.abs(curTarget - sec) < 1.0
-            btn.background = roundedBox(
-                if (active) 0xFF10B981.toInt() else 0xFF0B1120.toInt(),
-                if (active) 0xFF10B981.toInt() else 0xFF334155.toInt(),
-                dp(8)
-            )
-            btn.setTextColor(if (active) 0xFF04130D.toInt() else 0xFFCBD5E1.toInt())
+        headerSubtitleText.text = "PET Coach  •  Cutoff < ${TsPoliceBenchmark.formatDuration(curTarget)}"
+
+        if (::targetPresetButtons.isInitialized) {
+            for ((sec, btn) in targetPresetButtons) {
+                val active = abs(curTarget - sec) < 1.0
+                btn.background = AthleticTheme.solidPill(
+                    this,
+                    if (active) AthleticColors.EMERALD_BRIGHT else AthleticColors.SURFACE_RECESSED,
+                    if (active) AthleticColors.EMERALD_BRIGHT else AthleticColors.BORDER_SUBTLE,
+                    10f
+                )
+                btn.setTextColor(if (active) AthleticColors.TEXT_ON_DARK_ACCENT else AthleticColors.TEXT_PRIMARY)
+            }
         }
 
-        val curThresh = repository.runningThresholdMps
-        for ((mps, btn) in thresholdPresetButtons) {
-            val active = kotlin.math.abs(curThresh - mps) < 0.05
-            btn.background = roundedBox(
-                if (active) 0xFF38BDF8.toInt() else 0xFF0B1120.toInt(),
-                if (active) 0xFF38BDF8.toInt() else 0xFF334155.toInt(),
-                dp(8)
-            )
-            btn.setTextColor(if (active) 0xFF04130D.toInt() else 0xFFCBD5E1.toInt())
+        if (::thresholdPresetButtons.isInitialized) {
+            val curThresh = repository.runningThresholdMps
+            for ((mps, btn) in thresholdPresetButtons) {
+                val active = abs(curThresh - mps) < 0.05
+                btn.background = AthleticTheme.solidPill(
+                    this,
+                    if (active) AthleticColors.CYAN_BRIGHT else AthleticColors.SURFACE_RECESSED,
+                    if (active) AthleticColors.CYAN_BRIGHT else AthleticColors.BORDER_SUBTLE,
+                    10f
+                )
+                btn.setTextColor(if (active) AthleticColors.TEXT_ON_DARK_ACCENT else AthleticColors.TEXT_PRIMARY)
+            }
         }
-        refreshStateAudioChip()
+
+        if (::audioModeButtons.isInitialized) {
+            val curAudio = repository.pocketAudioMode
+            for ((mode, btn) in audioModeButtons) {
+                val active = mode == curAudio
+                if (active) {
+                    val c = when (mode) {
+                        PocketAudioMode.SMART_TRACK -> AthleticColors.EMERALD_BRIGHT
+                        PocketAudioMode.ALL_STATES -> AthleticColors.CYAN_BRIGHT
+                        PocketAudioMode.MUTED -> AthleticColors.BORDER_STRONG
+                    }
+                    btn.background = AthleticTheme.solidPill(this, c, c, 9f, 0f)
+                    btn.setTextColor(
+                        if (mode == PocketAudioMode.MUTED) AthleticColors.TEXT_PRIMARY else AthleticColors.TEXT_ON_DARK_ACCENT
+                    )
+                } else {
+                    btn.background = null
+                    btn.setTextColor(AthleticColors.TEXT_SECONDARY)
+                }
+            }
+        }
+        refreshHeaderAudioPill()
     }
 
-    private fun refreshStateAudioChip() {
-        if (!::stateAudioChip.isInitialized) return
-        val on = repository.stateChangeAudioEnabled
-        if (::stateAudioSwitch.isInitialized && stateAudioSwitch.isChecked != on) {
-            stateAudioSwitch.isChecked = on
+    private fun refreshHeaderAudioPill() {
+        if (!::headerAudioPill.isInitialized) return
+        val mode = repository.pocketAudioMode
+        when (mode) {
+            PocketAudioMode.SMART_TRACK -> {
+                headerAudioIcon.update(IconKind.AUDIO_SMART, AthleticColors.EMERALD_BRIGHT)
+                headerAudioLabel.text = "Smart"
+                headerAudioLabel.setTextColor(AthleticColors.EMERALD_BRIGHT)
+                headerAudioPill.background = AthleticTheme.solidPill(this, 0x2210B981, AthleticColors.HERO_EMERALD_BORDER, 18f)
+            }
+            PocketAudioMode.ALL_STATES -> {
+                headerAudioIcon.update(IconKind.AUDIO_ALL, AthleticColors.CYAN_BRIGHT)
+                headerAudioLabel.text = "All Audio"
+                headerAudioLabel.setTextColor(AthleticColors.CYAN_BRIGHT)
+                headerAudioPill.background = AthleticTheme.solidPill(this, 0x2238BDF8, AthleticColors.HERO_CYAN_BORDER, 18f)
+            }
+            PocketAudioMode.MUTED -> {
+                headerAudioIcon.update(IconKind.AUDIO_MUTED, AthleticColors.TEXT_MUTED)
+                headerAudioLabel.text = "Muted"
+                headerAudioLabel.setTextColor(AthleticColors.TEXT_MUTED)
+                headerAudioPill.background = AthleticTheme.solidPill(this, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 18f)
+            }
         }
-        stateAudioChip.text = if (on) "POCKET AUDIO ON" else "MUTED"
-        stateAudioChip.setTextColor(if (on) 0xFF38BDF8.toInt() else 0xFF64748B.toInt())
-        stateAudioChip.background = roundedBox(
-            if (on) 0x1E38BDF8 else 0xFF111827.toInt(),
-            if (on) 0xFF38BDF8.toInt() else 0xFF334155.toInt(),
-            dp(12)
-        )
     }
 
     private fun hasCorePermissions(): Boolean {
@@ -2536,8 +2856,11 @@ class MainActivity : AppCompatActivity() {
         return fine && act
     }
 
-    private fun updatePermissionBanner() {
-        permissionBanner.visibility = if (hasCorePermissions()) View.GONE else View.VISIBLE
+    private fun updateBanners() {
+        if (!::permissionBanner.isInitialized) return
+        val permsOk = hasCorePermissions()
+        permissionBanner.visibility = if (permsOk) View.GONE else View.VISIBLE
+        batteryGuardBanner.visibility = if (permsOk && !isIgnoringBatteryOpt()) View.VISIBLE else View.GONE
     }
 
     private fun requestNeededPermissionsIfMissing(silentCheckOnly: Boolean) {
@@ -2560,7 +2883,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // GITHUB OTA AUTO-UPDATE UI FLOW
+    // GITHUB OTA AUTO-UPDATE FLOW
     // =========================================================================
     private fun performUpdateCheck(manualUserTrigger: Boolean, autoInstallWhenFound: Boolean = false) {
         if (manualUserTrigger) {
@@ -2576,12 +2899,10 @@ class MainActivity : AppCompatActivity() {
             when (result) {
                 is UpdateCheckResult.UpdateAvailable -> {
                     latestDiscoveredRelease = result.release
-                    updateBanner.text =
-                        "UPDATE v${result.release.versionName} AVAILABLE  •  TAP TO INSTALL"
+                    updateBanner.text = "UPDATE v${result.release.versionName} READY  •  TAP TO INSTALL"
                     updateBanner.visibility = View.VISIBLE
-                    updateStatusText.text =
-                        "Update ready: v${result.installedVersionName} → v${result.release.versionName}"
-                    updateStatusText.setTextColor(0xFF38BDF8.toInt())
+                    updateStatusText.text = "Update ready: v${result.installedVersionName} → v${result.release.versionName}"
+                    updateStatusText.setTextColor(AthleticColors.CYAN_BRIGHT)
 
                     if (autoInstallWhenFound && !currentlyRecording) {
                         startUpdateDownloadAndInstall(result.release)
@@ -2591,24 +2912,15 @@ class MainActivity : AppCompatActivity() {
                 }
                 is UpdateCheckResult.UpToDate -> {
                     updateBanner.visibility = View.GONE
-                    updateStatusText.text =
-                        "Up to date: v${result.installedVersionName} (Build ${result.installedVersionCode})"
-                    updateStatusText.setTextColor(0xFF10B981.toInt())
+                    updateStatusText.text = "Up to date: v${result.installedVersionName} (Build ${result.installedVersionCode})"
+                    updateStatusText.setTextColor(AthleticColors.EMERALD_BRIGHT)
                     if (manualUserTrigger) {
-                        Toast.makeText(
-                            this,
-                            "You're on the latest version (v${result.installedVersionName})!",
-                            Toast.LENGTH_SHORT
-                        ).show()
+                        Toast.makeText(this, "You're on the latest version (v${result.installedVersionName})!", Toast.LENGTH_SHORT).show()
                     }
                 }
                 is UpdateCheckResult.Error -> {
                     if (manualUserTrigger) {
-                        Toast.makeText(
-                            this,
-                            "Update check: ${result.message}",
-                            Toast.LENGTH_LONG
-                        ).show()
+                        Toast.makeText(this, "Update check: ${result.message}", Toast.LENGTH_LONG).show()
                     }
                 }
             }
@@ -2622,11 +2934,9 @@ class MainActivity : AppCompatActivity() {
             .setMessage(
                 "Installed: v$currentVersion\nAvailable: v${release.versionName}\n\n" +
                     "What's New:\n${release.changelog}\n\n" +
-                    "Your daily 1.6 km run history and progress data will stay intact."
+                    "Your 1.6 km run history and Samsung calibration stay intact."
             )
-            .setPositiveButton("Download & Install") { _, _ ->
-                startUpdateDownloadAndInstall(release)
-            }
+            .setPositiveButton("Download & Install") { _, _ -> startUpdateDownloadAndInstall(release) }
             .setNegativeButton("Later", null)
             .show()
     }
@@ -2662,12 +2972,14 @@ class MainActivity : AppCompatActivity() {
                 if (pct >= 0 && total > 0L) {
                     progressBar.isIndeterminate = false
                     progressBar.progress = pct
-                    val dlMb = downloaded / (1024.0 * 1024.0)
-                    val totMb = total / (1024.0 * 1024.0)
-                    statusTv.text = String.format("Downloading APK... %d%% (%.1f / %.1f MB)", pct, dlMb, totMb)
+                    statusTv.text = String.format(
+                        "Downloading APK... %d%% (%.1f / %.1f MB)",
+                        pct,
+                        downloaded / (1024.0 * 1024.0),
+                        total / (1024.0 * 1024.0)
+                    )
                 } else {
-                    val dlMb = downloaded / (1024.0 * 1024.0)
-                    statusTv.text = String.format("Downloading APK... %.1f MB", dlMb)
+                    statusTv.text = String.format("Downloading APK... %.1f MB", downloaded / (1024.0 * 1024.0))
                 }
             },
             onNeedsInstallPermission = {
@@ -2676,11 +2988,9 @@ class MainActivity : AppCompatActivity() {
                     .setTitle("Allow App Self-Update")
                     .setMessage(
                         "Update v${release.versionName} is downloaded and SHA-256 verified!\n\n" +
-                            "On the next screen, toggle 'Allow from this source' and press Back — the update will install automatically."
+                            "Toggle 'Allow from this source' on the next screen and press Back."
                     )
-                    .setPositiveButton("Open Settings") { _, _ ->
-                        appUpdater.openUnknownSourcesSettings(this)
-                    }
+                    .setPositiveButton("Open Settings") { _, _ -> appUpdater.openUnknownSourcesSettings(this) }
                     .setNegativeButton("Cancel", null)
                     .show()
             },
@@ -2693,69 +3003,67 @@ class MainActivity : AppCompatActivity() {
                     .setNegativeButton("Close", null)
                     .show()
             },
-            onInstallerLaunched = {
-                progressDialog.dismiss()
-            }
+            onInstallerLaunched = { progressDialog.dismiss() }
         )
     }
 
     // =========================================================================
-    // UI STYLING HELPERS
+    // REUSABLE CARD & BENTO TILE BUILDERS
     // =========================================================================
-    private fun cardContainer(): LinearLayout = LinearLayout(this).apply {
+    private fun cardContainer(
+        topColor: Int = AthleticColors.SURFACE_TOP,
+        bottomColor: Int = AthleticColors.SURFACE_BOTTOM,
+        borderColor: Int = AthleticColors.BORDER_SUBTLE
+    ): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(14), dp(14), dp(14), dp(14))
-        background = roundedBox(0xFF111827.toInt(), 0xFF1E293B.toInt(), dp(14))
+        setPadding(dp(16), dp(15), dp(16), dp(15))
+        background = AthleticTheme.gradientCard(this@MainActivity, topColor, bottomColor, borderColor, 18f)
         layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { bottomMargin = dp(12) }
+        ).apply { bottomMargin = dp(14) }
     }
 
-    private fun sectionHeader(title: String): TextView = TextView(this).apply {
-        text = title
-        textSize = 11.5f
-        typeface = Typeface.DEFAULT_BOLD
-        setTextColor(0xFF94A3B8.toInt())
-        letterSpacing = 0.05f
-    }
-
-    private fun metricTile(label: String, initialVal: String, initialSub: String): Triple<LinearLayout, TextView, TextView> {
+    private fun metricTile(
+        label: String,
+        initialVal: String,
+        initialSub: String,
+        accentLabelColor: Int = AthleticColors.TEXT_SECONDARY
+    ): Triple<LinearLayout, TextView, TextView> {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(11), dp(12), dp(11))
-            background = roundedBox(0xFF111827.toInt(), 0xFF1E293B.toInt(), dp(12))
+            setPadding(dp(14), dp(13), dp(14), dp(13))
+            background = AthleticTheme.gradientCard(
+                this@MainActivity,
+                AthleticColors.SURFACE_TOP,
+                AthleticColors.SURFACE_BOTTOM,
+                AthleticColors.BORDER_SUBTLE,
+                15f
+            )
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         val lbl = TextView(this).apply {
             text = label
             textSize = 10.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF94A3B8.toInt())
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(accentLabelColor)
+            letterSpacing = 0.06f
         }
         val valueTv = TextView(this).apply {
             text = initialVal
-            textSize = 19f
-            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-            setTextColor(0xFFF8FAFC.toInt())
-            setPadding(0, dp(3), 0, dp(2))
+            textSize = 20f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(4), 0, dp(2))
         }
         val subTv = TextView(this).apply {
             text = initialSub
-            textSize = 11f
-            setTextColor(0xFF64748B.toInt())
+            textSize = 11.5f
+            setTextColor(AthleticColors.TEXT_MUTED)
         }
         box.addView(lbl)
         box.addView(valueTv)
         box.addView(subTv)
         return Triple(box, valueTv, subTv)
     }
-
-    private fun roundedBox(fillColor: Int, strokeColor: Int, radiusPx: Int): GradientDrawable =
-        GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = radiusPx.toFloat()
-            setColor(fillColor)
-            setStroke(dp(1), strokeColor)
-        }
 }

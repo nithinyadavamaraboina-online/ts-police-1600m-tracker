@@ -245,11 +245,12 @@ class MotionSignalProcessor {
 
     private var lastActualHardwareStepMs: Long = -100_000L
 
-    // Orientation-invariant scalar baseline + 2-pole ~4.8 Hz gait-band filter
+    // Orientation-invariant scalar baseline + dt-normalized 2-pole ~4.8 Hz gait-band filter
     private var baselineNorm = 9.81
     private var gaitNorm1 = 9.81
     private var gaitNorm2 = 9.81
     private var filterInitialized = false
+    private var lastAccelSampleMs = -1L
 
     // Bipolar peak-and-trough cycle state for accurate software pedometer
     private var awaitingTrough = false
@@ -272,6 +273,7 @@ class MotionSignalProcessor {
         gaitNorm1 = 9.81
         gaitNorm2 = 9.81
         filterInitialized = false
+        lastAccelSampleMs = -1L
         awaitingTrough = false
         cyclePeakDelta = 0.0
         cyclePeakTimeMs = -10_000L
@@ -340,11 +342,20 @@ class MotionSignalProcessor {
             gaitNorm2 = rawNorm
             filterInitialized = true
         } else {
-            baselineNorm = 0.94 * baselineNorm + 0.06 * rawNorm
+            val dtSec = if (lastAccelSampleMs >= 0L && nowMs > lastAccelSampleMs) {
+                ((nowMs - lastAccelSampleMs) / 1000.0).coerceIn(0.004, 0.12)
+            } else {
+                0.02
+            }
+            val sampleRatio = dtSec / 0.02 // 1.0 at 50 Hz (20ms); normalizes 20 Hz screen-off & 100 Hz sensors
+            val alphaBase = if (abs(sampleRatio - 1.0) < 0.02) 0.06 else (1.0 - Math.pow(0.94, sampleRatio))
+            val alphaGait = if (abs(sampleRatio - 1.0) < 0.02) 0.50 else (1.0 - Math.pow(0.50, sampleRatio))
+            baselineNorm = (1.0 - alphaBase) * baselineNorm + alphaBase * rawNorm
             // 2-pole ~4.8 Hz gait filter: passes >90% of walking/running steps while rejecting ~89% of 25 Hz bike buzz
-            gaitNorm1 = 0.50 * gaitNorm1 + 0.50 * rawNorm
-            gaitNorm2 = 0.50 * gaitNorm2 + 0.50 * gaitNorm1
+            gaitNorm1 = (1.0 - alphaGait) * gaitNorm1 + alphaGait * rawNorm
+            gaitNorm2 = (1.0 - alphaGait) * gaitNorm2 + alphaGait * gaitNorm1
         }
+        lastAccelSampleMs = nowMs
 
         val gaitDelta = gaitNorm2 - baselineNorm
         val mag = if (includesGravity) abs(gaitDelta) else gaitNorm2.coerceAtLeast(0.0)

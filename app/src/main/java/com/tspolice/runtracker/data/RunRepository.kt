@@ -8,6 +8,7 @@ import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.LapSplit
 import com.tspolice.runtracker.domain.MotionState
+import com.tspolice.runtracker.domain.PocketAudioMode
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
@@ -35,6 +36,9 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_RUN_SPEED_MPS = "run_threshold_mps"
         private const val KEY_VOICE_COACH = "voice_coach_enabled"
         private const val KEY_STATE_CHANGE_AUDIO = "state_change_audio_enabled"
+        private const val KEY_POCKET_AUDIO_MODE = "pocket_audio_mode_v2"
+        private const val KEY_RUNNER_HEIGHT_CM = "runner_height_cm"
+        private const val KEY_HAS_SAMSUNG_CAL = "has_samsung_stride_cal"
         private const val KEY_STEP_FALLBACK = "indoor_step_distance_fallback"
         private const val KEY_ALL_DAY_AUTO = "all_day_auto_tracking_enabled"
         private const val KEY_STRIDE_SCALE = "samsung_stride_scale_factor"
@@ -113,9 +117,43 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         get() = prefs.getBoolean(KEY_VOICE_COACH, true)
         set(value) = prefs.edit().putBoolean(KEY_VOICE_COACH, value).apply()
 
+    var pocketAudioMode: PocketAudioMode
+        get() {
+            val saved = prefs.getString(KEY_POCKET_AUDIO_MODE, null)
+            if (saved != null) {
+                return runCatching { PocketAudioMode.valueOf(saved) }.getOrDefault(PocketAudioMode.SMART_TRACK)
+            }
+            val legacyEnabled = prefs.getBoolean(KEY_STATE_CHANGE_AUDIO, true)
+            return if (legacyEnabled) PocketAudioMode.SMART_TRACK else PocketAudioMode.MUTED
+        }
+        set(value) {
+            prefs.edit()
+                .putString(KEY_POCKET_AUDIO_MODE, value.name)
+                .putBoolean(KEY_STATE_CHANGE_AUDIO, value != PocketAudioMode.MUTED)
+                .apply()
+        }
+
     var stateChangeAudioEnabled: Boolean
-        get() = prefs.getBoolean(KEY_STATE_CHANGE_AUDIO, true)
-        set(value) = prefs.edit().putBoolean(KEY_STATE_CHANGE_AUDIO, value).apply()
+        get() = pocketAudioMode != PocketAudioMode.MUTED
+        set(value) {
+            pocketAudioMode = if (value) PocketAudioMode.SMART_TRACK else PocketAudioMode.MUTED
+        }
+
+    var runnerHeightCm: Int
+        get() = prefs.getInt(KEY_RUNNER_HEIGHT_CM, 172).coerceIn(145, 205)
+        set(value) = prefs.edit().putInt(KEY_RUNNER_HEIGHT_CM, value.coerceIn(145, 205)).apply()
+
+    var hasSamsungStrideCalibration: Boolean
+        get() = prefs.getBoolean(KEY_HAS_SAMSUNG_CAL, false)
+        set(value) = prefs.edit().putBoolean(KEY_HAS_SAMSUNG_CAL, value).apply()
+
+    fun effectiveStrideScale(): Double {
+        return if (autoCalibrateFromSamsung && hasSamsungStrideCalibration) {
+            strideCalibrationScale
+        } else {
+            TsPoliceBenchmark.heightStrideScale(runnerHeightCm)
+        }
+    }
 
     var indoorStepFallbackEnabled: Boolean
         get() = prefs.getBoolean(KEY_STEP_FALLBACK, true)
@@ -495,5 +533,99 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             }
             list
         }.getOrDefault(emptyList())
+    }
+
+    /**
+     * Exports all non-demo run sessions, daily activity history, and runner profile into portable JSON.
+     */
+    fun exportBackupJson(): String {
+        val root = JSONObject()
+        root.put("schemaVersion", 1)
+        root.put("exportedAtIso", LocalDate.now().toString())
+        root.put("targetTimeSec", targetTimeSec)
+        root.put("runnerHeightCm", runnerHeightCm)
+        root.put("strideCalibrationScale", strideCalibrationScale)
+
+        val runsArr = JSONArray()
+        for (s in getAllSessions().filter { !it.isDemo }) {
+            runsArr.put(
+                JSONObject().apply {
+                    put("startedAtEpochMs", s.startedAtEpochMs)
+                    put("dateIso", s.dateIso)
+                    put("mode", s.mode.name)
+                    put("distanceMeters", s.distanceMeters)
+                    put("activeDurationSec", s.activeDurationSec)
+                    put("pausedDurationSec", s.pausedDurationSec)
+                    if (s.first1600mSplitSec != null) put("first1600mSplitSec", s.first1600mSplitSec)
+                    put("equiv1600mSec", s.equiv1600mSec)
+                    put("avgCadenceSpm", s.avgCadenceSpm)
+                    put("maxSpeedMps", s.maxSpeedMps)
+                    put("runningSec", s.runningSec)
+                    put("joggingSec", s.joggingSec)
+                    put("walkingSec", s.walkingSec)
+                    put("splitsJson", encodeSplits(s.lapSplits))
+                    put("notes", s.notes)
+                }
+            )
+        }
+        root.put("sessions", runsArr)
+
+        val dailyArr = JSONArray()
+        for (d in getRecentDailyActivities(60).filter { !it.isDemo }) {
+            dailyArr.put(
+                JSONObject().apply {
+                    put("dateIso", d.dateIso)
+                    put("walkingSec", d.walkingSec)
+                    put("joggingSec", d.joggingSec)
+                    put("runningSec", d.runningSec)
+                    put("walkingMeters", d.walkingMeters)
+                    put("joggingMeters", d.joggingMeters)
+                    put("runningMeters", d.runningMeters)
+                    put("totalSteps", d.totalSteps)
+                    put("maxSpeedMps", d.maxSpeedMps)
+                    put("maxCadenceSpm", d.maxCadenceSpm)
+                }
+            )
+        }
+        root.put("dailyActivity", dailyArr)
+        return root.toString(2)
+    }
+
+    /**
+     * Restores non-duplicate sessions from an exported JSON backup string. Returns count imported.
+     */
+    fun importBackupJson(rawJson: String): Int {
+        val root = JSONObject(rawJson)
+        val sessionsArr = root.optJSONArray("sessions") ?: JSONArray()
+        var imported = 0
+        for (i in 0 until sessionsArr.length()) {
+            val o = sessionsArr.getJSONObject(i)
+            val startMs = o.optLong("startedAtEpochMs", 0L)
+            if (startMs <= 0L || hasSessionNear(startMs, windowMs = 60_000L)) continue
+            val mode = runCatching { RunMode.valueOf(o.optString("mode")) }.getOrDefault(RunMode.TIMED_1600M)
+            val f1600 = if (o.has("first1600mSplitSec")) o.optDouble("first1600mSplitSec") else null
+            insertSession(
+                RunSessionRecord(
+                    startedAtEpochMs = startMs,
+                    dateIso = o.optString("dateIso", LocalDate.now().toString()),
+                    mode = mode,
+                    distanceMeters = o.optDouble("distanceMeters", 1600.0),
+                    activeDurationSec = o.optDouble("activeDurationSec", 480.0),
+                    pausedDurationSec = o.optDouble("pausedDurationSec", 0.0),
+                    first1600mSplitSec = f1600,
+                    equiv1600mSec = o.optDouble("equiv1600mSec", 480.0),
+                    avgCadenceSpm = o.optDouble("avgCadenceSpm", 165.0),
+                    maxSpeedMps = o.optDouble("maxSpeedMps", 3.5),
+                    runningSec = o.optDouble("runningSec", 0.0),
+                    joggingSec = o.optDouble("joggingSec", 0.0),
+                    walkingSec = o.optDouble("walkingSec", 0.0),
+                    lapSplits = decodeSplits(o.optString("splitsJson", "")),
+                    notes = o.optString("notes", "Restored backup"),
+                    isDemo = false
+                )
+            )
+            imported++
+        }
+        return imported
     }
 }
