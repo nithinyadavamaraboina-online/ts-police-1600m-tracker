@@ -595,6 +595,76 @@ class TrackerDomainTest {
         assertTrue(TsPoliceBenchmark.heightStrideScale(160) < 0.95)
     }
 
+    @Test
+    fun `yesterday and today samsung health comparison aggregates 2 day metrics and calibrates stride reliably`() {
+        val yesterdayTracker = DailyActivitySummary(
+            dateIso = "2026-10-26",
+            walkingSec = 2400.0,
+            joggingSec = 360.0,
+            runningSec = 420.0,
+            walkingMeters = 2850.0,
+            joggingMeters = 860.0,
+            runningMeters = 1520.0, // 5,230m across 6,100 steps
+            totalSteps = 6100,
+            maxSpeedMps = 3.85,
+            maxCadenceSpm = 176.0
+        )
+        val yesterdaySamsung = SamsungDailySnapshot(
+            dateIso = "2026-10-26",
+            steps = 6220,
+            distanceMeters = 5535.0, // ~0.89 m/step
+            walkingSec = 2460.0,
+            jogRunSec = 795.0,
+            maxSpeedMps = 3.88,
+            maxCadenceSpm = 178.0
+        )
+        // Early morning today: only 55 indoor steps so far!
+        val todayTracker = DailyActivitySummary(
+            dateIso = "2026-10-27",
+            walkingSec = 40.0,
+            walkingMeters = 42.0,
+            totalSteps = 55,
+            maxSpeedMps = 1.25,
+            maxCadenceSpm = 102.0
+        )
+        val todaySamsung = SamsungDailySnapshot(
+            dateIso = "2026-10-27",
+            steps = 60,
+            distanceMeters = 46.0,
+            walkingSec = 44.0,
+            maxSpeedMps = 1.28,
+            maxCadenceSpm = 104.0
+        )
+
+        val combTrk = SamsungHealthComparator.combineDailySummaries(yesterdayTracker, todayTracker)
+        val combSam = SamsungHealthComparator.combineSamsungSnapshots(yesterdaySamsung, todaySamsung)!!
+        assertEquals(6155, combTrk.totalSteps)
+        assertEquals(6280, combSam.steps)
+        assertEquals(3.85, combTrk.maxSpeedMps, 0.001)
+        assertEquals(178.0, combSam.maxCadenceSpm, 0.001)
+
+        // Multi-day calibration anchors on Yesterday's full 6,220-step day instead of skipping due to Today's <200 steps!
+        val twoDayScale = SamsungHealthComparator.computeMultiDayCalibratedStrideScale(
+            yesterdayTracker = yesterdayTracker,
+            yesterdaySamsung = yesterdaySamsung,
+            todayTracker = todayTracker,
+            todaySamsung = todaySamsung,
+            currentStrideScale = 1.0
+        )
+        assertTrue("Expected 2-day calibrated stride scale > 1.02, got $twoDayScale", twoDayScale in 1.02..1.12)
+
+        val reportTxt = SamsungHealthComparator.buildTwoDayReportText(
+            yesterdayTracker = yesterdayTracker,
+            yesterdaySamsung = yesterdaySamsung,
+            todayTracker = todayTracker,
+            todaySamsung = todaySamsung,
+            effectiveStrideScale = twoDayScale
+        )
+        assertTrue(reportTxt.contains("[YESTERDAY • 2026-10-26]"))
+        assertTrue(reportTxt.contains("[TODAY • 2026-10-27]"))
+        assertTrue(reportTxt.contains("[2-DAY COMBINED"))
+    }
+
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
         val is1600 = mode == RunMode.TIMED_1600M
         return RunSessionRecord(

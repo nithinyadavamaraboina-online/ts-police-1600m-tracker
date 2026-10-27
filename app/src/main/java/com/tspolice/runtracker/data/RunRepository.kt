@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.tspolice.runtracker.domain.DailyActivitySummary
+import com.tspolice.runtracker.domain.ExternalRunWorkout
 import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.LapSplit
 import com.tspolice.runtracker.domain.MotionState
@@ -45,6 +46,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_AUTO_CALIBRATE_SAMSUNG = "auto_calibrate_from_samsung"
         private const val KEY_AUTO_IMPORT_SAMSUNG_RUNS = "auto_import_samsung_runs"
         private const val KEY_CACHED_SAMSUNG_JSON = "cached_samsung_snapshot_json"
+        private const val KEY_CACHED_SAMSUNG_MAP_JSON = "cached_samsung_snapshots_map_v2"
         private const val KEY_IMPORTED_EXT_WORKOUTS = "imported_external_workout_ids"
     }
 
@@ -179,8 +181,24 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         get() = prefs.getBoolean(KEY_AUTO_IMPORT_SAMSUNG_RUNS, true)
         set(value) = prefs.edit().putBoolean(KEY_AUTO_IMPORT_SAMSUNG_RUNS, value).apply()
 
-    fun saveSamsungSnapshot(snapshot: SamsungDailySnapshot) {
-        val obj = JSONObject().apply {
+    private fun encodeSamsungSnapshot(snapshot: SamsungDailySnapshot): JSONObject {
+        val workoutsArr = JSONArray()
+        for (w in snapshot.workouts) {
+            workoutsArr.put(
+                JSONObject().apply {
+                    put("externalId", w.externalId)
+                    put("sourcePackage", w.sourcePackage)
+                    put("startedAtEpochMs", w.startedAtEpochMs)
+                    put("dateIso", w.dateIso)
+                    put("durationSec", w.durationSec)
+                    put("distanceMeters", w.distanceMeters)
+                    put("maxSpeedMps", w.maxSpeedMps)
+                    put("avgCadenceSpm", w.avgCadenceSpm)
+                    put("title", w.title)
+                }
+            )
+        }
+        return JSONObject().apply {
             put("dateIso", snapshot.dateIso)
             put("steps", snapshot.steps)
             put("distanceMeters", snapshot.distanceMeters)
@@ -191,28 +209,155 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             put("sourcePackage", snapshot.sourcePackage)
             put("sourceLabel", snapshot.sourceLabel)
             put("syncedAtEpochMs", snapshot.syncedAtEpochMs)
+            put("workouts", workoutsArr)
         }
-        prefs.edit().putString(KEY_CACHED_SAMSUNG_JSON, obj.toString()).apply()
+    }
+
+    private fun decodeSamsungSnapshot(o: JSONObject): SamsungDailySnapshot {
+        val workoutsList = mutableListOf<ExternalRunWorkout>()
+        val wArr = o.optJSONArray("workouts")
+        if (wArr != null) {
+            for (i in 0 until wArr.length()) {
+                val wo = wArr.optJSONObject(i) ?: continue
+                workoutsList.add(
+                    ExternalRunWorkout(
+                        externalId = wo.optString("externalId"),
+                        sourcePackage = wo.optString("sourcePackage", SamsungHealthComparator.SAMSUNG_HEALTH_PACKAGE),
+                        startedAtEpochMs = wo.optLong("startedAtEpochMs", 0L),
+                        dateIso = wo.optString("dateIso", o.optString("dateIso")),
+                        durationSec = wo.optDouble("durationSec", 0.0),
+                        distanceMeters = wo.optDouble("distanceMeters", 0.0),
+                        maxSpeedMps = wo.optDouble("maxSpeedMps", 0.0),
+                        avgCadenceSpm = wo.optDouble("avgCadenceSpm", 0.0),
+                        title = wo.optString("title", "Samsung Health Run")
+                    )
+                )
+            }
+        }
+        return SamsungDailySnapshot(
+            dateIso = o.optString("dateIso"),
+            steps = o.optInt("steps", 0),
+            distanceMeters = o.optDouble("distanceMeters", 0.0),
+            walkingSec = o.optDouble("walkingSec", 0.0),
+            jogRunSec = o.optDouble("jogRunSec", 0.0),
+            maxSpeedMps = o.optDouble("maxSpeedMps", 0.0),
+            maxCadenceSpm = o.optDouble("maxCadenceSpm", 0.0),
+            sourcePackage = o.optString("sourcePackage", SamsungHealthComparator.SAMSUNG_HEALTH_PACKAGE),
+            sourceLabel = o.optString("sourceLabel", "Samsung Health"),
+            syncedAtEpochMs = o.optLong("syncedAtEpochMs", 0L),
+            workouts = workoutsList
+        )
+    }
+
+    fun saveSamsungSnapshot(snapshot: SamsungDailySnapshot) {
+        if (snapshot.dateIso.isBlank()) return
+        val mapObj = runCatching {
+            val existing = prefs.getString(KEY_CACHED_SAMSUNG_MAP_JSON, null)
+            if (existing != null) JSONObject(existing) else JSONObject()
+        }.getOrDefault(JSONObject())
+
+        mapObj.put(snapshot.dateIso, encodeSamsungSnapshot(snapshot))
+
+        // Prune entries older than 14 days so SharedPreferences stays tiny
+        val keys = mapObj.keys().asSequence().toList().sortedDescending()
+        val trimmed = JSONObject()
+        for (k in keys.take(14)) {
+            trimmed.put(k, mapObj.getJSONObject(k))
+        }
+
+        prefs.edit()
+            .putString(KEY_CACHED_SAMSUNG_MAP_JSON, trimmed.toString())
+            .putString(KEY_CACHED_SAMSUNG_JSON, encodeSamsungSnapshot(snapshot).toString())
+            .apply()
     }
 
     fun getCachedSamsungSnapshot(dateIso: String): SamsungDailySnapshot? {
+        if (dateIso.isBlank()) return null
+        val mapRaw = prefs.getString(KEY_CACHED_SAMSUNG_MAP_JSON, null)
+        if (mapRaw != null) {
+            val fromMap = runCatching {
+                val mapObj = JSONObject(mapRaw)
+                val entry = mapObj.optJSONObject(dateIso)
+                entry?.let { decodeSamsungSnapshot(it) }
+            }.getOrNull()
+            if (fromMap != null) return fromMap
+        }
+
         val raw = prefs.getString(KEY_CACHED_SAMSUNG_JSON, null) ?: return null
         return runCatching {
             val o = JSONObject(raw)
             if (o.optString("dateIso") != dateIso) return null
-            SamsungDailySnapshot(
-                dateIso = o.optString("dateIso"),
-                steps = o.optInt("steps", 0),
-                distanceMeters = o.optDouble("distanceMeters", 0.0),
-                walkingSec = o.optDouble("walkingSec", 0.0),
-                jogRunSec = o.optDouble("jogRunSec", 0.0),
-                maxSpeedMps = o.optDouble("maxSpeedMps", 0.0),
-                maxCadenceSpm = o.optDouble("maxCadenceSpm", 0.0),
-                sourcePackage = o.optString("sourcePackage", SamsungHealthComparator.SAMSUNG_HEALTH_PACKAGE),
-                sourceLabel = o.optString("sourceLabel", "Samsung Health"),
-                syncedAtEpochMs = o.optLong("syncedAtEpochMs", 0L)
-            )
+            decodeSamsungSnapshot(o)
         }.getOrNull()
+    }
+
+    fun getAllCachedSamsungSnapshots(): Map<String, SamsungDailySnapshot> {
+        val out = LinkedHashMap<String, SamsungDailySnapshot>()
+        val mapRaw = prefs.getString(KEY_CACHED_SAMSUNG_MAP_JSON, null)
+        if (mapRaw != null) {
+            runCatching {
+                val mapObj = JSONObject(mapRaw)
+                for (k in mapObj.keys().asSequence().toList().sortedDescending()) {
+                    mapObj.optJSONObject(k)?.let { out[k] = decodeSamsungSnapshot(it) }
+                }
+            }
+        }
+        return out
+    }
+
+    /**
+     * Safely aligns a past day's SQLite [DailyActivitySummary] (e.g. Yesterday) with Samsung Health
+     * ground-truth totals if the user wore a Galaxy Watch or had steps recorded while the app wasn't running.
+     */
+    fun alignDailyActivityWithSamsung(dateIso: String, samsung: SamsungDailySnapshot): DailyActivitySummary {
+        val cur = getDailyActivity(dateIso)
+        val newSteps = kotlin.math.max(cur.totalSteps, samsung.steps)
+        val newWalkSec = kotlin.math.max(cur.walkingSec, samsung.walkingSec)
+        val curJogRunSec = cur.jogRunCombinedSec
+        var newJogSec = cur.joggingSec
+        var newRunSec = cur.runningSec
+        if (samsung.jogRunSec > curJogRunSec) {
+            val extra = samsung.jogRunSec - curJogRunSec
+            newRunSec += extra * 0.55
+            newJogSec += extra * 0.45
+        }
+
+        var newWalkM = cur.walkingMeters
+        var newJogM = cur.joggingMeters
+        var newRunM = cur.runningMeters
+        val curTotalDist = cur.totalDistanceMeters
+        if (samsung.distanceMeters > curTotalDist) {
+            val missing = samsung.distanceMeters - curTotalDist
+            val samActive = samsung.walkingSec + samsung.jogRunSec
+            val runShare = if (samActive > 10.0) (samsung.jogRunSec / samActive).coerceIn(0.0, 1.0) else 0.0
+            newWalkM += missing * (1.0 - runShare)
+            newRunM += missing * runShare * 0.55
+            newJogM += missing * runShare * 0.45
+        }
+
+        val newMaxSpeed = if (samsung.maxSpeedMps in 0.55..GaitClassifier.MAX_HUMAN_RUNNING_SPEED_MPS) {
+            kotlin.math.max(cur.maxSpeedMps, samsung.maxSpeedMps)
+        } else cur.maxSpeedMps
+
+        val newMaxCad = if (samsung.maxCadenceSpm in 68.0..235.0) {
+            kotlin.math.max(cur.maxCadenceSpm, samsung.maxCadenceSpm)
+        } else cur.maxCadenceSpm
+
+        val updated = cur.copy(
+            dateIso = dateIso,
+            walkingSec = newWalkSec,
+            joggingSec = newJogSec,
+            runningSec = newRunSec,
+            walkingMeters = newWalkM,
+            joggingMeters = newJogM,
+            runningMeters = newRunM,
+            totalSteps = newSteps,
+            maxSpeedMps = newMaxSpeed,
+            maxCadenceSpm = newMaxCad,
+            isDemo = false
+        )
+        upsertDailyActivity(updated)
+        return updated
     }
 
     fun hasSessionNear(startedAtMs: Long, windowMs: Long = 15L * 60_000L): Boolean {
@@ -588,6 +733,11 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             )
         }
         root.put("dailyActivity", dailyArr)
+        val samArr = JSONArray()
+        for ((_, snap) in getAllCachedSamsungSnapshots()) {
+            samArr.put(encodeSamsungSnapshot(snap))
+        }
+        root.put("samsungSnapshots", samArr)
         return root.toString(2)
     }
 

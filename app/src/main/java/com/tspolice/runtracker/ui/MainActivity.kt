@@ -28,6 +28,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.tspolice.runtracker.data.RunRepository
+import com.tspolice.runtracker.domain.ComparisonDayScope
 import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.HealthSyncStatus
@@ -68,9 +69,11 @@ class MainActivity : AppCompatActivity() {
     private var lastAutoUpdateCheckElapsedMs = -10_000_000L
     private var activeUpdateDialog: AlertDialog? = null
 
-    // Samsung Health Sync & Calibration state
+    // Samsung Health Sync & Calibration state (Yesterday + Today)
     private var healthSyncStatus: HealthSyncStatus = HealthSyncStatus.PERMISSION_REQUIRED
     private var latestSamsungSnapshot: SamsungDailySnapshot? = null
+    private var yesterdaySamsungSnapshot: SamsungDailySnapshot? = null
+    private var activeComparisonScope: ComparisonDayScope = ComparisonDayScope.TODAY
     private var latestDailySummaryForCompare: DailyActivitySummary = DailyActivitySummary()
     private var isHealthSyncInFlight = false
     private var lastHealthSyncElapsedMs = -120_000L
@@ -126,10 +129,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var dailyGaitBar: GaitBreakdownBarView
     private lateinit var dailyGaitLegendText: TextView
 
-    // Samsung Health Comparison Card views
+    // Samsung Health Comparison Card views (Yesterday + Today + 2-Day Combined)
     private lateinit var samsungSyncBadge: TextView
     private lateinit var samsungHeadlineText: TextView
     private lateinit var samsungDetailText: TextView
+    private lateinit var samsungScopeBar: LinearLayout
+    private lateinit var samScopeTodayBtn: TextView
+    private lateinit var samScopeYesterdayBtn: TextView
+    private lateinit var samScopeTwoDayBtn: TextView
+    private lateinit var samsungTwoDaySummaryStrip: TextView
     private lateinit var samsungCompareTable: LinearLayout
     private lateinit var samRowStepsTracker: TextView
     private lateinit var samRowStepsSamsung: TextView
@@ -143,11 +151,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var samRowRunTracker: TextView
     private lateinit var samRowRunSamsung: TextView
     private lateinit var samRowRunDelta: TextView
+    private lateinit var samRowPaceTracker: TextView
+    private lateinit var samRowPaceSamsung: TextView
+    private lateinit var samRowPaceDelta: TextView
+    private lateinit var samRowCadTracker: TextView
+    private lateinit var samRowCadSamsung: TextView
+    private lateinit var samRowCadDelta: TextView
     private lateinit var samRowStrideTracker: TextView
     private lateinit var samRowStrideSamsung: TextView
     private lateinit var samRowStrideDelta: TextView
     private lateinit var samsungPrimaryBtn: TextView
     private lateinit var samsungSecondaryBtn: TextView
+    private lateinit var samsungReportBtn: TextView
     private lateinit var dailyHistoryListLayout: LinearLayout
 
     // Tab 1B: 1.6 km PT Trial views
@@ -252,8 +267,11 @@ class MainActivity : AppCompatActivity() {
         repository = RunRepository(this)
         appUpdater = AppUpdater(this)
         healthSyncManager = SamsungHealthSyncManager(this, repository)
-        latestSamsungSnapshot = repository.getCachedSamsungSnapshot(LocalDate.now().toString())
-        if (latestSamsungSnapshot != null) {
+        val todayNow = LocalDate.now()
+        latestDailySummaryForCompare = repository.getDailyActivity(todayNow.toString())
+        latestSamsungSnapshot = repository.getCachedSamsungSnapshot(todayNow.toString())
+        yesterdaySamsungSnapshot = repository.getCachedSamsungSnapshot(todayNow.minusDays(1).toString())
+        if (latestSamsungSnapshot != null || yesterdaySamsungSnapshot != null) {
             healthSyncStatus = HealthSyncStatus.SYNCED
         }
 
@@ -877,7 +895,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        headerRow.addView(AthleticTheme.sectionLabel(this, "SAMSUNG HEALTH CALIBRATION", AthleticColors.CYAN_BRIGHT).apply {
+        headerRow.addView(AthleticTheme.sectionLabel(this, "SAMSUNG HEALTH  •  YESTERDAY & TODAY", AthleticColors.CYAN_BRIGHT).apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         samsungSyncBadge = TextView(this).apply {
@@ -892,20 +910,69 @@ class MainActivity : AppCompatActivity() {
         card.addView(headerRow)
 
         samsungHeadlineText = TextView(this).apply {
-            text = "Sync Samsung Health for Ground-Truth Stride"
+            text = "Pull Yesterday & Today vs Samsung Health"
             textSize = 15f
             typeface = AthleticTheme.FONT_SANS_BOLD
             setTextColor(AthleticColors.TEXT_PRIMARY)
             setPadding(0, dp(8), 0, dp(3))
         }
         samsungDetailText = TextView(this).apply {
-            text = "Compares Steps, Distance & Runs via Health Connect (backfills 14 days of Watch/Samsung runs)."
+            text = "Pulls Yesterday's full 24h & Today's live Steps, Distance, Walk/Run, Pace & Cadence via Health Connect."
             textSize = 12f
             setTextColor(AthleticColors.TEXT_SECONDARY)
             setPadding(0, 0, 0, dp(10))
         }
         card.addView(samsungHeadlineText)
         card.addView(samsungDetailText)
+
+        // 3-Way Segmented Day Switcher: Today | Yesterday | 2-Day Total
+        samsungScopeBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            visibility = View.GONE
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 11f)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+        fun makeScopePill(scope: ComparisonDayScope): TextView = TextView(this).apply {
+            text = scope.tabLabel
+            textSize = 11.5f
+            gravity = Gravity.CENTER
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setPadding(dp(6), dp(7), dp(6), dp(7))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                activeComparisonScope = scope
+                renderSamsungComparisonCard(force = true)
+            }
+        }
+        samScopeTodayBtn = makeScopePill(ComparisonDayScope.TODAY)
+        samScopeYesterdayBtn = makeScopePill(ComparisonDayScope.YESTERDAY)
+        samScopeTwoDayBtn = makeScopePill(ComparisonDayScope.TWO_DAY_COMBINED)
+        samsungScopeBar.addView(samScopeTodayBtn)
+        samsungScopeBar.addView(samScopeYesterdayBtn)
+        samsungScopeBar.addView(samScopeTwoDayBtn)
+        card.addView(samsungScopeBar)
+
+        // At-a-glance Yesterday + Today Quick Match Strip
+        samsungTwoDaySummaryStrip = TextView(this).apply {
+            text = ""
+            visibility = View.GONE
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            background = AthleticTheme.solidPill(this@MainActivity, 0x1A38BDF8, AthleticColors.HERO_CYAN_BORDER, 9f)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(9) }
+        }
+        card.addView(samsungTwoDaySummaryStrip)
 
         samsungCompareTable = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -940,17 +1007,17 @@ class MainActivity : AppCompatActivity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(5), 0, dp(5))
+                setPadding(0, dp(4.5f), 0, dp(4.5f))
             }
             val lblTv = TextView(this).apply {
                 text = label
-                textSize = 12f
+                textSize = 11.5f
                 setTextColor(AthleticColors.TEXT_SECONDARY)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.05f)
             }
             val trkTv = TextView(this).apply {
                 text = "--"
-                textSize = 12f
+                textSize = 11.5f
                 gravity = Gravity.END
                 typeface = AthleticTheme.FONT_TABULAR_BOLD
                 setTextColor(AthleticColors.TEXT_PRIMARY)
@@ -958,7 +1025,7 @@ class MainActivity : AppCompatActivity() {
             }
             val samTv = TextView(this).apply {
                 text = "--"
-                textSize = 12f
+                textSize = 11.5f
                 gravity = Gravity.END
                 typeface = AthleticTheme.FONT_TABULAR_BOLD
                 setTextColor(AthleticColors.CYAN_BRIGHT)
@@ -988,6 +1055,10 @@ class MainActivity : AppCompatActivity() {
         samRowWalkTracker = rWalk.first; samRowWalkSamsung = rWalk.second; samRowWalkDelta = rWalk.third
         val rRun = buildCompareRow("Jog + Run")
         samRowRunTracker = rRun.first; samRowRunSamsung = rRun.second; samRowRunDelta = rRun.third
+        val rPace = buildCompareRow("Max Pace")
+        samRowPaceTracker = rPace.first; samRowPaceSamsung = rPace.second; samRowPaceDelta = rPace.third
+        val rCad = buildCompareRow("Max Cad.")
+        samRowCadTracker = rCad.first; samRowCadSamsung = rCad.second; samRowCadDelta = rCad.third
         val rStride = buildCompareRow("Stride")
         samRowStrideTracker = rStride.first; samRowStrideSamsung = rStride.second; samRowStrideDelta = rStride.third
 
@@ -997,16 +1068,26 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
-        samsungPrimaryBtn = AthleticTheme.createButton(this, "Connect Samsung Health", AthleticTheme.ButtonStyle.PRIMARY_EMERALD, 44f).apply {
-            textSize = 12.5f
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f).apply { marginEnd = dp(5) }
+        samsungPrimaryBtn = AthleticTheme.createButton(this, "Pull Yesterday & Today", AthleticTheme.ButtonStyle.PRIMARY_EMERALD, 44f).apply {
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f).apply { marginEnd = dp(4) }
         }
         samsungSecondaryBtn = AthleticTheme.createButton(this, "Settings", AthleticTheme.ButtonStyle.SECONDARY_SLATE, 44f).apply {
-            textSize = 12.5f
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f).apply { marginStart = dp(5) }
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f).apply {
+                marginStart = dp(4)
+                marginEnd = dp(4)
+            }
+        }
+        samsungReportBtn = AthleticTheme.createButton(this, "Report", AthleticTheme.ButtonStyle.PRIMARY_CYAN, 44f).apply {
+            textSize = 12f
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.72f).apply { marginStart = dp(4) }
+            setOnClickListener { openTwoDaySamsungReportModal() }
         }
         btnRow.addView(samsungPrimaryBtn)
         btnRow.addView(samsungSecondaryBtn)
+        btnRow.addView(samsungReportBtn)
         card.addView(btnRow)
 
         return card
@@ -1911,7 +1992,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderDailyHistoryCards(todaySummary: DailyActivitySummary) {
         val nowMs = SystemClock.elapsedRealtime()
-        val key = "${todaySummary.dateIso}:${todaySummary.walkingSec.toInt()}:${todaySummary.jogRunCombinedSec.toInt()}:${todaySummary.totalSteps}:${cachedPastDailyLogs.size}"
+        val yesterdayIso = LocalDate.now().minusDays(1).toString()
+        val key = "${todaySummary.dateIso}:${todaySummary.walkingSec.toInt()}:${todaySummary.jogRunCombinedSec.toInt()}:" +
+            "${todaySummary.totalSteps}:${cachedPastDailyLogs.size}:${latestSamsungSnapshot?.steps}:${yesterdaySamsungSnapshot?.steps}"
         if (key == lastDailyHistoryKey && (nowMs - lastDailyHistoryRenderMs) < 4000L) return
         if ((nowMs - lastDailyHistoryRenderMs) >= 15_000L) {
             val today = LocalDate.now().toString()
@@ -1920,21 +2003,46 @@ class MainActivity : AppCompatActivity() {
         lastDailyHistoryKey = key
         lastDailyHistoryRenderMs = nowMs
 
-        val rows = mutableListOf(todaySummary).apply { addAll(cachedPastDailyLogs) }
+        val rows = mutableListOf(todaySummary)
+        val hasYesterdayInPast = cachedPastDailyLogs.any { it.dateIso == yesterdayIso }
+        if (!hasYesterdayInPast) {
+            val yestSummary = repository.getDailyActivity(yesterdayIso)
+            if (yestSummary.totalSteps > 0 || yesterdaySamsungSnapshot != null) {
+                rows.add(yestSummary)
+            }
+        }
+        rows.addAll(cachedPastDailyLogs)
+
         dailyHistoryListLayout.removeAllViews()
         for ((idx, day) in rows.withIndex()) {
             val isToday = idx == 0
+            val isYesterday = day.dateIso == yesterdayIso
+            val samSnap = when {
+                isToday -> latestSamsungSnapshot
+                isYesterday -> yesterdaySamsungSnapshot ?: repository.getCachedSamsungSnapshot(day.dateIso)
+                else -> repository.getCachedSamsungSnapshot(day.dateIso)
+            }
+
             val card = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(12), dp(10), dp(12), dp(10))
+                isClickable = isToday || isYesterday
+                isFocusable = isToday || isYesterday
                 background = AthleticTheme.solidPill(
                     this@MainActivity,
                     if (isToday) 0xFF0E1D30.toInt() else AthleticColors.SURFACE_RECESSED,
-                    if (isToday) AthleticColors.HERO_CYAN_BORDER else AthleticColors.BORDER_SUBTLE,
+                    when {
+                        isToday -> AthleticColors.HERO_CYAN_BORDER
+                        isYesterday && samSnap != null -> AthleticColors.HERO_EMERALD_BORDER
+                        else -> AthleticColors.BORDER_SUBTLE
+                    },
                     11f
                 )
                 layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                     .apply { bottomMargin = dp(7) }
+                if (isToday || isYesterday) {
+                    setOnClickListener { openTwoDaySamsungReportModal() }
+                }
             }
             val top = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -1943,12 +2051,19 @@ class MainActivity : AppCompatActivity() {
             top.addView(TextView(this).apply {
                 text = when {
                     isToday -> "TODAY  •  ${day.dateIso}"
+                    isYesterday -> "YESTERDAY  •  ${day.dateIso}"
                     day.isDemo -> "${day.dateIso}  •  SAMPLE"
                     else -> day.dateIso
                 }
                 textSize = 12f
                 typeface = AthleticTheme.FONT_SANS_BOLD
-                setTextColor(if (isToday) AthleticColors.CYAN_BRIGHT else AthleticColors.TEXT_PRIMARY)
+                setTextColor(
+                    when {
+                        isToday -> AthleticColors.CYAN_BRIGHT
+                        isYesterday -> AthleticColors.EMERALD_BRIGHT
+                        else -> AthleticColors.TEXT_PRIMARY
+                    }
+                )
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
             top.addView(TextView(this).apply {
@@ -1966,6 +2081,17 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(AthleticColors.TEXT_SECONDARY)
                 setPadding(0, dp(4), 0, 0)
             })
+            if (samSnap != null) {
+                val rep = SamsungHealthComparator.compare(day, samSnap, repository.effectiveStrideScale())
+                val matchTxt = rep.overallMatchPercent?.let { String.format("%.0f%% Match", it) } ?: "Synced"
+                card.addView(TextView(this).apply {
+                    text = "${samSnap.sourceLabel}: ${samSnap.steps} steps (${formatDistanceShort(samSnap.distanceMeters)})  •  $matchTxt"
+                    textSize = 11f
+                    typeface = AthleticTheme.FONT_SANS_MEDIUM
+                    setTextColor(AthleticColors.CYAN_BRIGHT)
+                    setPadding(0, dp(3), 0, 0)
+                })
+            }
             dailyHistoryListLayout.addView(card)
         }
     }
@@ -2350,33 +2476,72 @@ class MainActivity : AppCompatActivity() {
         return String.format("%s%d:%02d", sign, a / 60, a % 60)
     }
 
+    private fun openTwoDaySamsungReportModal() {
+        val yesterdayIso = LocalDate.now().minusDays(1).toString()
+        val yesterdayTrk = repository.getDailyActivity(yesterdayIso)
+        val todayTrk = latestDailySummaryForCompare
+        SessionDialogs.showTwoDayComparisonDialog(
+            ctx = this,
+            yesterdayTracker = yesterdayTrk,
+            yesterdaySamsung = yesterdaySamsungSnapshot ?: repository.getCachedSamsungSnapshot(yesterdayIso),
+            todayTracker = todayTrk,
+            todaySamsung = latestSamsungSnapshot,
+            strideScale = repository.effectiveStrideScale()
+        )
+    }
+
     private fun renderSamsungComparisonCard(force: Boolean) {
         if (!::samsungHeadlineText.isInitialized) return
-        val daily = latestDailySummaryForCompare
-        val sam = latestSamsungSnapshot
+        val todayTrk = latestDailySummaryForCompare
+        val yesterdayIso = LocalDate.now().minusDays(1).toString()
+        val yesterdayTrk = repository.getDailyActivity(yesterdayIso)
+        val todaySam = latestSamsungSnapshot
+        val yesterdaySam = yesterdaySamsungSnapshot
         val scale = repository.effectiveStrideScale()
 
-        val key = "${healthSyncStatus}:${isHealthSyncInFlight}:${daily.totalSteps}:${daily.totalDistanceMeters.toInt()}:" +
-            "${daily.walkingSec.toInt()}:${daily.jogRunCombinedSec.toInt()}:${sam?.steps}:${sam?.distanceMeters?.toInt()}:${String.format("%.3f", scale)}"
+        val key = "${healthSyncStatus}:${isHealthSyncInFlight}:${activeComparisonScope}:" +
+            "${todayTrk.totalSteps}:${todayTrk.totalDistanceMeters.toInt()}:${yesterdayTrk.totalSteps}:" +
+            "${todaySam?.steps}:${todaySam?.distanceMeters?.toInt()}:" +
+            "${yesterdaySam?.steps}:${yesterdaySam?.distanceMeters?.toInt()}:${String.format("%.3f", scale)}"
         if (!force && key == lastSamsungRenderKey) return
         lastSamsungRenderKey = key
 
         if (isHealthSyncInFlight) {
-            samsungSyncBadge.text = "SYNCING..."
+            samsungSyncBadge.text = "PULLING 2 DAYS..."
             samsungSyncBadge.background = AthleticTheme.solidPill(this, AthleticColors.CYAN_BRIGHT, AthleticColors.CYAN_BRIGHT, 10f, 0f)
             samsungPrimaryBtn.isEnabled = false
-            samsungPrimaryBtn.text = "Syncing Health Connect..."
+            samsungPrimaryBtn.text = "Pulling Yesterday & Today..."
             return
         }
         samsungPrimaryBtn.isEnabled = true
 
+        // Style the 3 scope pills (Today | Yesterday | 2-Day Total)
+        val scopePairs = listOf(
+            ComparisonDayScope.TODAY to samScopeTodayBtn,
+            ComparisonDayScope.YESTERDAY to samScopeYesterdayBtn,
+            ComparisonDayScope.TWO_DAY_COMBINED to samScopeTwoDayBtn
+        )
+        for ((sc, btn) in scopePairs) {
+            val active = sc == activeComparisonScope
+            if (active) {
+                btn.background = AthleticTheme.solidPill(this, AthleticColors.CYAN_BRIGHT, AthleticColors.CYAN_BRIGHT, 8.5f, 0f)
+                btn.setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            } else {
+                btn.background = null
+                btn.setTextColor(AthleticColors.TEXT_SECONDARY)
+            }
+        }
+
         when (healthSyncStatus) {
             HealthSyncStatus.NOT_INSTALLED -> {
+                samsungScopeBar.visibility = View.GONE
+                samsungTwoDaySummaryStrip.visibility = View.GONE
                 samsungCompareTable.visibility = View.GONE
+                samsungReportBtn.visibility = View.GONE
                 samsungSyncBadge.text = "INSTALL HC"
                 samsungSyncBadge.background = AthleticTheme.solidPill(this, AthleticColors.AMBER_BRIGHT, AthleticColors.AMBER_BRIGHT, 10f, 0f)
                 samsungHeadlineText.text = "Android Health Connect Needed"
-                samsungDetailText.text = "Install or update Health Connect so Samsung Health can share steps, distance & 14-day runs."
+                samsungDetailText.text = "Install or update Health Connect so Samsung Health can share Yesterday & Today steps, distance & runs."
                 samsungPrimaryBtn.text = "Get Health Connect"
                 samsungPrimaryBtn.setOnClickListener { healthSyncManager.openSamsungHealthOrHealthConnectSettings() }
                 samsungSecondaryBtn.visibility = View.VISIBLE
@@ -2385,12 +2550,15 @@ class MainActivity : AppCompatActivity() {
             }
 
             HealthSyncStatus.PERMISSION_REQUIRED -> {
+                samsungScopeBar.visibility = View.GONE
+                samsungTwoDaySummaryStrip.visibility = View.GONE
                 samsungCompareTable.visibility = View.GONE
+                samsungReportBtn.visibility = View.GONE
                 samsungSyncBadge.text = "CONNECT"
                 samsungSyncBadge.background = AthleticTheme.solidPill(this, AthleticColors.CYAN_BRIGHT, AthleticColors.CYAN_BRIGHT, 10f, 0f)
-                samsungHeadlineText.text = "Connect Samsung Health for Ground-Truth Accuracy"
+                samsungHeadlineText.text = "Connect Samsung Health (Yesterday & Today)"
                 samsungDetailText.text =
-                    "Compares Tracker vs Samsung Health side-by-side, calibrates your personal stride & imports past 14 days of Watch/Samsung runs."
+                    "Pulls Yesterday's completed 24h & Today's live Samsung Health data to compare accuracy side-by-side and calibrate your stride."
                 samsungPrimaryBtn.text = "Connect Samsung Health"
                 samsungPrimaryBtn.setOnClickListener { requestSamsungPermissionsSafely() }
                 samsungSecondaryBtn.visibility = View.VISIBLE
@@ -2403,12 +2571,15 @@ class MainActivity : AppCompatActivity() {
             }
 
             HealthSyncStatus.WAITING_FOR_SAMSUNG_SYNC -> {
+                samsungScopeBar.visibility = View.GONE
+                samsungTwoDaySummaryStrip.visibility = View.GONE
                 samsungCompareTable.visibility = View.GONE
+                samsungReportBtn.visibility = View.GONE
                 samsungSyncBadge.text = "ENABLE SYNC"
                 samsungSyncBadge.background = AthleticTheme.solidPill(this, AthleticColors.AMBER_BRIGHT, AthleticColors.AMBER_BRIGHT, 10f, 0f)
                 samsungHeadlineText.text = "Turn ON Health Connect inside Samsung Health"
                 samsungDetailText.text =
-                    "In Samsung Health → ⋮ → Settings → Health Connect → Allow all, then tap 'Sync Now'."
+                    "In Samsung Health → ⋮ → Settings → Health Connect → Allow all, then tap 'Pull Now'."
                 samsungPrimaryBtn.text = "Open Samsung Health"
                 samsungPrimaryBtn.setOnClickListener {
                     if (!healthSyncManager.openSamsungHealthAppDirectly()) {
@@ -2416,17 +2587,20 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 samsungSecondaryBtn.visibility = View.VISIBLE
-                samsungSecondaryBtn.text = "Sync Now"
+                samsungSecondaryBtn.text = "Pull Now"
                 samsungSecondaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
             }
 
             HealthSyncStatus.SYNCED, HealthSyncStatus.ERROR -> {
-                if (sam == null) {
+                if (todaySam == null && yesterdaySam == null) {
+                    samsungScopeBar.visibility = View.GONE
+                    samsungTwoDaySummaryStrip.visibility = View.GONE
                     samsungCompareTable.visibility = View.GONE
+                    samsungReportBtn.visibility = View.GONE
                     samsungSyncBadge.text = "SYNC"
-                    samsungHeadlineText.text = "Tap Sync Now to Pull Samsung Health Data"
-                    samsungDetailText.text = "Ensure Health Connect permissions are active for Samsung Health and TS Police 1.6K."
-                    samsungPrimaryBtn.text = "Sync & Calibrate"
+                    samsungHeadlineText.text = "Tap to Pull Yesterday & Today Data"
+                    samsungDetailText.text = "Pulls both Yesterday ($yesterdayIso) and Today from Samsung Health via Health Connect."
+                    samsungPrimaryBtn.text = "Pull Yesterday & Today"
                     samsungPrimaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
                     samsungSecondaryBtn.visibility = View.VISIBLE
                     samsungSecondaryBtn.text = "Settings"
@@ -2434,7 +2608,43 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
 
-                val report = SamsungHealthComparator.compare(daily, sam, scale)
+                samsungScopeBar.visibility = View.VISIBLE
+                samsungReportBtn.visibility = View.VISIBLE
+
+                // Render the 2-Day Quick Summary Strip so both Yesterday & Today match % are always visible
+                val yestMatchStr = yesterdaySam?.let {
+                    val r = SamsungHealthComparator.compare(yesterdayTrk, it, scale, "yesterday")
+                    r.overallMatchPercent?.let { p -> String.format("Yesterday %.0f%% (%d/%d)", p, yesterdayTrk.totalSteps, it.steps) }
+                        ?: "Yesterday: ${it.steps} steps"
+                } ?: "Yesterday: --"
+                val todayMatchStr = todaySam?.let {
+                    val r = SamsungHealthComparator.compare(todayTrk, it, scale, "today")
+                    r.overallMatchPercent?.let { p -> String.format("Today %.0f%% (%d/%d)", p, todayTrk.totalSteps, it.steps) }
+                        ?: "Today: ${it.steps} steps"
+                } ?: "Today: --"
+                samsungTwoDaySummaryStrip.visibility = View.VISIBLE
+                samsungTwoDaySummaryStrip.text = "$yestMatchStr   •   $todayMatchStr"
+
+                val (selectedTrk, selectedSam, dayLabel) = when (activeComparisonScope) {
+                    ComparisonDayScope.TODAY -> Triple(
+                        todayTrk,
+                        todaySam ?: SamsungDailySnapshot(dateIso = todayTrk.dateIso),
+                        "today"
+                    )
+                    ComparisonDayScope.YESTERDAY -> Triple(
+                        yesterdayTrk,
+                        yesterdaySam ?: SamsungDailySnapshot(dateIso = yesterdayIso),
+                        "yesterday ($yesterdayIso)"
+                    )
+                    ComparisonDayScope.TWO_DAY_COMBINED -> Triple(
+                        SamsungHealthComparator.combineDailySummaries(yesterdayTrk, todayTrk),
+                        SamsungHealthComparator.combineSamsungSnapshots(yesterdaySam, todaySam)
+                            ?: SamsungDailySnapshot(dateIso = "$yesterdayIso..${todayTrk.dateIso}"),
+                        "yesterday + today"
+                    )
+                }
+
+                val report = SamsungHealthComparator.compare(selectedTrk, selectedSam, scale, dayLabel)
                 samsungCompareTable.visibility = View.VISIBLE
 
                 val matchBadge = report.overallMatchPercent?.let { String.format("%.0f%% MATCH", it) }
@@ -2447,8 +2657,8 @@ class MainActivity : AppCompatActivity() {
                 samsungHeadlineText.text = report.headline
                 samsungDetailText.text = report.detailAdvice
 
-                samRowStepsTracker.text = "${daily.totalSteps}"
-                samRowStepsSamsung.text = "${sam.steps}"
+                samRowStepsTracker.text = "${selectedTrk.totalSteps}"
+                samRowStepsSamsung.text = "${selectedSam.steps}"
                 val stSign = if (report.stepsDelta > 0) "+${report.stepsDelta}" else "${report.stepsDelta}"
                 samRowStepsDelta.text = report.stepsMatchPercent?.let {
                     String.format("%.0f%% (%s)", it, if (report.stepsDelta == 0) "0" else stSign)
@@ -2457,8 +2667,8 @@ class MainActivity : AppCompatActivity() {
                     if ((report.stepsMatchPercent ?: 100.0) >= 88.0) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
                 )
 
-                samRowDistTracker.text = formatDistanceShort(daily.totalDistanceMeters)
-                samRowDistSamsung.text = formatDistanceShort(sam.distanceMeters)
+                samRowDistTracker.text = formatDistanceShort(selectedTrk.totalDistanceMeters)
+                samRowDistSamsung.text = formatDistanceShort(selectedSam.distanceMeters)
                 val dMeters = report.distanceDeltaMeters.roundToInt()
                 val dSign = if (dMeters > 0) "+${dMeters}m" else "${dMeters}m"
                 samRowDistDelta.text = report.distanceMatchPercent?.let {
@@ -2468,34 +2678,66 @@ class MainActivity : AppCompatActivity() {
                     if ((report.distanceMatchPercent ?: 100.0) >= 88.0) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
                 )
 
-                samRowWalkTracker.text = TsPoliceBenchmark.formatDuration(daily.walkingSec)
-                samRowWalkSamsung.text = TsPoliceBenchmark.formatDuration(sam.walkingSec)
+                samRowWalkTracker.text = TsPoliceBenchmark.formatDuration(selectedTrk.walkingSec)
+                samRowWalkSamsung.text = TsPoliceBenchmark.formatDuration(selectedSam.walkingSec)
                 samRowWalkDelta.text = formatSignedSeconds(report.walkSecDelta)
 
-                samRowRunTracker.text = TsPoliceBenchmark.formatDuration(daily.jogRunCombinedSec)
-                samRowRunSamsung.text = TsPoliceBenchmark.formatDuration(sam.jogRunSec)
+                samRowRunTracker.text = TsPoliceBenchmark.formatDuration(selectedTrk.jogRunCombinedSec)
+                samRowRunSamsung.text = TsPoliceBenchmark.formatDuration(selectedSam.jogRunSec)
                 samRowRunDelta.text = formatSignedSeconds(report.jogRunSecDelta)
+
+                samRowPaceTracker.text = TsPoliceBenchmark.formatPacePerKm(selectedTrk.maxSpeedMps)
+                samRowPaceSamsung.text = TsPoliceBenchmark.formatPacePerKm(selectedSam.maxSpeedMps)
+                samRowPaceDelta.text = if (selectedTrk.maxSpeedMps >= 0.4 && selectedSam.maxSpeedMps >= 0.4) {
+                    val trkSecKm = 1000.0 / selectedTrk.maxSpeedMps
+                    val samSecKm = 1000.0 / selectedSam.maxSpeedMps
+                    val pDiff = (trkSecKm - samSecKm).roundToInt()
+                    if (abs(pDiff) <= 3) "Exact" else String.format("%+ds/km", pDiff)
+                } else "--"
+
+                samRowCadTracker.text = if (selectedTrk.maxCadenceSpm > 0) "${selectedTrk.maxCadenceSpm.roundToInt()} spm" else "--"
+                samRowCadSamsung.text = if (selectedSam.maxCadenceSpm > 0) "${selectedSam.maxCadenceSpm.roundToInt()} spm" else "--"
+                samRowCadDelta.text = report.maxCadenceDeltaSpm?.let {
+                    val cDiff = it.roundToInt()
+                    if (abs(cDiff) <= 2) "Exact" else String.format("%+d spm", cDiff)
+                } ?: "--"
 
                 samRowStrideTracker.text = report.trackerStrideM?.let { String.format("%.2f m", it) } ?: "--"
                 samRowStrideSamsung.text = report.samsungStrideM?.let { String.format("%.2f m", it) } ?: "--"
                 samRowStrideDelta.text = String.format("Cal %.2fx", scale)
                 samRowStrideDelta.setTextColor(AthleticColors.CYAN_BRIGHT)
 
-                samsungPrimaryBtn.text = "Sync & Calibrate"
+                samsungPrimaryBtn.text = "Pull Yesterday & Today"
                 samsungPrimaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
 
-                val samsungHasHigherTotals = sam.steps > daily.totalSteps + 25 ||
-                    sam.distanceMeters > daily.totalDistanceMeters + 25.0
+                val samsungHasHigherTotals = selectedSam.steps > selectedTrk.totalSteps + 25 ||
+                    selectedSam.distanceMeters > selectedTrk.totalDistanceMeters + 25.0
                 samsungSecondaryBtn.visibility = View.VISIBLE
                 if (samsungHasHigherTotals) {
-                    val extraSteps = max(0, sam.steps - daily.totalSteps)
-                    samsungSecondaryBtn.text = if (extraSteps > 0) "Align (+$extraSteps)" else "Align Today"
+                    val extraSteps = max(0, selectedSam.steps - selectedTrk.totalSteps)
+                    samsungSecondaryBtn.text = when (activeComparisonScope) {
+                        ComparisonDayScope.YESTERDAY -> if (extraSteps > 0) "Align Yest (+$extraSteps)" else "Align Yesterday"
+                        ComparisonDayScope.TWO_DAY_COMBINED -> "Align Both Days"
+                        ComparisonDayScope.TODAY -> if (extraSteps > 0) "Align (+$extraSteps)" else "Align Today"
+                    }
                     samsungSecondaryBtn.setTextColor(AthleticColors.CYAN_BRIGHT)
                     samsungSecondaryBtn.setOnClickListener {
-                        trackingService?.alignTodayWithSamsungHealth(sam)
+                        when (activeComparisonScope) {
+                            ComparisonDayScope.YESTERDAY -> {
+                                yesterdaySam?.let { repository.alignDailyActivityWithSamsung(yesterdayIso, it) }
+                            }
+                            ComparisonDayScope.TODAY -> {
+                                todaySam?.let { trackingService?.alignTodayWithSamsungHealth(it) }
+                            }
+                            ComparisonDayScope.TWO_DAY_COMBINED -> {
+                                yesterdaySam?.let { repository.alignDailyActivityWithSamsung(yesterdayIso, it) }
+                                todaySam?.let { trackingService?.alignTodayWithSamsungHealth(it) }
+                            }
+                        }
                         refreshCachedDailyHistory(forceRender = true)
                         renderSamsungComparisonCard(force = true)
-                        Toast.makeText(this, "Aligned today's floor with ${sam.sourceLabel}!", Toast.LENGTH_SHORT).show()
+                        renderDailyHistoryCards(latestDailySummaryForCompare)
+                        Toast.makeText(this, "Aligned ${activeComparisonScope.titlePrefix} with ${selectedSam.sourceLabel}!", Toast.LENGTH_SHORT).show()
                     }
                 } else {
                     samsungSecondaryBtn.text = "Health Connect"
@@ -2531,18 +2773,23 @@ class MainActivity : AppCompatActivity() {
             if (outcome.snapshot != null) {
                 latestSamsungSnapshot = outcome.snapshot
             }
+            if (outcome.yesterdaySnapshot != null) {
+                yesterdaySamsungSnapshot = outcome.yesterdaySnapshot
+            }
             trackingService?.syncThresholdsFromPrefs()
+            refreshCachedDailyHistory(forceRender = true)
             if (outcome.importedRunCount > 0) {
                 refreshProgressDashboard()
                 Toast.makeText(
                     this@MainActivity,
-                    "Imported ${outcome.importedRunCount} Samsung Health run(s) into Progress!",
+                    "Pulled Yesterday & Today + imported ${outcome.importedRunCount} Samsung Health run(s)!",
                     Toast.LENGTH_LONG
                 ).show()
             } else if (userTriggered) {
                 Toast.makeText(this@MainActivity, outcome.statusMessage, Toast.LENGTH_SHORT).show()
             }
             renderSamsungComparisonCard(force = true)
+            renderDailyHistoryCards(latestDailySummaryForCompare)
         }
     }
 

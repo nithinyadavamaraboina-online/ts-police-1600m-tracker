@@ -1,8 +1,8 @@
 {
-    "versionCode":  10,
-    "versionName":  "1.0.9",
+    "versionCode":  11,
+    "versionName":  "1.0.10",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "ba23735009c6108f87689380c9d3882741f579f831a6b01567dc5f3fe510378e",
-    "changelog":  "Major Athletic UI Overhaul (Midnight Obsidian + Volt Emerald rings, glowing race cockpit, custom vector icons, modern pill toggles) + Official Unpaused TSLPRB Race Clock, Smart 24/7 Stationary Battery Saver, 3-Mode Smart Pocket Audio (en-IN + 1400m Final Kick Bell), Guided 400m Speed-Endurance Interval Coach, TSLPRB Merit Gradation Marks (0-100 pts), Tap-to-Inspect Lap Splits, JSON Backup \u0026 14-Day Samsung Health Sync.",
-    "publishedAt":  "2026-10-26T10:24:18Z"
+    "sha256":  "92cd58f359cb8e077654d5bb7e75bc7124a04553d5725fb08cbfb6c44d57783d",
+    "changelog":  "Pull \u0026 compare Yesterday + Today + 2-Day Combined data against Samsung Health (Steps, Distance, Walk, Jog+Run, Max Pace, Max Cadence \u0026 Stride), 2-day personal stride calibration, Align Yesterday/Today, and 1-tap Copyable 2-Day Accuracy Report.",
+    "publishedAt":  "2026-10-27T15:49:49Z"
 }

@@ -14,12 +14,16 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.tspolice.runtracker.data.RunRepository
+import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
+import com.tspolice.runtracker.domain.SamsungDailySnapshot
+import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import java.time.LocalDate
 import java.time.ZoneId
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 object SessionDialogs {
 
@@ -345,6 +349,181 @@ object SessionDialogs {
                     }
                     .setNegativeButton("Cancel", null)
                     .show()
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    /**
+     * Rich dark modal displaying Yesterday, Today, and 2-Day Combined side-by-side comparison
+     * against Samsung Health, with 1-tap Copy & Share Report.
+     */
+    fun showTwoDayComparisonDialog(
+        ctx: Context,
+        yesterdayTracker: DailyActivitySummary,
+        yesterdaySamsung: SamsungDailySnapshot?,
+        todayTracker: DailyActivitySummary,
+        todaySamsung: SamsungDailySnapshot?,
+        strideScale: Double
+    ) {
+        val scroll = ScrollView(ctx)
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(AthleticColors.SURFACE_BOTTOM)
+            setPadding(dp(ctx, 18f), dp(ctx, 18f), dp(ctx, 18f), dp(ctx, 12f))
+        }
+
+        root.addView(AthleticTheme.sectionLabel(ctx, "SAMSUNG HEALTH 2-DAY ACCURACY AUDIT", AthleticColors.CYAN_BRIGHT))
+        root.addView(TextView(ctx).apply {
+            text = "Yesterday (${yesterdayTracker.dateIso})  +  Today (${todayTracker.dateIso})"
+            textSize = 15f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(ctx, 5f), 0, dp(ctx, 2f))
+        })
+        root.addView(TextView(ctx).apply {
+            text = String.format("Calibrated Personal Stride Scale: %.2fx", strideScale)
+            textSize = 12f
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            setPadding(0, 0, 0, dp(ctx, 10f))
+        })
+
+        fun addDaySection(title: String, trk: DailyActivitySummary, sam: SamsungDailySnapshot?) {
+            val box = LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(ctx, 12f), dp(ctx, 10f), dp(ctx, 12f), dp(ctx, 10f))
+                background = AthleticTheme.solidPill(ctx, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 12f)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(ctx, 10f) }
+            }
+
+            val topRow = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, dp(ctx, 6f))
+            }
+            topRow.addView(TextView(ctx).apply {
+                text = title
+                textSize = 12f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setTextColor(AthleticColors.CYAN_BRIGHT)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+
+            if (sam == null) {
+                box.addView(topRow)
+                box.addView(TextView(ctx).apply {
+                    text = "Tracker: ${trk.totalSteps} steps • ${String.format("%.2f km", trk.totalDistanceMeters / 1000.0)}\nSamsung Health: Not synced yet for this date."
+                    textSize = 12f
+                    setTextColor(AthleticColors.TEXT_SECONDARY)
+                })
+                root.addView(box)
+                return
+            }
+
+            val rep = SamsungHealthComparator.compare(trk, sam, strideScale, title.lowercase())
+            val pctText = rep.overallMatchPercent?.let { String.format("%.1f%% MATCH", it) } ?: "SYNCED"
+            val high = (rep.overallMatchPercent ?: 100.0) >= 88.0
+            topRow.addView(TextView(ctx).apply {
+                text = pctText
+                textSize = 10.5f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setTextColor(if (high) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
+            })
+            box.addView(topRow)
+
+            fun addLine(metric: String, tVal: String, sVal: String, dVal: String) {
+                val r = LinearLayout(ctx).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    setPadding(0, dp(ctx, 2.5f), 0, dp(ctx, 2.5f))
+                }
+                r.addView(TextView(ctx).apply {
+                    text = metric
+                    textSize = 11.5f
+                    setTextColor(AthleticColors.TEXT_SECONDARY)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f)
+                })
+                r.addView(TextView(ctx).apply {
+                    text = tVal
+                    textSize = 11.5f
+                    gravity = Gravity.END
+                    typeface = AthleticTheme.FONT_TABULAR_BOLD
+                    setTextColor(AthleticColors.TEXT_PRIMARY)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f)
+                })
+                r.addView(TextView(ctx).apply {
+                    text = sVal
+                    textSize = 11.5f
+                    gravity = Gravity.END
+                    typeface = AthleticTheme.FONT_TABULAR_BOLD
+                    setTextColor(AthleticColors.CYAN_BRIGHT)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f)
+                })
+                r.addView(TextView(ctx).apply {
+                    text = dVal
+                    textSize = 11f
+                    gravity = Gravity.END
+                    typeface = AthleticTheme.FONT_SANS_BOLD
+                    setTextColor(AthleticColors.EMERALD_BRIGHT)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.05f)
+                })
+                box.addView(r)
+            }
+
+            fun fmtDist(m: Double) = if (m >= 1000.0) String.format("%.2f km", m / 1000.0) else "${m.toInt()} m"
+            val stSign = if (rep.stepsDelta >= 0) "+${rep.stepsDelta}" else "${rep.stepsDelta}"
+            val dm = rep.distanceDeltaMeters.roundToInt()
+            val dmSign = if (dm >= 0) "+${dm}m" else "${dm}m"
+
+            addLine("Steps", "${trk.totalSteps}", "${sam.steps}", stSign)
+            addLine("Distance", fmtDist(trk.totalDistanceMeters), fmtDist(sam.distanceMeters), dmSign)
+            addLine("Walk", TsPoliceBenchmark.formatDuration(trk.walkingSec), TsPoliceBenchmark.formatDuration(sam.walkingSec), "${rep.walkSecDelta.roundToInt()}s")
+            addLine("Jog+Run", TsPoliceBenchmark.formatDuration(trk.jogRunCombinedSec), TsPoliceBenchmark.formatDuration(sam.jogRunSec), "${rep.jogRunSecDelta.roundToInt()}s")
+            addLine("Max Pace", TsPoliceBenchmark.formatPacePerKm(trk.maxSpeedMps), TsPoliceBenchmark.formatPacePerKm(sam.maxSpeedMps), "")
+            addLine("Max Cad.", "${trk.maxCadenceSpm.roundToInt()} spm", "${sam.maxCadenceSpm.roundToInt()} spm", "")
+            addLine(
+                "Stride",
+                rep.trackerStrideM?.let { String.format("%.2fm", it) } ?: "--",
+                rep.samsungStrideM?.let { String.format("%.2fm", it) } ?: "--",
+                String.format("%.2fx", strideScale)
+            )
+            root.addView(box)
+        }
+
+        addDaySection("YESTERDAY (${yesterdayTracker.dateIso})", yesterdayTracker, yesterdaySamsung)
+        addDaySection("TODAY (${todayTracker.dateIso})", todayTracker, todaySamsung)
+
+        val combSam = SamsungHealthComparator.combineSamsungSnapshots(yesterdaySamsung, todaySamsung)
+        val combTrk = SamsungHealthComparator.combineDailySummaries(yesterdayTracker, todayTracker)
+        addDaySection("2-DAY COMBINED TOTAL", combTrk, combSam)
+
+        val reportText = SamsungHealthComparator.buildTwoDayReportText(
+            yesterdayTracker = yesterdayTracker,
+            yesterdaySamsung = yesterdaySamsung,
+            todayTracker = todayTracker,
+            todaySamsung = todaySamsung,
+            effectiveStrideScale = strideScale
+        )
+
+        scroll.addView(root)
+        AlertDialog.Builder(ctx)
+            .setView(scroll)
+            .setPositiveButton("Copy Report") { _, _ ->
+                runCatching {
+                    val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    cm?.setPrimaryClip(ClipData.newPlainText("Samsung_2Day_Comparison", reportText))
+                }
+                Toast.makeText(ctx, "Copied Yesterday + Today comparison report to clipboard!", Toast.LENGTH_LONG).show()
+            }
+            .setNeutralButton("Share") { _, _ ->
+                val share = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "TS Police 1.6K vs Samsung Health (Yesterday & Today)")
+                    putExtra(Intent.EXTRA_TEXT, reportText)
+                }
+                ctx.startActivity(Intent.createChooser(share, "Share 2-Day Accuracy Report"))
             }
             .setNegativeButton("Close", null)
             .show()
