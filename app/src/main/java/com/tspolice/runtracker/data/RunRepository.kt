@@ -30,7 +30,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
 ) {
     companion object {
         private const val DB_NAME = "ts_police_1600m.db"
-        private const val DB_VERSION = 3
+        private const val DB_VERSION = 4
         private const val TABLE_RUNS = "run_sessions"
         private const val TABLE_DAILY = "daily_activity"
         private const val TABLE_HOURLY = "sensor_hourly_buckets"
@@ -53,6 +53,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_CACHED_SAMSUNG_MAP_JSON = "cached_samsung_snapshots_map_v2"
         private const val KEY_IMPORTED_EXT_WORKOUTS = "imported_external_workout_ids"
         private const val KEY_LAST_TUNING_SYNC_SUMMARY = "last_tuning_sync_summary"
+        private const val KEY_VERIFIED_HW_PEDOMETER = "verified_hw_pedometer_active"
     }
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -146,11 +147,31 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
                 accel_rms REAL NOT NULL,
                 min_raw_norm REAL,
                 peak_to_trough REAL,
+                p20_raw_norm REAL,
                 is_low_power INTEGER NOT NULL DEFAULT 0,
                 pt_phase TEXT NOT NULL
             )
             """.trimIndent()
         )
+        ensureTransitionP20Column(db)
+    }
+
+    private fun ensureTransitionP20Column(db: SQLiteDatabase) {
+        var hasP20 = false
+        db.rawQuery("PRAGMA table_info($TABLE_TRANSITIONS)", null).use { c ->
+            val nameIdx = c.getColumnIndex("name")
+            while (c.moveToNext()) {
+                if (nameIdx >= 0 && c.getString(nameIdx) == "p20_raw_norm") {
+                    hasP20 = true
+                    break
+                }
+            }
+        }
+        if (!hasP20) {
+            runCatching {
+                db.execSQL("ALTER TABLE $TABLE_TRANSITIONS ADD COLUMN p20_raw_norm REAL")
+            }
+        }
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -160,6 +181,10 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         }
         if (oldVersion < 3) {
             createTuningTablesIfNeeded(db)
+        }
+        if (oldVersion < 4) {
+            createTuningTablesIfNeeded(db)
+            ensureTransitionP20Column(db)
         }
     }
 
@@ -224,6 +249,10 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         get() = prefs.getBoolean(KEY_STEP_FALLBACK, true)
         set(value) = prefs.edit().putBoolean(KEY_STEP_FALLBACK, value).apply()
 
+    var hasVerifiedHardwarePedometer: Boolean
+        get() = prefs.getBoolean(KEY_VERIFIED_HW_PEDOMETER, false)
+        set(value) = prefs.edit().putBoolean(KEY_VERIFIED_HW_PEDOMETER, value).apply()
+
     var allDayTrackingEnabled: Boolean
         get() = prefs.getBoolean(KEY_ALL_DAY_AUTO, true)
         set(value) = prefs.edit().putBoolean(KEY_ALL_DAY_AUTO, value).apply()
@@ -273,6 +302,8 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             put("sourceLabel", snapshot.sourceLabel)
             put("syncedAtEpochMs", snapshot.syncedAtEpochMs)
             put("workouts", workoutsArr)
+            put("rawHealthConnectDistanceMeters", snapshot.rawHealthConnectDistanceMeters)
+            put("distanceIncludedPassiveEstimate", snapshot.distanceIncludedPassiveEstimate)
         }
     }
 
@@ -297,10 +328,11 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
                 )
             }
         }
+        val distMeters = o.optDouble("distanceMeters", 0.0)
         return SamsungDailySnapshot(
             dateIso = o.optString("dateIso"),
             steps = o.optInt("steps", 0),
-            distanceMeters = o.optDouble("distanceMeters", 0.0),
+            distanceMeters = distMeters,
             walkingSec = o.optDouble("walkingSec", 0.0),
             jogRunSec = o.optDouble("jogRunSec", 0.0),
             maxSpeedMps = o.optDouble("maxSpeedMps", 0.0),
@@ -308,7 +340,9 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             sourcePackage = o.optString("sourcePackage", SamsungHealthComparator.SAMSUNG_HEALTH_PACKAGE),
             sourceLabel = o.optString("sourceLabel", "Samsung Health"),
             syncedAtEpochMs = o.optLong("syncedAtEpochMs", 0L),
-            workouts = workoutsList
+            workouts = workoutsList,
+            rawHealthConnectDistanceMeters = o.optDouble("rawHealthConnectDistanceMeters", distMeters),
+            distanceIncludedPassiveEstimate = o.optBoolean("distanceIncludedPassiveEstimate", false)
         )
     }
 
@@ -369,42 +403,96 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     }
 
     /**
-     * Safely aligns a past day's SQLite [DailyActivitySummary] (e.g. Yesterday) with Samsung Health
-     * ground-truth totals if the user wore a Galaxy Watch or had steps recorded while the app wasn't running.
+     * Bidirectionally aligns a day's SQLite [DailyActivitySummary] with Samsung Health ground truth:
+     *  - Adds missed steps/distance if the user wore a Galaxy Watch or walked while the app was off.
+     *  - Cleans overcounted pre-update bike/vibration steps, fake jog/run time, and vehicle speed spikes
+     *    while preserving any real saved 1.6 km / Open Run sessions recorded in [TABLE_RUNS] for [dateIso].
      */
     fun alignDailyActivityWithSamsung(dateIso: String, samsung: SamsungDailySnapshot): DailyActivitySummary {
         val cur = getDailyActivity(dateIso)
-        val newSteps = kotlin.math.max(cur.totalSteps, samsung.steps)
-        val newWalkSec = kotlin.math.max(cur.walkingSec, samsung.walkingSec)
-        val curJogRunSec = cur.jogRunCombinedSec
-        var newJogSec = cur.joggingSec
-        var newRunSec = cur.runningSec
-        if (samsung.jogRunSec > curJogRunSec) {
-            val extra = samsung.jogRunSec - curJogRunSec
-            newRunSec += extra * 0.55
-            newJogSec += extra * 0.45
+        if (samsung.steps <= 0 && samsung.distanceMeters < 5.0) {
+            return cur
         }
 
-        var newWalkM = cur.walkingMeters
-        var newJogM = cur.joggingMeters
-        var newRunM = cur.runningMeters
-        val curTotalDist = cur.totalDistanceMeters
-        if (samsung.distanceMeters > curTotalDist) {
-            val missing = samsung.distanceMeters - curTotalDist
-            val samActive = samsung.walkingSec + samsung.jogRunSec
-            val runShare = if (samActive > 10.0) (samsung.jogRunSec / samActive).coerceIn(0.0, 1.0) else 0.0
-            newWalkM += missing * (1.0 - runShare)
-            newRunM += missing * runShare * 0.55
-            newJogM += missing * runShare * 0.45
+        val dayRuns = getAllSessions().filter { !it.isDemo && it.dateIso == dateIso }
+        val savedRunSec = dayRuns.sumOf { it.runningSec }
+        val savedJogSec = dayRuns.sumOf { it.joggingSec }
+        val savedRunDistM = dayRuns.sumOf { it.distanceMeters }
+        val savedMaxSpeed = dayRuns.maxOfOrNull { it.maxSpeedMps } ?: 0.0
+        val savedMaxCad = dayRuns.maxOfOrNull { it.avgCadenceSpm } ?: 0.0
+
+        val newSteps = if (samsung.steps > 0) {
+            kotlin.math.max(samsung.steps, (savedRunDistM / 1.25).toInt())
+        } else {
+            cur.totalSteps
         }
 
-        val newMaxSpeed = if (samsung.maxSpeedMps in 0.55..GaitClassifier.MAX_HUMAN_RUNNING_SPEED_MPS) {
-            kotlin.math.max(cur.maxSpeedMps, samsung.maxSpeedMps)
-        } else cur.maxSpeedMps
+        val targetJogRunSec = kotlin.math.max(samsung.jogRunSec, savedRunSec + savedJogSec)
 
-        val newMaxCad = if (samsung.maxCadenceSpm in 68.0..235.0) {
-            kotlin.math.max(cur.maxCadenceSpm, samsung.maxCadenceSpm)
-        } else cur.maxCadenceSpm
+        val newWalkSec: Double
+        val newJogSec: Double
+        val newRunSec: Double
+        val newWalkM: Double
+        val newJogM: Double
+        val newRunM: Double
+        val newMaxSpeed: Double
+        val newMaxCad: Double
+
+        if (targetJogRunSec < 5.0) {
+            // Pure walking day (no real jog/run in Samsung Health or saved run_sessions) — erase bike pollution!
+            newJogSec = 0.0
+            newRunSec = 0.0
+            newJogM = 0.0
+            newRunM = 0.0
+            newWalkSec = if (samsung.walkingSec > 0.0) samsung.walkingSec else (newSteps / 1.72)
+            newWalkM = if (samsung.distanceMeters > 0.0) {
+                samsung.distanceMeters
+            } else {
+                newSteps * 0.76 * effectiveStrideScale()
+            }
+            newMaxSpeed = samsung.maxSpeedMps.takeIf { it in 0.45..GaitClassifier.MAX_HUMAN_RUNNING_SPEED_MPS }
+                ?: cur.maxSpeedMps.takeIf { it in 0.45..2.05 }
+                ?: 1.45
+            newMaxCad = samsung.maxCadenceSpm.takeIf { it in 65.0..145.0 }
+                ?: cur.maxCadenceSpm.takeIf { it in 65.0..138.0 }
+                ?: 110.0
+        } else {
+            // Day includes real running/jogging (from Samsung Health and/or saved run_sessions)
+            val runShareOfJogRun = when {
+                savedRunSec + savedJogSec >= targetJogRunSec * 0.80 && (savedRunSec + savedJogSec) > 0.0 ->
+                    (savedRunSec / (savedRunSec + savedJogSec)).coerceIn(0.0, 1.0)
+                cur.jogRunCombinedSec > 5.0 ->
+                    (cur.runningSec / cur.jogRunCombinedSec).coerceIn(0.25, 0.85)
+                else -> 0.55
+            }
+            newRunSec = targetJogRunSec * runShareOfJogRun
+            newJogSec = targetJogRunSec * (1.0 - runShareOfJogRun)
+            newWalkSec = if (samsung.walkingSec > 0.0) samsung.walkingSec else cur.walkingSec
+
+            val targetTotalDist = kotlin.math.max(samsung.distanceMeters, savedRunDistM)
+            val estJogRunDist = if (savedRunDistM > 0.0 && samsung.jogRunSec <= savedRunSec + savedJogSec + 30.0) {
+                savedRunDistM.coerceAtMost(targetTotalDist)
+            } else {
+                (targetJogRunSec * 2.85).coerceAtMost(targetTotalDist * 0.92)
+            }
+            newWalkM = (targetTotalDist - estJogRunDist).coerceAtLeast(0.0)
+            newRunM = estJogRunDist * runShareOfJogRun
+            newJogM = estJogRunDist * (1.0 - runShareOfJogRun)
+
+            val candidateSpeed = maxOf(
+                savedMaxSpeed,
+                samsung.maxSpeedMps.takeIf { it <= GaitClassifier.MAX_HUMAN_RUNNING_SPEED_MPS } ?: 0.0,
+                cur.maxSpeedMps.takeIf { it <= 5.10 } ?: 0.0
+            )
+            newMaxSpeed = if (candidateSpeed >= 0.50) candidateSpeed else 3.20
+
+            val candidateCad = maxOf(
+                savedMaxCad,
+                samsung.maxCadenceSpm.takeIf { it <= 220.0 } ?: 0.0,
+                cur.maxCadenceSpm.takeIf { it <= 195.0 } ?: 0.0
+            )
+            newMaxCad = if (candidateCad >= 68.0) candidateCad else 162.0
+        }
 
         val updated = cur.copy(
             dateIso = dateIso,
@@ -950,6 +1038,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             put("accel_rms", event.accelRms)
             if (event.minRawNorm != null) put("min_raw_norm", event.minRawNorm) else putNull("min_raw_norm")
             if (event.peakToTroughNorm != null) put("peak_to_trough", event.peakToTroughNorm) else putNull("peak_to_trough")
+            if (event.p20RawNorm != null) put("p20_raw_norm", event.p20RawNorm) else putNull("p20_raw_norm")
             put("is_low_power", if (event.isLowPower) 1 else 0)
             put("pt_phase", event.ptPhase)
         }
@@ -976,6 +1065,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             val gpsAccIdx = c.getColumnIndexOrThrow("gps_acc_m")
             val minNormIdx = c.getColumnIndexOrThrow("min_raw_norm")
             val p2tIdx = c.getColumnIndexOrThrow("peak_to_trough")
+            val p20Idx = c.getColumnIndex("p20_raw_norm")
             while (c.moveToNext()) {
                 out.add(
                     SensorTransitionEvent(
@@ -988,6 +1078,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
                         accelRms = c.getDouble(c.getColumnIndexOrThrow("accel_rms")),
                         minRawNorm = if (c.isNull(minNormIdx)) null else c.getDouble(minNormIdx),
                         peakToTroughNorm = if (c.isNull(p2tIdx)) null else c.getDouble(p2tIdx),
+                        p20RawNorm = if (p20Idx < 0 || c.isNull(p20Idx)) null else c.getDouble(p20Idx),
                         isLowPower = c.getInt(c.getColumnIndexOrThrow("is_low_power")) == 1,
                         ptPhase = c.getString(c.getColumnIndexOrThrow("pt_phase"))
                     )

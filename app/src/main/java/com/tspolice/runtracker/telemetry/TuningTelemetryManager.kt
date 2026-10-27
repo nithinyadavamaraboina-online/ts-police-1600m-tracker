@@ -98,7 +98,7 @@ class TuningTelemetryManager(
         )
 
         val root = JSONObject()
-        root.put("schemaVersion", 2)
+        root.put("schemaVersion", 3)
         root.put("generatedAtIso", Instant.now().toString())
         root.put("localTimezone", zone.id)
         root.put("todayIso", todayIso)
@@ -117,6 +117,7 @@ class TuningTelemetryManager(
                 put("rawSamsungStrideScale", repository.strideCalibrationScale)
                 put("hasSamsungStrideCalibration", repository.hasSamsungStrideCalibration)
                 put("effectiveStrideScale", repository.effectiveStrideScale())
+                put("verifiedHardwarePedometerActive", repository.hasVerifiedHardwarePedometer)
                 put("pocketAudioMode", repository.pocketAudioMode.name)
                 put("allDayTrackingEnabled", repository.allDayTrackingEnabled)
                 put("indoorStepFallbackEnabled", repository.indoorStepFallbackEnabled)
@@ -199,7 +200,33 @@ class TuningTelemetryManager(
         }
         root.put("recentRunSessions", runsArr)
 
-        // 8. Last 300 Raw DSP Gait State Transitions
+        // 8. Raw 48-Hour Health Connect Record Spans (exact start/end timestamps & values)
+        fun encodeSpans(spans: List<com.tspolice.runtracker.health.RawHealthRecordSpan>): JSONArray {
+            val arr = JSONArray()
+            for (sp in spans) {
+                arr.put(
+                    JSONObject().apply {
+                        put("startLocal", sp.startLocalIso)
+                        put("endLocal", sp.endLocalIso)
+                        put("durationMin", round2(sp.durationMinutes))
+                        put("value", round2(sp.value))
+                        put("extra", sp.extra)
+                        put("sourcePkg", sp.sourcePkg)
+                    }
+                )
+            }
+            return arr
+        }
+        root.put(
+            "rawHealthConnectRecords48h",
+            JSONObject().apply {
+                put("steps", encodeSpans(deepSamsung.rawStepSpans48h))
+                put("distances", encodeSpans(deepSamsung.rawDistanceSpans48h))
+                put("exercises", encodeSpans(deepSamsung.rawExerciseSpans48h))
+            }
+        )
+
+        // 9. Last 300 Raw DSP Gait State Transitions
         val transArr = JSONArray()
         for (ev in recentTransitions) {
             transArr.put(
@@ -214,6 +241,7 @@ class TuningTelemetryManager(
                     put("accelRms", round3(ev.accelRms))
                     if (ev.minRawNorm != null) put("minRawNorm", round3(ev.minRawNorm))
                     if (ev.peakToTroughNorm != null) put("peakToTrough", round3(ev.peakToTroughNorm))
+                    if (ev.p20RawNorm != null) put("p20RawNorm", round3(ev.p20RawNorm))
                     put("lowPower", ev.isLowPower)
                     put("ptPhase", ev.ptPhase)
                 }
@@ -465,6 +493,8 @@ class TuningTelemetryManager(
                         put("sourceLabel", sam.sourceLabel)
                         put("steps", sam.steps)
                         put("distanceMeters", round2(sam.distanceMeters))
+                        put("rawHealthConnectDistanceMeters", round2(sam.rawHealthConnectDistanceMeters))
+                        put("distanceIncludedPassiveEstimate", sam.distanceIncludedPassiveEstimate)
                         put("walkingSec", round2(sam.walkingSec))
                         put("jogRunSec", round2(sam.jogRunSec))
                         put("maxSpeedMps", round3(sam.maxSpeedMps))

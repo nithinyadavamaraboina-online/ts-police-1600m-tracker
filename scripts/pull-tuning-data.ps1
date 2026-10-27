@@ -216,13 +216,35 @@ if ($null -ne $Data.intradayHourlyComparison -and $Data.intradayHourlyComparison
     }
 }
 
+if ($null -ne $Data.rawHealthConnectRecords48h) {
+    $RawHc = $Data.rawHealthConnectRecords48h
+    Write-Host ""
+    Write-Host "--- RAW HEALTH CONNECT RECORD SPANS (48H) ---" -ForegroundColor Cyan
+    if ($null -ne $RawHc.steps) {
+        foreach ($r in $RawHc.steps) {
+            Write-Host ("  [STEPS]    {0} -> {1} ({2}m) : {3} steps ({4})" -f $r.startLocal, $r.endLocal, $r.durationMin, $r.value, $r.sourcePkg)
+        }
+    }
+    if ($null -ne $RawHc.distances) {
+        foreach ($r in $RawHc.distances) {
+            Write-Host ("  [DISTANCE] {0} -> {1} ({2}m) : {3} m ({4})" -f $r.startLocal, $r.endLocal, $r.durationMin, $r.value, $r.sourcePkg)
+        }
+    }
+    if ($null -ne $RawHc.exercises) {
+        foreach ($r in $RawHc.exercises) {
+            Write-Host ("  [EXERCISE] {0} -> {1} ({2}m) : {3} ({4})" -f $r.startLocal, $r.endLocal, $r.durationMin, $r.extra, $r.sourcePkg)
+        }
+    }
+}
+
 if ($null -ne $Data.recentStateTransitions -and $Data.recentStateTransitions.Count -gt 0) {
     Write-Host ""
     Write-Host ("--- LAST GAIT TRANSITIONS (showing latest 10 of {0}) ---" -f $Data.recentStateTransitions.Count) -ForegroundColor Cyan
     foreach ($tr in ($Data.recentStateTransitions | Select-Object -First 10)) {
         $spd = if ($null -ne $tr.gpsSpeedMps) { "$($tr.gpsSpeedMps)m/s" } else { "no-gps" }
-        Write-Host ("  {0} | {1} -> {2} | cad={3}spm | rms={4} | gps={5}" -f `
-            $tr.localTime, $tr.from, $tr.to, $tr.cadenceSpm, $tr.accelRms, $spd)
+        $p20 = if ($null -ne $tr.p20RawNorm) { " | p20=$($tr.p20RawNorm)" } else { "" }
+        Write-Host ("  {0} | {1} -> {2} | cad={3}spm | rms={4} | gps={5}{6}" -f `
+            $tr.localTime, $tr.from, $tr.to, $tr.cadenceSpm, $tr.accelRms, $spd, $p20)
     }
 }
 Write-Host "======================================================================" -ForegroundColor Green

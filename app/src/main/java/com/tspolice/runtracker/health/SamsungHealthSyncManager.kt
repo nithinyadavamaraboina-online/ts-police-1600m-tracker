@@ -41,6 +41,15 @@ data class HealthSyncOutcome(
     val statusMessage: String = ""
 )
 
+data class RawHealthRecordSpan(
+    val startLocalIso: String,
+    val endLocalIso: String,
+    val durationMinutes: Double,
+    val value: Double,
+    val extra: String = "",
+    val sourcePkg: String = ""
+)
+
 data class DeepSamsungTuningDataset(
     val syncOutcome: HealthSyncOutcome,
     val sevenDaySnapshots: Map<String, SamsungDailySnapshot> = emptyMap(),
@@ -49,7 +58,10 @@ data class DeepSamsungTuningDataset(
     val rawDistanceRecordCount48h: Int = 0,
     val rawExerciseRecordCount48h: Int = 0,
     val avgStepBucketMinutes: Double = 0.0,
-    val grantedPermissions: List<String> = emptyList()
+    val grantedPermissions: List<String> = emptyList(),
+    val rawStepSpans48h: List<RawHealthRecordSpan> = emptyList(),
+    val rawDistanceSpans48h: List<RawHealthRecordSpan> = emptyList(),
+    val rawExerciseSpans48h: List<RawHealthRecordSpan> = emptyList()
 )
 
 /**
@@ -241,6 +253,8 @@ class SamsungHealthSyncManager(
             val todayStart = today.atStartOfDay(zone).toInstant()
             val safeNow = if (nowInstant.isAfter(todayStart)) nowInstant else todayStart.plusSeconds(1)
 
+            val defaultWalkStrideM = 0.76 * TsPoliceBenchmark.heightStrideScale(repository.runnerHeightCm)
+
             val yesterdaySnapshot = pullDaySnapshot(
                 client = client,
                 granted = granted,
@@ -250,8 +264,20 @@ class SamsungHealthSyncManager(
                 zone = zone,
                 targetOrigins = targetOrigins,
                 sourcePkg = sourcePkg,
-                sourceLabel = sourceLabel
+                sourceLabel = sourceLabel,
+                referenceWalkStrideM = defaultWalkStrideM
             )
+
+            val learnedWalkStrideM = if (
+                yesterdaySnapshot.steps >= 300 &&
+                !yesterdaySnapshot.distanceIncludedPassiveEstimate &&
+                yesterdaySnapshot.jogRunSec < 120.0 &&
+                (yesterdaySnapshot.rawHealthConnectDistanceMeters / yesterdaySnapshot.steps) in 0.64..0.95
+            ) {
+                yesterdaySnapshot.rawHealthConnectDistanceMeters / yesterdaySnapshot.steps
+            } else {
+                defaultWalkStrideM
+            }
 
             val todaySnapshot = pullDaySnapshot(
                 client = client,
@@ -262,7 +288,8 @@ class SamsungHealthSyncManager(
                 zone = zone,
                 targetOrigins = targetOrigins,
                 sourcePkg = sourcePkg,
-                sourceLabel = sourceLabel
+                sourceLabel = sourceLabel,
+                referenceWalkStrideM = learnedWalkStrideM
             )
 
             repository.saveSamsungSnapshot(yesterdaySnapshot)
@@ -407,7 +434,8 @@ class SamsungHealthSyncManager(
         zone: ZoneId,
         targetOrigins: Set<DataOrigin>,
         sourcePkg: String,
-        sourceLabel: String
+        sourceLabel: String,
+        referenceWalkStrideM: Double = 0.76
     ): SamsungDailySnapshot {
         val dayFilter = TimeRangeFilter.between(windowStart, windowEnd)
         val canReadExercise = HealthPermission.getReadPermission(ExerciseSessionRecord::class) in granted
@@ -458,7 +486,25 @@ class SamsungHealthSyncManager(
             ?: scopedSteps.sumOf { it.count }.toInt()
         val rawDistMeters = agg?.get(DistanceRecord.DISTANCE_TOTAL)?.inMeters
             ?: scopedDistances.sumOf { it.distance.inMeters }
-        val totalDistanceM = if (rawDistMeters > 1.0) rawDistMeters else (totalSteps * 0.76)
+
+        // Samsung Health often flushes only workout-session DistanceRecords intraday while holding passive
+        // all-day DistanceRecords until midnight (producing e.g. 2.1km for 6,007 steps = 0.35 m/step).
+        // Reconstruct missing passive step distance transparently while preserving rawHealthConnectDistanceMeters!
+        val safeWalkStride = referenceWalkStrideM.coerceIn(0.64, 0.95)
+        val includedPassiveEstimate: Boolean
+        val totalDistanceM: Double
+        if (rawDistMeters <= 1.0 && totalSteps > 0) {
+            totalDistanceM = totalSteps * safeWalkStride
+            includedPassiveEstimate = true
+        } else if (totalSteps >= 200 && rawDistMeters > 1.0 && (rawDistMeters / totalSteps) < 0.58) {
+            val coveredSteps = (rawDistMeters / safeWalkStride).toInt().coerceIn(0, totalSteps)
+            val uncoveredSteps = (totalSteps - coveredSteps).coerceAtLeast(0)
+            totalDistanceM = rawDistMeters + (uncoveredSteps * safeWalkStride)
+            includedPassiveEstimate = true
+        } else {
+            totalDistanceM = rawDistMeters
+            includedPassiveEstimate = false
+        }
 
         val walkIntervals = mutableListOf<Pair<Long, Long>>()
         val runIntervals = mutableListOf<Pair<Long, Long>>()
@@ -522,7 +568,6 @@ class SamsungHealthSyncManager(
             val sMs = max(stepRec.startTime.toEpochMilli(), windowStart.toEpochMilli())
             val eMs = min(stepRec.endTime.toEpochMilli(), windowEnd.toEpochMilli())
             if (eMs <= sMs || stepRec.count < 6L) continue
-            if (overlapsAny(sMs, eMs, allSessionIntervals)) continue
 
             val bucketDurSec = Duration.between(
                 Instant.ofEpochMilli(sMs),
@@ -530,11 +575,33 @@ class SamsungHealthSyncManager(
             ).toMillis() / 1000.0
             if (bucketDurSec <= 0.5) continue
 
-            val bucketCadenceSpm = (stepRec.count.toDouble() / bucketDurSec) * 60.0
+            // Prorate step count if the record spans across midnight beyond [windowStart, windowEnd]
+            val fullRecDurMs = max(1L, stepRec.endTime.toEpochMilli() - stepRec.startTime.toEpochMilli()).toDouble()
+            val windowStepCount = stepRec.count.toDouble() * ((eMs - sMs).toDouble() / fullRecDurMs)
+
+            if (overlapsAny(sMs, eMs, allSessionIntervals)) {
+                if (bucketDurSec <= 2400.0) {
+                    // Granular (<40m) step bucket inside an ExerciseSessionRecord — already counted in walkSec/jogRunSec
+                    continue
+                }
+                // Samsung Health writes a single 24-hour (00:00..23:59) StepsRecord! Subtract the steps accounted
+                // for by overlapped ExerciseSessionRecords and credit the remaining passive steps to walkSec.
+                val ovRunSec = overlapSeconds(sMs, eMs, mergedRunMs)
+                val ovWalkSec = overlapSeconds(sMs, eMs, mergedWalkMs)
+                val estimatedSessionSteps = ovWalkSec * 1.72 + ovRunSec * 2.65
+                val remainingPassiveSteps = (windowStepCount - estimatedSessionSteps).coerceAtLeast(0.0)
+                if (remainingPassiveSteps >= 10.0) {
+                    val nonSessionDurSec = (bucketDurSec - ovRunSec - ovWalkSec).coerceAtLeast(0.0)
+                    walkSec += min(nonSessionDurSec, remainingPassiveSteps / 1.70)
+                }
+                continue
+            }
+
+            val bucketCadenceSpm = (windowStepCount / bucketDurSec) * 60.0
             if (bucketDurSec <= 900.0 && bucketCadenceSpm >= 132.0) {
-                jogRunSec += min(bucketDurSec, stepRec.count / 2.50)
+                jogRunSec += min(bucketDurSec, windowStepCount / 2.50)
             } else {
-                walkSec += min(bucketDurSec, stepRec.count / 1.70)
+                walkSec += min(bucketDurSec, windowStepCount / 1.70)
             }
         }
 
@@ -590,7 +657,9 @@ class SamsungHealthSyncManager(
             sourcePackage = sourcePkg,
             sourceLabel = sourceLabel,
             syncedAtEpochMs = System.currentTimeMillis(),
-            workouts = runWorkouts
+            workouts = runWorkouts,
+            rawHealthConnectDistanceMeters = rawDistMeters,
+            distanceIncludedPassiveEstimate = includedPassiveEstimate
         )
     }
 
@@ -619,6 +688,18 @@ class SamsungHealthSyncManager(
             if (startMs < e && endMs > s) return true
         }
         return false
+    }
+
+    private fun overlapSeconds(startMs: Long, endMs: Long, intervals: List<Pair<Long, Long>>): Double {
+        var totalMs = 0L
+        for ((s, e) in intervals) {
+            val ovStart = max(startMs, s)
+            val ovEnd = min(endMs, e)
+            if (ovEnd > ovStart) {
+                totalMs += (ovEnd - ovStart)
+            }
+        }
+        return totalMs / 1000.0
     }
 
     /**
@@ -825,6 +906,37 @@ class SamsungHealthSyncManager(
             }
         }
 
+        val rawStepSpans = steps48h.map { sr ->
+            RawHealthRecordSpan(
+                startLocalIso = sr.startTime.atZone(zone).toLocalDateTime().toString(),
+                endLocalIso = sr.endTime.atZone(zone).toLocalDateTime().toString(),
+                durationMinutes = max(0L, sr.endTime.toEpochMilli() - sr.startTime.toEpochMilli()) / 60_000.0,
+                value = sr.count.toDouble(),
+                extra = "steps",
+                sourcePkg = sr.metadata.dataOrigin.packageName
+            )
+        }
+        val rawDistanceSpans = dist48h.map { dr ->
+            RawHealthRecordSpan(
+                startLocalIso = dr.startTime.atZone(zone).toLocalDateTime().toString(),
+                endLocalIso = dr.endTime.atZone(zone).toLocalDateTime().toString(),
+                durationMinutes = max(0L, dr.endTime.toEpochMilli() - dr.startTime.toEpochMilli()) / 60_000.0,
+                value = dr.distance.inMeters,
+                extra = "meters",
+                sourcePkg = dr.metadata.dataOrigin.packageName
+            )
+        }
+        val rawExerciseSpans = ex48h.map { ex ->
+            RawHealthRecordSpan(
+                startLocalIso = ex.startTime.atZone(zone).toLocalDateTime().toString(),
+                endLocalIso = ex.endTime.atZone(zone).toLocalDateTime().toString(),
+                durationMinutes = max(0L, ex.endTime.toEpochMilli() - ex.startTime.toEpochMilli()) / 60_000.0,
+                value = ex.exerciseType.toDouble(),
+                extra = ex.title?.takeIf { it.isNotBlank() } ?: "type=${ex.exerciseType}",
+                sourcePkg = ex.metadata.dataOrigin.packageName
+            )
+        }
+
         return DeepSamsungTuningDataset(
             syncOutcome = baseOutcome,
             sevenDaySnapshots = sevenDays,
@@ -833,7 +945,10 @@ class SamsungHealthSyncManager(
             rawDistanceRecordCount48h = dist48h.size,
             rawExerciseRecordCount48h = ex48h.size,
             avgStepBucketMinutes = avgBucketMins,
-            grantedPermissions = granted.sorted()
+            grantedPermissions = granted.sorted(),
+            rawStepSpans48h = rawStepSpans,
+            rawDistanceSpans48h = rawDistanceSpans,
+            rawExerciseSpans48h = rawExerciseSpans
         )
     }
 }

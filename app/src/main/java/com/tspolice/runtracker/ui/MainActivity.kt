@@ -2780,15 +2780,26 @@ class MainActivity : AppCompatActivity() {
                 samsungPrimaryBtn.text = "Pull Yesterday & Today"
                 samsungPrimaryBtn.setOnClickListener { triggerSamsungHealthSync(userTriggered = true) }
 
-                val samsungHasHigherTotals = selectedSam.steps > selectedTrk.totalSteps + 25 ||
-                    selectedSam.distanceMeters > selectedTrk.totalDistanceMeters + 25.0
+                val needsAlignment = (selectedSam.steps > 0 || selectedSam.distanceMeters >= 20.0) && (
+                    abs(selectedSam.steps - selectedTrk.totalSteps) >= 30 ||
+                        abs(selectedSam.distanceMeters - selectedTrk.totalDistanceMeters) >= 35.0 ||
+                        abs(selectedSam.jogRunSec - selectedTrk.jogRunCombinedSec) >= 20.0
+                    )
                 samsungSecondaryBtn.visibility = View.VISIBLE
-                if (samsungHasHigherTotals) {
-                    val extraSteps = max(0, selectedSam.steps - selectedTrk.totalSteps)
+                if (needsAlignment) {
+                    val stepDeltaFromSam = selectedSam.steps - selectedTrk.totalSteps
                     samsungSecondaryBtn.text = when (activeComparisonScope) {
-                        ComparisonDayScope.YESTERDAY -> if (extraSteps > 0) "Align Yest (+$extraSteps)" else "Align Yesterday"
+                        ComparisonDayScope.YESTERDAY -> when {
+                            stepDeltaFromSam > 25 -> "Align Yest (+$stepDeltaFromSam)"
+                            stepDeltaFromSam < -25 -> "Clean & Align Yest"
+                            else -> "Align Yesterday"
+                        }
                         ComparisonDayScope.TWO_DAY_COMBINED -> "Align Both Days"
-                        ComparisonDayScope.TODAY -> if (extraSteps > 0) "Align (+$extraSteps)" else "Align Today"
+                        ComparisonDayScope.TODAY -> when {
+                            stepDeltaFromSam > 25 -> "Align (+$stepDeltaFromSam)"
+                            stepDeltaFromSam < -25 -> "Clean & Align Today"
+                            else -> "Align Today"
+                        }
                     }
                     samsungSecondaryBtn.setTextColor(AthleticColors.CYAN_BRIGHT)
                     samsungSecondaryBtn.setOnClickListener {
@@ -2797,11 +2808,25 @@ class MainActivity : AppCompatActivity() {
                                 yesterdaySam?.let { repository.alignDailyActivityWithSamsung(yesterdayIso, it) }
                             }
                             ComparisonDayScope.TODAY -> {
-                                todaySam?.let { trackingService?.alignTodayWithSamsungHealth(it) }
+                                todaySam?.let { snap ->
+                                    val svc = trackingService
+                                    if (svc != null) {
+                                        svc.alignTodayWithSamsungHealth(snap)
+                                    } else {
+                                        repository.alignDailyActivityWithSamsung(todayTrk.dateIso, snap)
+                                    }
+                                }
                             }
                             ComparisonDayScope.TWO_DAY_COMBINED -> {
                                 yesterdaySam?.let { repository.alignDailyActivityWithSamsung(yesterdayIso, it) }
-                                todaySam?.let { trackingService?.alignTodayWithSamsungHealth(it) }
+                                todaySam?.let { snap ->
+                                    val svc = trackingService
+                                    if (svc != null) {
+                                        svc.alignTodayWithSamsungHealth(snap)
+                                    } else {
+                                        repository.alignDailyActivityWithSamsung(todayTrk.dateIso, snap)
+                                    }
+                                }
                             }
                         }
                         refreshCachedDailyHistory(forceRender = true)

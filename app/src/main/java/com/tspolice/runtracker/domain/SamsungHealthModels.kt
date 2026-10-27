@@ -44,7 +44,9 @@ data class SamsungDailySnapshot(
     val sourcePackage: String = SamsungHealthComparator.SAMSUNG_HEALTH_PACKAGE,
     val sourceLabel: String = "Samsung Health",
     val syncedAtEpochMs: Long = 0L,
-    val workouts: List<ExternalRunWorkout> = emptyList()
+    val workouts: List<ExternalRunWorkout> = emptyList(),
+    val rawHealthConnectDistanceMeters: Double = distanceMeters,
+    val distanceIncludedPassiveEstimate: Boolean = false
 )
 
 data class AccuracyComparisonReport(
@@ -114,13 +116,23 @@ object SamsungHealthComparator {
             sourcePackage = today.sourcePackage.ifBlank { yesterday.sourcePackage },
             sourceLabel = today.sourceLabel.ifBlank { yesterday.sourceLabel },
             syncedAtEpochMs = max(yesterday.syncedAtEpochMs, today.syncedAtEpochMs),
-            workouts = (yesterday.workouts + today.workouts).distinctBy { it.externalId }
+            workouts = (yesterday.workouts + today.workouts).distinctBy { it.externalId },
+            rawHealthConnectDistanceMeters = yesterday.rawHealthConnectDistanceMeters + today.rawHealthConnectDistanceMeters,
+            distanceIncludedPassiveEstimate = yesterday.distanceIncludedPassiveEstimate || today.distanceIncludedPassiveEstimate
         )
     }
 
+    private fun hasCompleteRawDistanceForCalibration(snap: SamsungDailySnapshot?): Boolean {
+        if (snap == null || snap.steps < 250 || snap.rawHealthConnectDistanceMeters < 150.0) return false
+        if (snap.distanceIncludedPassiveEstimate) return false
+        val rawStride = snap.rawHealthConnectDistanceMeters / snap.steps
+        return rawStride in 0.62..1.52
+    }
+
     /**
-     * Uses Yesterday + Today combined steps & distance when available so early-morning partial
-     * steps never skew stride calibration, while full 24h yesterday ground truth anchors accuracy.
+     * Uses only days whose raw Health Connect DistanceRecord covers the whole day's steps (`0.62..1.52 m/step`),
+     * preventing Samsung Health's intra-day workout-only DistanceRecords (e.g. 2.1km walk out of 6,000 steps)
+     * from dragging down personal stride calibration!
      */
     fun computeMultiDayCalibratedStrideScale(
         yesterdayTracker: DailyActivitySummary,
@@ -129,10 +141,19 @@ object SamsungHealthComparator {
         todaySamsung: SamsungDailySnapshot?,
         currentStrideScale: Double = 1.0
     ): Double {
-        val combinedSam = combineSamsungSnapshots(yesterdaySamsung, todaySamsung)
-            ?: return currentStrideScale.coerceIn(MIN_STRIDE_SCALE, MAX_STRIDE_SCALE)
-        val combinedTrk = combineDailySummaries(yesterdayTracker, todayTracker)
-        return computeCalibratedStrideScale(combinedTrk, combinedSam, currentStrideScale)
+        val yestValid = hasCompleteRawDistanceForCalibration(yesterdaySamsung)
+        val todayValid = hasCompleteRawDistanceForCalibration(todaySamsung)
+
+        return when {
+            yestValid && todayValid -> {
+                val combSam = combineSamsungSnapshots(yesterdaySamsung, todaySamsung)!!
+                val combTrk = combineDailySummaries(yesterdayTracker, todayTracker)
+                computeCalibratedStrideScale(combTrk, combSam, currentStrideScale)
+            }
+            yestValid -> computeCalibratedStrideScale(yesterdayTracker, yesterdaySamsung!!, currentStrideScale)
+            todayValid -> computeCalibratedStrideScale(todayTracker, todaySamsung!!, currentStrideScale)
+            else -> currentStrideScale.coerceIn(MIN_STRIDE_SCALE, MAX_STRIDE_SCALE)
+        }
     }
 
     fun computeCalibratedStrideScale(
@@ -141,39 +162,42 @@ object SamsungHealthComparator {
         currentStrideScale: Double = 1.0
     ): Double {
         val clampedCurrent = currentStrideScale.coerceIn(MIN_STRIDE_SCALE, MAX_STRIDE_SCALE)
-        if (samsung.steps < 200 || samsung.distanceMeters < 110.0) {
+        val distForCal = if (samsung.distanceIncludedPassiveEstimate) {
+            samsung.rawHealthConnectDistanceMeters
+        } else {
+            samsung.distanceMeters
+        }
+        if (samsung.steps < 200 || distForCal < 120.0) {
             return clampedCurrent
         }
-        val samsungStrideM = samsung.distanceMeters / samsung.steps
-        if (samsungStrideM !in 0.52..1.60) {
+        val samsungStrideM = distForCal / samsung.steps
+        // Reject partial Health Connect distance syncs (< 0.62 m/step is physically impossible for adult gait)
+        if (samsungStrideM !in 0.62..1.52) {
             return clampedCurrent
         }
 
         val samActiveSec = samsung.walkingSec + samsung.jogRunSec
         val samRunShare = if (samActiveSec >= 30.0) {
             (samsung.jogRunSec / samActiveSec).coerceIn(0.0, 1.0)
-        } else 0.0
-
-        val trkActiveSec = tracker.walkingSec + tracker.jogRunCombinedSec
-        val trkRunShare = if (trkActiveSec >= 30.0) {
-            (tracker.jogRunCombinedSec / trkActiveSec).coerceIn(0.0, 1.0)
-        } else 0.0
-
-        val unscaledReferenceStrideM = if (
-            tracker.totalSteps >= 200 &&
-            tracker.totalDistanceMeters >= 100.0 &&
-            abs(trkRunShare - samRunShare) <= 0.25
-        ) {
-            val currentTrackerStride = tracker.totalDistanceMeters / tracker.totalSteps
-            (currentTrackerStride / clampedCurrent).coerceIn(0.55, 1.45)
         } else {
+            val trkActive = tracker.walkingSec + tracker.jogRunCombinedSec
+            if (trkActive >= 60.0 && samsung.jogRunSec > 0.0) {
+                (tracker.jogRunCombinedSec / trkActive).coerceIn(0.0, 1.0)
+            } else 0.0
+        }
+
+        val unscaledReferenceStrideM =
             (1.0 - samRunShare) * DEFAULT_UNSCALED_WALK_STRIDE_M +
                 samRunShare * DEFAULT_UNSCALED_RUN_STRIDE_M
-        }
 
         val targetScale = (samsungStrideM / unscaledReferenceStrideM)
             .coerceIn(MIN_STRIDE_SCALE, MAX_STRIDE_SCALE)
-        return (0.65 * targetScale + 0.35 * clampedCurrent)
+
+        // Heal previously under-calibrated scales (< 0.85x) immediately rather than dragging them forward
+        if (clampedCurrent < 0.85 && targetScale >= 0.90) {
+            return targetScale
+        }
+        return (0.75 * targetScale + 0.25 * clampedCurrent)
             .coerceIn(MIN_STRIDE_SCALE, MAX_STRIDE_SCALE)
     }
 
@@ -241,6 +265,8 @@ object SamsungHealthComparator {
         val detailAdvice = when {
             samsung.steps == 0 && samsung.distanceMeters < 5.0 ->
                 "Open Samsung Health once so it flushes $dayLabel's pedometer & workout records to Health Connect."
+            tracker.totalSteps - samsung.steps >= 300 || (tracker.jogRunCombinedSec - samsung.jogRunSec) >= 30.0 ->
+                "Pre-update bike/vibration drift detected on $dayLabel — tap 'Align' below to clean $dayLabel to ${samsung.sourceLabel} ground truth."
             samsungStrideM != null ->
                 String.format(
                     "%s stride %.2f m/step → Personal stride scale %.2fx (%s). Use 'Align' if you wore a Watch or walked without the app.",
@@ -408,5 +434,6 @@ data class SensorTransitionEvent(
     val minRawNorm: Double?,
     val peakToTroughNorm: Double?,
     val isLowPower: Boolean,
-    val ptPhase: String
+    val ptPhase: String,
+    val p20RawNorm: Double? = null
 )

@@ -667,27 +667,39 @@ class TrackerDomainTest {
     }
 
     @Test
-    fun `fine tuning telemetry separates hardware steps from software fallback steps and computes hourly bucket stats`() {
-        val dsp = MotionSignalProcessor().apply { hardwareStepSensorAvailable = true }
+    fun `fine tuning telemetry separates hardware steps from software fallback steps and locks verified hardware pedometer`() {
+        // 1. On devices with a verified working hardware pedometer (like Samsung S23 SM-S911B),
+        //    once real hardware steps arrive, quiet bike/hand vibration MUST NOT trigger software fallback steps!
+        val verifiedHwDsp = MotionSignalProcessor().apply { hardwareStepSensorAvailable = true }
+        verifiedHwDsp.onHardwareStepDetected(1000L, 4)
+        verifiedHwDsp.reconcileStepCounterDelta(2000L, hwDeltaSteps = 6, stepsCountedSinceLastCounter = 4)
+        assertTrue(verifiedHwDsp.verifiedHardwarePedometerActive)
+        assertEquals(6, verifiedHwDsp.hardwareStepsCount)
+        assertEquals(0, verifiedHwDsp.fallbackSoftwareStepsCount)
+        assertEquals(6, verifiedHwDsp.totalSteps)
 
-        // 1. Hardware step detector + step counter delta reconciliation attribute purely to hardwareStepsCount
-        dsp.onHardwareStepDetected(1000L, 4)
-        dsp.reconcileStepCounterDelta(2000L, hwDeltaSteps = 6, stepsCountedSinceLastCounter = 4) // +2 missed steps from batching
-        assertEquals(6, dsp.hardwareStepsCount)
-        assertEquals(0, dsp.fallbackSoftwareStepsCount)
-        assertEquals(6, dsp.totalSteps)
-
-        // 2. After >3.5s hardware step silence, software gait peak fallback attributes purely to fallbackSoftwareStepsCount
-        val freqHz = 2.0 // 120 spm brisk walk
+        val freqHz = 2.0 // 120 spm vibration after >3.5s hardware step silence
         for (i in 0..250) {
             val tMs = 6000L + i * 20L
             val tSec = (i * 20L) / 1000.0
             val ay = (9.81 + 2.2 * sin(2.0 * Math.PI * freqHz * tSec)).toFloat()
-            dsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
+            verifiedHwDsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
         }
-        assertEquals(6, dsp.hardwareStepsCount)
-        assertTrue("Expected software fallback steps > 6, got ${dsp.fallbackSoftwareStepsCount}", dsp.fallbackSoftwareStepsCount > 6)
-        assertEquals(dsp.hardwareStepsCount + dsp.fallbackSoftwareStepsCount, dsp.totalSteps)
+        assertEquals("Verified hardware pedometer must never fabricate software vibration steps!", 0, verifiedHwDsp.fallbackSoftwareStepsCount)
+        assertEquals(6, verifiedHwDsp.totalSteps)
+
+        // 2. On devices whose OEM hardware step sensor emits 0 events (verifiedHardwarePedometerActive == false),
+        //    software gait fallback attributes purely to fallbackSoftwareStepsCount
+        val fallbackDsp = MotionSignalProcessor().apply { hardwareStepSensorAvailable = false }
+        for (i in 0..250) {
+            val tMs = i * 20L
+            val tSec = tMs / 1000.0
+            val ay = (9.81 + 2.2 * sin(2.0 * Math.PI * freqHz * tSec)).toFloat()
+            fallbackDsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
+        }
+        assertEquals(0, fallbackDsp.hardwareStepsCount)
+        assertTrue("Expected software fallback steps > 6, got ${fallbackDsp.fallbackSoftwareStepsCount}", fallbackDsp.fallbackSoftwareStepsCount > 6)
+        assertEquals(fallbackDsp.fallbackSoftwareStepsCount, fallbackDsp.totalSteps)
 
         // 3. HourlySensorBucket aggregates steps, GPS vs stride distance, and mean GPS accuracy cleanly
         val bucket = HourlySensorBucket(
@@ -709,10 +721,142 @@ class TrackerDomainTest {
         assertEquals(1710.0, bucket.totalDistanceMeters, 0.001)
         assertEquals(6.5, bucket.avgGpsAccuracyM ?: 0.0, 0.001)
 
-        dsp.reset()
-        assertEquals(0, dsp.hardwareStepsCount)
-        assertEquals(0, dsp.fallbackSoftwareStepsCount)
-        assertEquals(0, dsp.totalSteps)
+        verifiedHwDsp.reset()
+        assertEquals(0, verifiedHwDsp.hardwareStepsCount)
+        assertEquals(0, verifiedHwDsp.fallbackSoftwareStepsCount)
+        assertEquals(0, verifiedHwDsp.totalSteps)
+    }
+
+    @Test
+    fun `bike latch prevents jogging walking or running when slowing down speeding up or stopping at traffic lights until verified dismount walk`() {
+        val classifier = GaitClassifier()
+        var nowMs = 1_000L
+
+        // 1. Accelerate onto bike (22 km/h = 6.1 m/s) -> instant VEHICLE latch
+        assertEquals(MotionState.VEHICLE, classifier.update(nowMs, gpsSpeedMps = 6.1, cadenceSpm = 0.0, dynamicAccelRms = 3.5))
+        assertTrue(classifier.isInOrCoolingDownFromVehicle())
+
+        // 2. Slow bike down to Running speed (3.5 m/s) even if bumpy road fakes 172 spm + pothole dip!
+        for (step in 1..15) {
+            nowMs += 400L
+            val st = classifier.update(
+                nowMs = nowMs,
+                gpsSpeedMps = 3.5,
+                cadenceSpm = 172.0,
+                dynamicAccelRms = 6.8,
+                minRawNorm = 4.2,       // single pothole dip!
+                peakToTroughNorm = 11.5,
+                p20RawNorm = 8.4        // seated on saddle 80% of window
+            )
+            assertEquals("Slowing bike to 3.5 m/s must stay VEHICLE, never RUNNING", MotionState.VEHICLE, st)
+        }
+
+        // 3. Slow bike down further to Jogging speed (2.2 m/s) with 145 spm vibration -> STILL VEHICLE!
+        for (step in 1..15) {
+            nowMs += 400L
+            val st = classifier.update(
+                nowMs = nowMs,
+                gpsSpeedMps = 2.2,
+                cadenceSpm = 145.0,
+                dynamicAccelRms = 4.2,
+                p20RawNorm = 8.6
+            )
+            assertEquals("Slowing bike to 2.2 m/s must stay VEHICLE, never JOGGING", MotionState.VEHICLE, st)
+        }
+
+        // 4. Slow bike down even more to Walking crawl in traffic (1.2 m/s) WITHOUT having parked -> STILL VEHICLE!
+        for (step in 1..15) {
+            nowMs += 400L
+            val st = classifier.update(
+                nowMs = nowMs,
+                gpsSpeedMps = 1.2,
+                cadenceSpm = 98.0,
+                dynamicAccelRms = 2.3,
+                p20RawNorm = 8.9
+            )
+            assertEquals("Crawling bike in traffic at 1.2 m/s without parking must stay VEHICLE, never WALKING", MotionState.VEHICLE, st)
+        }
+
+        // 5. Lose GPS inside an underpass for 8 seconds while vibrating at 165 spm -> STILL VEHICLE!
+        for (step in 1..20) {
+            nowMs += 400L
+            val st = classifier.update(
+                nowMs = nowMs,
+                gpsSpeedMps = null,
+                cadenceSpm = 165.0,
+                dynamicAccelRms = 5.9,
+                p20RawNorm = 8.5
+            )
+            assertEquals("Temporary GPS loss while latched on bike must stay VEHICLE", MotionState.VEHICLE, st)
+        }
+
+        // 6. Stop at a red traffic light for 20 seconds (< 0.85 m/s) -> settles to STANDING while keeping cooldown armed,
+        //    then green light acceleration (1.3 -> 2.4 -> 4.2 m/s) snaps straight back to VEHICLE with ZERO walk/jog/run!
+        for (step in 1..50) {
+            nowMs += 400L
+            val st = classifier.update(nowMs, gpsSpeedMps = 0.0, cadenceSpm = 0.0, dynamicAccelRms = 0.25)
+            assertFalse("Stopped at red light must never count as movement", st.countsAsActiveMovement)
+        }
+        assertTrue("Red-light cooldown must remain armed", classifier.isInOrCoolingDownFromVehicle())
+
+        // Green light pull-away through walking/jogging/running speeds:
+        val pullAwaySpeeds = listOf(1.3, 1.8, 2.3, 3.1, 3.8, 5.4)
+        for (spd in pullAwaySpeeds) {
+            nowMs += 400L
+            val st = classifier.update(nowMs, gpsSpeedMps = spd, cadenceSpm = 110.0, dynamicAccelRms = 3.2, p20RawNorm = 8.5)
+            assertFalse("Accelerating from red light at $spd m/s must NEVER trigger Walk/Jog/Run, got $st", st.countsAsActiveMovement)
+        }
+        assertEquals(MotionState.VEHICLE, classifier.currentState())
+
+        // 7. Genuine Park & Dismount: park bike (< 0.85 m/s) for 7 seconds, then walk away on foot (104 spm at 1.25 m/s) for 6s!
+        for (step in 1..18) {
+            nowMs += 400L
+            classifier.update(nowMs, gpsSpeedMps = 0.1, cadenceSpm = 0.0, dynamicAccelRms = 0.2)
+        }
+        var unlockedWalk = false
+        for (step in 1..16) {
+            nowMs += 400L
+            val st = classifier.update(nowMs, gpsSpeedMps = 1.25, cadenceSpm = 104.0, dynamicAccelRms = 2.1, p20RawNorm = 7.4)
+            if (st == MotionState.WALKING) unlockedWalk = true
+        }
+        assertTrue("6s genuine walking after 7s parked stop must unlock WALKING", unlockedWalk)
+        assertFalse("Vehicle latch and cooldown must clear after verified dismount walk", classifier.isInOrCoolingDownFromVehicle())
+    }
+
+    @Test
+    fun `partial intraday samsung distance record does not corrupt multi day personal stride calibration`() {
+        // Exact real-world numbers from Samsung Galaxy S23 (SM-S911B) telemetry:
+        // Yesterday: 5,297 steps, 4,025.72m full-day Health Connect distance (0.760 m/step)
+        // Today: 6,007 steps, raw Health Connect only flushed 2,107.70m from 7 PM walk session (0.351 m/step!)
+        val yesterdayTrk = DailyActivitySummary(dateIso = "2026-10-26", totalSteps = 5297, walkingMeters = 4025.72, walkingSec = 3115.0)
+        val yesterdaySam = SamsungDailySnapshot(
+            dateIso = "2026-10-26",
+            steps = 5297,
+            distanceMeters = 4025.72,
+            rawHealthConnectDistanceMeters = 4025.72,
+            distanceIncludedPassiveEstimate = false,
+            walkingSec = 3115.88
+        )
+        val todayTrk = DailyActivitySummary(dateIso = "2026-10-27", totalSteps = 6007, walkingMeters = 4565.0, walkingSec = 3366.0)
+        val todaySam = SamsungDailySnapshot(
+            dateIso = "2026-10-27",
+            steps = 6007,
+            distanceMeters = 4565.32, // reconstructed for UI comparison
+            rawHealthConnectDistanceMeters = 2107.70, // partial workout-only Health Connect record!
+            distanceIncludedPassiveEstimate = true,
+            walkingSec = 3513.0
+        )
+
+        // Even starting from a previously corrupted 0.81x stride scale, multi-day calibration rejects Today's
+        // partial raw distance and heals immediately to Yesterday's true ~0.987x (0.760 / 0.770)!
+        val healedScale = SamsungHealthComparator.computeMultiDayCalibratedStrideScale(
+            yesterdayTracker = yesterdayTrk,
+            yesterdaySamsung = yesterdaySam,
+            todayTracker = todayTrk,
+            todaySamsung = todaySam,
+            currentStrideScale = 0.8106
+        )
+        assertTrue("Expected healed stride scale ~0.987x (in 0.96..1.01), got $healedScale", healedScale in 0.96..1.01)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

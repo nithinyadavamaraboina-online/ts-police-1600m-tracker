@@ -200,6 +200,25 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var lastHwStepsProcessed = 0
     private var lastSwStepsProcessed = 0
 
+    // 12-second Pre-Vehicle Checkpoint Ring Buffer (erases initial bike rollout before GPS hits vehicle threshold)
+    private data class PreVehicleCheckpoint(
+        val elapsedMs: Long,
+        val dateIso: String,
+        val walkSec: Double,
+        val jogSec: Double,
+        val runSec: Double,
+        val walkMeters: Double,
+        val jogMeters: Double,
+        val runMeters: Double,
+        val totalSteps: Int,
+        val maxSpeedMps: Double,
+        val maxCadenceSpm: Double,
+        val hourlyBucket: HourlySensorBucket?
+    )
+    private val preVehicleCheckpoints = ArrayDeque<PreVehicleCheckpoint>()
+    private var lastCheckpointSampleMs = 0L
+    private var wasInVehicleLatchLastTick = false
+
     // Automatic Open Jog/Run bout detector (logs >= 600m casual jog/runs into 7:15 Progress & ETA automatically!)
     private var openBoutStartedWallMs = 0L
     private var openBoutJogRunMeters = 0.0
@@ -242,6 +261,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     override fun onCreate() {
         super.onCreate()
         repository = RunRepository(this)
+        signalProcessor.verifiedHardwarePedometerActive = repository.hasVerifiedHardwarePedometer
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -354,7 +374,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     private fun enterLowPowerStandby() {
-        if (isLowPowerStandby || isHighPrecisionSessionActive() || uiForegroundVisible) return
+        if (isLowPowerStandby || isHighPrecisionSessionActive() || uiForegroundVisible ||
+            gaitClassifier.isInOrCoolingDownFromVehicle()
+        ) return
         isLowPowerStandby = true
         pauseLocationUpdatesOnly()
         registerAccelerometerWithRate(lowPower = true)
@@ -518,6 +540,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         dailyTotalSteps = 0
         dailyMaxSpeedMps = 0.0
         dailyMaxCadenceSpm = 0.0
+        preVehicleCheckpoints.clear()
         resetOpenBout()
         persistDailySummaryNow()
         broadcastTelemetry()
@@ -526,38 +549,22 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     fun alignTodayWithSamsungHealth(samsung: SamsungDailySnapshot) {
         ensureDailyLoadedForToday()
         if (samsung.dateIso.isNotBlank() && samsung.dateIso != dailyDateIso) return
-
-        if (samsung.steps > dailyTotalSteps) {
-            dailyTotalSteps = samsung.steps
-        }
-        if (samsung.walkingSec > dailyWalkSec) {
-            dailyWalkSec = samsung.walkingSec
-        }
-        val localJogRunSec = dailyJogSec + dailyRunSec
-        if (samsung.jogRunSec > localJogRunSec) {
-            val extraJogRunSec = samsung.jogRunSec - localJogRunSec
-            dailyRunSec += extraJogRunSec * 0.55
-            dailyJogSec += extraJogRunSec * 0.45
-        }
-        val localTotalDist = dailyWalkMeters + dailyJogMeters + dailyRunMeters
-        if (samsung.distanceMeters > localTotalDist) {
-            val missingDist = samsung.distanceMeters - localTotalDist
-            val samActive = samsung.walkingSec + samsung.jogRunSec
-            val runShare = if (samActive > 10.0) (samsung.jogRunSec / samActive).coerceIn(0.0, 1.0) else 0.0
-            dailyWalkMeters += missingDist * (1.0 - runShare)
-            dailyRunMeters += missingDist * runShare * 0.55
-            dailyJogMeters += missingDist * runShare * 0.45
-        }
-        if (samsung.maxSpeedMps in 0.55..GaitClassifier.MAX_HUMAN_RUNNING_SPEED_MPS &&
-            samsung.maxSpeedMps > dailyMaxSpeedMps
-        ) {
-            dailyMaxSpeedMps = samsung.maxSpeedMps
-        }
-        if (samsung.maxCadenceSpm in 68.0..235.0 && samsung.maxCadenceSpm > dailyMaxCadenceSpm) {
-            dailyMaxCadenceSpm = samsung.maxCadenceSpm
-        }
-        dailyDirty = true
         persistDailySummaryNow()
+
+        val aligned = repository.alignDailyActivityWithSamsung(dailyDateIso, samsung)
+        dailyWalkSec = aligned.walkingSec
+        dailyJogSec = aligned.joggingSec
+        dailyRunSec = aligned.runningSec
+        dailyWalkMeters = aligned.walkingMeters
+        dailyJogMeters = aligned.joggingMeters
+        dailyRunMeters = aligned.runningMeters
+        dailyTotalSteps = aligned.totalSteps
+        dailyMaxSpeedMps = aligned.maxSpeedMps
+        dailyMaxCadenceSpm = aligned.maxCadenceSpm
+        preVehicleCheckpoints.clear()
+        resetOpenBout()
+        dailyDirty = false
+        lastDailyPersistElapsedMs = SystemClock.elapsedRealtime()
         broadcastTelemetry()
     }
 
@@ -567,6 +574,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     fun armPtTrial() {
         if (ptTrialPhase != PtTrialPhase.IDLE) return
         if (intervalPhase != IntervalPhase.IDLE) cancelIntervalWorkout(silent = true)
+        gaitClassifier.clearVehicleLatchForManualWorkout()
+        signalProcessor.suppressStepsForVehicle = false
+        wasInVehicleLatchLastTick = false
         wakeFromLowPowerStandby()
         registerLocationIfPermitted()
         flushOpenBoutIfQualified()
@@ -750,6 +760,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     // =========================================================================
     fun startIntervalWorkout(totalReps: Int = 6, restSeconds: Double = 90.0) {
         if (ptTrialPhase != PtTrialPhase.IDLE) cancelPtTrial()
+        gaitClassifier.clearVehicleLatchForManualWorkout()
+        signalProcessor.suppressStepsForVehicle = false
+        wasInVehicleLatchLastTick = false
         wakeFromLowPowerStandby()
         registerLocationIfPermitted()
         flushOpenBoutIfQualified()
@@ -887,7 +900,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         } else true
 
         if (canReadSteps && !stepDetectorRegistered) {
-            val stepDetector = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
+            val stepDetector = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR, true)
+                ?: sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
             if (stepDetector != null) {
                 stepDetectorRegistered = sensorManager.registerListener(
                     this,
@@ -901,7 +915,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         }
 
         if (canReadSteps && !stepCounterRegistered) {
-            val stepCounter = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+            val stepCounter = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER, true)
+                ?: sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
             if (stepCounter != null) {
                 lastStepCounterHwValue = null
                 stepCounterRegistered = sensorManager.registerListener(
@@ -991,6 +1006,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         when (event.sensor.type) {
             Sensor.TYPE_STEP_DETECTOR -> {
                 val steps = event.values.firstOrNull()?.toInt()?.coerceAtLeast(1) ?: 1
+                if (!repository.hasVerifiedHardwarePedometer) {
+                    repository.hasVerifiedHardwarePedometer = true
+                }
                 signalProcessor.onHardwareStepDetected(nowMs, steps)
                 wakeFromLowPowerStandby()
             }
@@ -999,6 +1017,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 val prevHw = lastStepCounterHwValue
                 if (prevHw != null && cumulative > prevHw) {
                     val hwDelta = (cumulative - prevHw).toInt()
+                    if (hwDelta > 0 && !repository.hasVerifiedHardwarePedometer) {
+                        repository.hasVerifiedHardwarePedometer = true
+                    }
                     val alreadyCounted = (signalProcessor.totalSteps - stepsAtLastStepCounter).coerceAtLeast(0)
                     signalProcessor.reconcileStepCounterDelta(nowMs, hwDelta, alreadyCounted)
                     if (hwDelta > 0) wakeFromLowPowerStandby()
@@ -1076,8 +1097,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             if (chordMeters >= minMoveFloor) {
                 val curState = gaitClassifier.currentState()
                 val candState = gaitClassifier.candidateState()
+                val inVeh = gaitClassifier.isInOrCoolingDownFromVehicle()
                 val activeCadence = signalProcessor.getCadenceSpm(nowElapsed) >= GaitClassifier.MIN_WALKING_CADENCE_SPM
-                val onFoot = curState != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
+                val onFoot = !inVeh && curState != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
                     (curState.countsAsActiveMovement || activeCadence)
 
                 // 400m oval track curve arc-to-chord compensation so 36.5m semicircular bends don't under-measure!
@@ -1171,27 +1193,76 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         val accelRms = signalProcessor.getDynamicAccelRms(nowMs)
         val minRawNorm = signalProcessor.getMinRawNorm(nowMs)
         val peakToTroughNorm = signalProcessor.getPeakToTroughNorm(nowMs)
+        val p20RawNorm = signalProcessor.getP20RawNorm(nowMs)
         val gpsReliableForGait = gpsFresh &&
             (latestGpsAccuracyM == null || latestGpsAccuracyM!! <= 14f || smoothedGpsSpeedMps >= 0.70)
         val gpsForClassifier = if (gpsReliableForGait) smoothedGpsSpeedMps else null
 
+        val wasInVehicleLatchBefore = wasInVehicleLatchLastTick
         val state = gaitClassifier.update(
             nowMs = nowMs,
             gpsSpeedMps = gpsForClassifier,
             cadenceSpm = cadenceSpm,
             dynamicAccelRms = accelRms,
             minRawNorm = minRawNorm,
-            peakToTroughNorm = peakToTroughNorm
+            peakToTroughNorm = peakToTroughNorm,
+            p20RawNorm = p20RawNorm
         )
         val candState = gaitClassifier.candidateState()
+        val inVehicleOrCooldown = gaitClassifier.isInOrCoolingDownFromVehicle()
+        signalProcessor.suppressStepsForVehicle = inVehicleOrCooldown
+        wasInVehicleLatchLastTick = gaitClassifier.isVehicleLatched()
+
+        // 12-second Pre-Vehicle Rollback: if the rider just mounted a bike and accelerated into VEHICLE,
+        // roll back the few seconds of initial rollout before GPS crossed vehicle threshold so ZERO fake
+        // steps, distance, walk/jog/run seconds, or peak speed/cadence spikes pollute the day!
+        if (!wasInVehicleLatchBefore && gaitClassifier.isVehicleLatched() &&
+            ptTrialPhase == PtTrialPhase.IDLE && intervalPhase == IntervalPhase.IDLE
+        ) {
+            flushOpenBoutIfQualified()
+            resetOpenBout()
+            val rollbackSnap = preVehicleCheckpoints.firstOrNull {
+                it.dateIso == dailyDateIso && (nowMs - it.elapsedMs) in 3_500L..14_500L
+            } ?: preVehicleCheckpoints.lastOrNull { it.dateIso == dailyDateIso }
+            if (rollbackSnap != null) {
+                dailyWalkSec = rollbackSnap.walkSec
+                dailyJogSec = rollbackSnap.jogSec
+                dailyRunSec = rollbackSnap.runSec
+                dailyWalkMeters = rollbackSnap.walkMeters
+                dailyJogMeters = rollbackSnap.jogMeters
+                dailyRunMeters = rollbackSnap.runMeters
+                dailyTotalSteps = rollbackSnap.totalSteps
+                dailyMaxSpeedMps = rollbackSnap.maxSpeedMps
+                dailyMaxCadenceSpm = rollbackSnap.maxCadenceSpm
+                rollbackSnap.hourlyBucket?.let { prevHb ->
+                    val curHb = currentHourlyBucket
+                    if (curHb != null && curHb.bucketKey == prevHb.bucketKey) {
+                        currentHourlyBucket = prevHb.copy(vehicleSec = curHb.vehicleSec)
+                        hourlyDirty = true
+                    }
+                }
+                dailyDirty = true
+            }
+            preVehicleCheckpoints.clear()
+        }
 
         // Smart GPS & Battery Duty-Cycling:
-        //  - Spin up GPS immediately during PT Trials, Intervals, UI visible, Jog/Run, or >= 18s sustained outdoor walk.
+        //  - CRITICAL: NEVER shut off GPS while riding a bike/vehicle or waiting for dismount verification!
+        //  - Spin up GPS quickly (5s walk or active acceleration) so bike departures lock GPS immediately.
         //  - Drop into Low-Power Standby (0% GPS drain, no WakeLock) after 45s stationary indoors!
-        if (state.countsAsActiveMovement || cadenceSpm >= 50.0) {
+        if (inVehicleOrCooldown) {
+            lastMovementDetectedElapsedMs = nowMs
+            continuousFootMovementMs = 0L
+            if (isLowPowerStandby) {
+                wakeFromLowPowerStandby()
+            }
+            registerLocationIfPermitted()
+        } else if (state.countsAsActiveMovement || candState.countsAsActiveMovement || cadenceSpm >= 50.0 || accelRms >= 2.1) {
             lastMovementDetectedElapsedMs = nowMs
             continuousFootMovementMs = (continuousFootMovementMs + dtMs).coerceAtMost(60_000L)
-            if (isHighPrecisionSessionActive() || state.isJogOrRun() || candState.isJogOrRun() || continuousFootMovementMs >= 18_000L) {
+            if (isHighPrecisionSessionActive() || state.isJogOrRun() || candState.isJogOrRun() ||
+                continuousFootMovementMs >= 5_000L || accelRms >= 2.2
+            ) {
                 registerLocationIfPermitted()
             }
         } else {
@@ -1224,6 +1295,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                         accelRms = accelRms,
                         minRawNorm = minRawNorm,
                         peakToTroughNorm = peakToTroughNorm,
+                        p20RawNorm = p20RawNorm,
                         isLowPower = isLowPowerStandby,
                         ptPhase = ptTrialPhase.name
                     )
@@ -1237,7 +1309,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             locationRegistered && lastGpsDistanceContributionMs > 0L && (nowMs - lastGpsDistanceContributionMs) <= 4000L
         val stepSpeedMps = gaitClassifier.estimateSpeedFromStepsMps(cadenceSpm, accelRms)
         val effectiveSpeedMps = when {
-            !state.countsAsActiveMovement -> 0.0
+            !state.countsAsActiveMovement || inVehicleOrCooldown -> 0.0
             gpsActivelyMeasuringDistance && smoothedGpsSpeedMps > 0.55 -> smoothedGpsSpeedMps
             gpsFresh && smoothedGpsSpeedMps > stepSpeedMps -> smoothedGpsSpeedMps
             else -> stepSpeedMps
@@ -1253,7 +1325,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         lastHwStepsProcessed = curHwSteps
         lastSwStepsProcessed = curSwSteps
 
-        val onFootNow = state != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
+        val onFootNow = !inVehicleOrCooldown && state != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
             (state.countsAsActiveMovement || cadenceSpm >= GaitClassifier.MIN_WALKING_CADENCE_SPM)
         val stepFallbackDeltaM = if (!gpsActivelyMeasuringDistance && repository.indoorStepFallbackEnabled && newSteps > 0 && onFootNow) {
             newSteps * gaitClassifier.estimateStrideLengthMeters(cadenceSpm.coerceAtLeast(85.0), accelRms)
@@ -1264,7 +1336,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         // Update Intraday Hourly Fine-Tuning Bucket
         run {
             val hb = ensureHourlyBucketLoaded()
-            val countStepNow = newSteps > 0 && state != MotionState.VEHICLE && candState != MotionState.VEHICLE
+            val countStepNow = newSteps > 0 && !inVehicleOrCooldown && state != MotionState.VEHICLE && candState != MotionState.VEHICLE
             val effStateForDist = if (state.countsAsActiveMovement) state else {
                 if (candState.countsAsActiveMovement) candState else MotionState.WALKING
             }
@@ -1280,7 +1352,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 jogRunMeters = hb.jogRunMeters + if (stepFallbackDeltaM > 0.0 && effStateForDist.isJogOrRun()) stepFallbackDeltaM else 0.0,
                 strideMeters = hb.strideMeters + stepFallbackDeltaM,
                 maxSpeedMps = max(hb.maxSpeedMps, effectiveSpeedMps),
-                maxCadenceSpm = max(hb.maxCadenceSpm, cadenceSpm),
+                maxCadenceSpm = if (!inVehicleOrCooldown) max(hb.maxCadenceSpm, cadenceSpm) else hb.maxCadenceSpm,
                 maxAccelRms = max(hb.maxAccelRms, accelRms)
             )
             if (countStepNow || state != MotionState.STANDING || stepFallbackDeltaM > 0.0) {
@@ -1292,7 +1364,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         // 1. ALWAYS-ON 24/7 ALL-DAY OPEN AUTO TRACKING (Auto-Pauses When Standing)
         // =========================================================================
         if (repository.allDayTrackingEnabled) {
-            if (newSteps > 0 && state != MotionState.VEHICLE && candState != MotionState.VEHICLE) {
+            if (newSteps > 0 && !inVehicleOrCooldown && state != MotionState.VEHICLE && candState != MotionState.VEHICLE) {
                 dailyTotalSteps += newSteps
                 dailyDirty = true
             }
@@ -1302,7 +1374,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 }
                 addAllDayDistanceDelta(stepFallbackDeltaM, effectiveState)
             }
-            if (state.countsAsActiveMovement) {
+            if (state.countsAsActiveMovement && !inVehicleOrCooldown) {
                 when (state) {
                     MotionState.WALKING -> dailyWalkSec += dtSec
                     MotionState.JOGGING -> dailyJogSec += dtSec
@@ -1318,6 +1390,32 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                     dailyMaxCadenceSpm = cadenceSpm
                 }
                 dailyDirty = true
+            }
+
+            // Sample pre-vehicle checkpoint every 2s while cleanly on foot / standing
+            if (!inVehicleOrCooldown && state != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
+                (nowMs - lastCheckpointSampleMs) >= 2_000L
+            ) {
+                lastCheckpointSampleMs = nowMs
+                preVehicleCheckpoints.addLast(
+                    PreVehicleCheckpoint(
+                        elapsedMs = nowMs,
+                        dateIso = dailyDateIso,
+                        walkSec = dailyWalkSec,
+                        jogSec = dailyJogSec,
+                        runSec = dailyRunSec,
+                        walkMeters = dailyWalkMeters,
+                        jogMeters = dailyJogMeters,
+                        runMeters = dailyRunMeters,
+                        totalSteps = dailyTotalSteps,
+                        maxSpeedMps = dailyMaxSpeedMps,
+                        maxCadenceSpm = dailyMaxCadenceSpm,
+                        hourlyBucket = currentHourlyBucket
+                    )
+                )
+                while (preVehicleCheckpoints.size > 10) {
+                    preVehicleCheckpoints.removeFirst()
+                }
             }
 
             if (ptTrialPhase == PtTrialPhase.IDLE && intervalPhase == IntervalPhase.IDLE) {
