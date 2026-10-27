@@ -41,6 +41,7 @@ import androidx.core.content.ContextCompat
 import com.tspolice.runtracker.data.RunRepository
 import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.GaitClassifier
+import com.tspolice.runtracker.domain.HourlySensorBucket
 import com.tspolice.runtracker.domain.IntervalPhase
 import com.tspolice.runtracker.domain.IntervalWorkoutState
 import com.tspolice.runtracker.domain.LapSplit
@@ -53,9 +54,11 @@ import com.tspolice.runtracker.domain.PtTrialPhase
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
+import com.tspolice.runtracker.domain.SensorTransitionEvent
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import com.tspolice.runtracker.ui.MainActivity
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArraySet
 import kotlin.math.abs
@@ -190,6 +193,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var dailyDirty = false
     private var lastDailyPersistElapsedMs = 0L
     private var lastSignalStepsProcessed = 0
+
+    // Intraday Hourly Sensor Fine-Tuning Bucket (persisted alongside daily summary)
+    private var currentHourlyBucket: HourlySensorBucket? = null
+    private var hourlyDirty = false
+    private var lastHwStepsProcessed = 0
+    private var lastSwStepsProcessed = 0
 
     // Automatic Open Jog/Run bout detector (logs >= 600m casual jog/runs into 7:15 Progress & ETA automatically!)
     private var openBoutStartedWallMs = 0L
@@ -437,6 +446,36 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         dailyMaxCadenceSpm = stored.maxCadenceSpm
         dailyDirty = false
         lastSignalStepsProcessed = signalProcessor.totalSteps
+        lastHwStepsProcessed = signalProcessor.hardwareStepsCount
+        lastSwStepsProcessed = signalProcessor.fallbackSoftwareStepsCount
+        ensureHourlyBucketLoaded()
+    }
+
+    private fun ensureHourlyBucketLoaded(): HourlySensorBucket {
+        val nowDt = LocalDateTime.now()
+        val dIso = nowDt.toLocalDate().toString()
+        val hr = nowDt.hour
+        val bKey = String.format("%sT%02d", dIso, hr)
+        val existing = currentHourlyBucket
+        if (existing != null && existing.bucketKey == bKey) {
+            return existing
+        }
+        if (existing != null && hourlyDirty) {
+            runCatching { repository.upsertHourlySensorBucket(existing) }
+            hourlyDirty = false
+        }
+        val loaded = runCatching { repository.getHourlySensorBucket(bKey, dIso, hr) }
+            .getOrElse { HourlySensorBucket(bucketKey = bKey, dateIso = dIso, hourOfDay = hr) }
+        currentHourlyBucket = loaded
+        return loaded
+    }
+
+    fun flushTuningBuffersNow() {
+        persistDailySummaryNow()
+        currentHourlyBucket?.let { b ->
+            runCatching { repository.upsertHourlySensorBucket(b) }
+            hourlyDirty = false
+        }
     }
 
     private fun currentDailySnapshot(): DailyActivitySummary = DailyActivitySummary(
@@ -457,6 +496,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (dailyDateIso.isBlank()) return
         runCatching {
             repository.upsertDailyActivity(currentDailySnapshot())
+            currentHourlyBucket?.let { b ->
+                if (hourlyDirty) {
+                    repository.upsertHourlySensorBucket(b)
+                    hourlyDirty = false
+                }
+            }
             dailyDirty = false
             lastDailyPersistElapsedMs = SystemClock.elapsedRealtime()
         }
@@ -999,6 +1044,15 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             return
         }
 
+        if (location.hasAccuracy()) {
+            val hb = ensureHourlyBucketLoaded()
+            currentHourlyBucket = hb.copy(
+                gpsFixCount = hb.gpsFixCount + 1,
+                gpsAccSumMeters = hb.gpsAccSumMeters + location.accuracy.toDouble()
+            )
+            hourlyDirty = true
+        }
+
         val nowElapsed = SystemClock.elapsedRealtime()
         val prev = lastValidLocation
         var observedSpeed = if (location.hasSpeed()) location.speed.toDouble() else -1.0
@@ -1053,6 +1107,13 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                             if (candState.countsAsActiveMovement) candState else MotionState.WALKING
                         }
                         addAllDayDistanceDelta(curveAdjustedMeters, effectiveState)
+                        val hb = ensureHourlyBucketLoaded()
+                        currentHourlyBucket = hb.copy(
+                            gpsMeters = hb.gpsMeters + curveAdjustedMeters,
+                            walkMeters = hb.walkMeters + if (effectiveState.isJogOrRun()) 0.0 else curveAdjustedMeters,
+                            jogRunMeters = hb.jogRunMeters + if (effectiveState.isJogOrRun()) curveAdjustedMeters else 0.0
+                        )
+                        hourlyDirty = true
                     }
                     when (ptTrialPhase) {
                         PtTrialPhase.RUNNING_TRIAL -> {
@@ -1151,7 +1212,24 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (state != lastAnnouncedState) {
             val previousState = lastAnnouncedState
             lastAnnouncedState = state
-            if (dailyDirty) persistDailySummaryNow()
+            runCatching {
+                repository.recordSensorTransition(
+                    SensorTransitionEvent(
+                        epochMs = System.currentTimeMillis(),
+                        fromState = previousState.name,
+                        toState = state.name,
+                        gpsSpeedMps = gpsForClassifier,
+                        gpsAccMeters = latestGpsAccuracyM?.toDouble(),
+                        cadenceSpm = cadenceSpm,
+                        accelRms = accelRms,
+                        minRawNorm = minRawNorm,
+                        peakToTroughNorm = peakToTroughNorm,
+                        isLowPower = isLowPowerStandby,
+                        ptPhase = ptTrialPhase.name
+                    )
+                )
+            }
+            if (dailyDirty || hourlyDirty) persistDailySummaryNow()
             onMotionStateChanged(previousState, state, nowMs)
         }
 
@@ -1168,6 +1246,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         val currentSteps = signalProcessor.totalSteps
         val newSteps = (currentSteps - lastSignalStepsProcessed).coerceAtLeast(0)
         lastSignalStepsProcessed = currentSteps
+        val curHwSteps = signalProcessor.hardwareStepsCount
+        val curSwSteps = signalProcessor.fallbackSoftwareStepsCount
+        val deltaHwSteps = (curHwSteps - lastHwStepsProcessed).coerceAtLeast(0)
+        val deltaSwSteps = (curSwSteps - lastSwStepsProcessed).coerceAtLeast(0)
+        lastHwStepsProcessed = curHwSteps
+        lastSwStepsProcessed = curSwSteps
 
         val onFootNow = state != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
             (state.countsAsActiveMovement || cadenceSpm >= GaitClassifier.MIN_WALKING_CADENCE_SPM)
@@ -1175,6 +1259,33 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             newSteps * gaitClassifier.estimateStrideLengthMeters(cadenceSpm.coerceAtLeast(85.0), accelRms)
         } else {
             0.0
+        }
+
+        // Update Intraday Hourly Fine-Tuning Bucket
+        run {
+            val hb = ensureHourlyBucketLoaded()
+            val countStepNow = newSteps > 0 && state != MotionState.VEHICLE && candState != MotionState.VEHICLE
+            val effStateForDist = if (state.countsAsActiveMovement) state else {
+                if (candState.countsAsActiveMovement) candState else MotionState.WALKING
+            }
+            currentHourlyBucket = hb.copy(
+                hwSteps = hb.hwSteps + if (countStepNow) deltaHwSteps else 0,
+                fallbackSteps = hb.fallbackSteps + if (countStepNow) deltaSwSteps else 0,
+                walkSec = hb.walkSec + if (state == MotionState.WALKING) dtSec else 0.0,
+                jogSec = hb.jogSec + if (state == MotionState.JOGGING) dtSec else 0.0,
+                runSec = hb.runSec + if (state == MotionState.RUNNING || state == MotionState.TARGET_PACE) dtSec else 0.0,
+                vehicleSec = hb.vehicleSec + if (state == MotionState.VEHICLE) dtSec else 0.0,
+                lowPowerSec = hb.lowPowerSec + if (isLowPowerStandby) dtSec else 0.0,
+                walkMeters = hb.walkMeters + if (stepFallbackDeltaM > 0.0 && !effStateForDist.isJogOrRun()) stepFallbackDeltaM else 0.0,
+                jogRunMeters = hb.jogRunMeters + if (stepFallbackDeltaM > 0.0 && effStateForDist.isJogOrRun()) stepFallbackDeltaM else 0.0,
+                strideMeters = hb.strideMeters + stepFallbackDeltaM,
+                maxSpeedMps = max(hb.maxSpeedMps, effectiveSpeedMps),
+                maxCadenceSpm = max(hb.maxCadenceSpm, cadenceSpm),
+                maxAccelRms = max(hb.maxAccelRms, accelRms)
+            )
+            if (countStepNow || state != MotionState.STANDING || stepFallbackDeltaM > 0.0) {
+                hourlyDirty = true
+            }
         }
 
         // =========================================================================
@@ -1213,7 +1324,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 updateAutomaticOpenRunBout(state, dtMs, dtSec, effectiveSpeedMps, cadenceSpm)
             }
 
-            if (dailyDirty && (nowMs - lastDailyPersistElapsedMs) >= 5000L) {
+            if ((dailyDirty || hourlyDirty) && (nowMs - lastDailyPersistElapsedMs) >= 5000L) {
                 persistDailySummaryNow()
             }
         }

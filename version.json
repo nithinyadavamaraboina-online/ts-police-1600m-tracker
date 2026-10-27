@@ -1,8 +1,8 @@
 {
-    "versionCode":  11,
-    "versionName":  "1.0.10",
+    "versionCode":  12,
+    "versionName":  "1.0.11",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "92cd58f359cb8e077654d5bb7e75bc7124a04553d5725fb08cbfb6c44d57783d",
-    "changelog":  "Pull \u0026 compare Yesterday + Today + 2-Day Combined data against Samsung Health (Steps, Distance, Walk, Jog+Run, Max Pace, Max Cadence \u0026 Stride), 2-day personal stride calibration, Align Yesterday/Today, and 1-tap Copyable 2-Day Accuracy Report.",
-    "publishedAt":  "2026-10-27T15:49:49Z"
+    "sha256":  "55ec600d323fc379ff30e06e2a2aae969951def38fa496bfedcd9880c4cde3bb",
+    "changelog":  "Add 1-tap Fine-Tuning Telemetry Pull \u0026 Cloud Sync (7-day Samsung Health, 48h Yesterday+Today intraday hourly step/distance buckets, hardware sensor FIFO profile \u0026 300-transition DSP log) for remote threshold \u0026 stride tuning.",
+    "publishedAt":  "2026-10-27T16:12:21Z"
 }

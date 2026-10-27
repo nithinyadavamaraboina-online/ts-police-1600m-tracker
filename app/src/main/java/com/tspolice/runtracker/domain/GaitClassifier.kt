@@ -261,6 +261,12 @@ class MotionSignalProcessor {
     var totalSteps: Int = 0
         private set
 
+    var hardwareStepsCount: Int = 0
+        private set
+
+    var fallbackSoftwareStepsCount: Int = 0
+        private set
+
     fun isReceivingHardwareSteps(nowMs: Long): Boolean =
         (nowMs - lastActualHardwareStepMs) in 0L..5000L
 
@@ -279,12 +285,16 @@ class MotionSignalProcessor {
         cyclePeakTimeMs = -10_000L
         lastConfirmedSwStepMs = -10_000L
         totalSteps = 0
+        hardwareStepsCount = 0
+        fallbackSoftwareStepsCount = 0
     }
 
     fun onHardwareStepDetected(nowMs: Long, count: Int = 1) {
         lastActualHardwareStepMs = nowMs
         pendingSoftwareStepMs.clear()
-        totalSteps += count.coerceIn(1, 12)
+        val c = count.coerceIn(1, 12)
+        totalSteps += c
+        hardwareStepsCount += c
         recordStepTimestamp(nowMs)
         pruneOld(nowMs)
     }
@@ -298,6 +308,7 @@ class MotionSignalProcessor {
         val missing = (hwDeltaSteps - stepsCountedSinceLastCounter).coerceIn(0, 12)
         if (missing > 0) {
             totalSteps += missing
+            hardwareStepsCount += missing
             recordStepTimestamp(nowMs)
         }
         pruneOld(nowMs)
@@ -422,6 +433,7 @@ class MotionSignalProcessor {
             pendingSoftwareStepMs.clear()
             recordStepTimestamp(nowMs)
             totalSteps++
+            fallbackSoftwareStepsCount++
             return true
         }
 
@@ -432,6 +444,7 @@ class MotionSignalProcessor {
                 val ts = pendingSoftwareStepMs.removeFirst()
                 recordStepTimestamp(ts)
                 totalSteps++
+                fallbackSoftwareStepsCount++
             }
             return true
         }

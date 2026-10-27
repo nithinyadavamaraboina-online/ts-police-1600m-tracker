@@ -7,6 +7,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.ExternalRunWorkout
 import com.tspolice.runtracker.domain.GaitClassifier
+import com.tspolice.runtracker.domain.HourlySensorBucket
 import com.tspolice.runtracker.domain.LapSplit
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.PocketAudioMode
@@ -14,6 +15,7 @@ import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SamsungHealthComparator
+import com.tspolice.runtracker.domain.SensorTransitionEvent
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,9 +30,11 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
 ) {
     companion object {
         private const val DB_NAME = "ts_police_1600m.db"
-        private const val DB_VERSION = 2
+        private const val DB_VERSION = 3
         private const val TABLE_RUNS = "run_sessions"
         private const val TABLE_DAILY = "daily_activity"
+        private const val TABLE_HOURLY = "sensor_hourly_buckets"
+        private const val TABLE_TRANSITIONS = "sensor_transition_log"
         private const val PREFS_NAME = "ts_police_prefs"
 
         private const val KEY_TARGET_SEC = "target_time_sec"
@@ -48,6 +52,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_CACHED_SAMSUNG_JSON = "cached_samsung_snapshot_json"
         private const val KEY_CACHED_SAMSUNG_MAP_JSON = "cached_samsung_snapshots_map_v2"
         private const val KEY_IMPORTED_EXT_WORKOUTS = "imported_external_workout_ids"
+        private const val KEY_LAST_TUNING_SYNC_SUMMARY = "last_tuning_sync_summary"
     }
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -78,6 +83,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_runs_date ON $TABLE_RUNS(date_iso, started_at_ms DESC)")
         createDailyTableIfNeeded(db)
+        createTuningTablesIfNeeded(db)
     }
 
     private fun createDailyTableIfNeeded(db: SQLiteDatabase) {
@@ -100,10 +106,67 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         )
     }
 
+    private fun createTuningTablesIfNeeded(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $TABLE_HOURLY (
+                bucket_key TEXT PRIMARY KEY NOT NULL,
+                date_iso TEXT NOT NULL,
+                hour_of_day INTEGER NOT NULL,
+                hw_steps INTEGER NOT NULL DEFAULT 0,
+                fallback_steps INTEGER NOT NULL DEFAULT 0,
+                walk_sec REAL NOT NULL DEFAULT 0,
+                jog_sec REAL NOT NULL DEFAULT 0,
+                run_sec REAL NOT NULL DEFAULT 0,
+                vehicle_sec REAL NOT NULL DEFAULT 0,
+                low_power_sec REAL NOT NULL DEFAULT 0,
+                walk_m REAL NOT NULL DEFAULT 0,
+                jog_run_m REAL NOT NULL DEFAULT 0,
+                gps_m REAL NOT NULL DEFAULT 0,
+                stride_m REAL NOT NULL DEFAULT 0,
+                max_speed_mps REAL NOT NULL DEFAULT 0,
+                max_cadence_spm REAL NOT NULL DEFAULT 0,
+                max_accel_rms REAL NOT NULL DEFAULT 0,
+                gps_fix_count INTEGER NOT NULL DEFAULT 0,
+                gps_acc_sum REAL NOT NULL DEFAULT 0
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_hourly_date ON $TABLE_HOURLY(date_iso, hour_of_day)")
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $TABLE_TRANSITIONS (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                epoch_ms INTEGER NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                gps_speed_mps REAL,
+                gps_acc_m REAL,
+                cadence_spm REAL NOT NULL,
+                accel_rms REAL NOT NULL,
+                min_raw_norm REAL,
+                peak_to_trough REAL,
+                is_low_power INTEGER NOT NULL DEFAULT 0,
+                pt_phase TEXT NOT NULL
+            )
+            """.trimIndent()
+        )
+    }
+
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Non-destructive upgrade: preserve all existing user run_sessions!
+        // Non-destructive upgrade: preserve all existing user run_sessions & daily_activity!
         if (oldVersion < 2) {
             createDailyTableIfNeeded(db)
+        }
+        if (oldVersion < 3) {
+            createTuningTablesIfNeeded(db)
+        }
+    }
+
+    override fun onOpen(db: SQLiteDatabase) {
+        super.onOpen(db)
+        if (!db.isReadOnly) {
+            createTuningTablesIfNeeded(db)
         }
     }
 
@@ -777,5 +840,160 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             imported++
         }
         return imported
+    }
+
+    var lastTuningSyncSummary: String
+        get() = prefs.getString(KEY_LAST_TUNING_SYNC_SUMMARY, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_LAST_TUNING_SYNC_SUMMARY, value).apply()
+
+    fun getHourlySensorBucket(bucketKey: String, dateIso: String, hourOfDay: Int): HourlySensorBucket {
+        readableDatabase.query(
+            TABLE_HOURLY,
+            null,
+            "bucket_key = ?",
+            arrayOf(bucketKey),
+            null,
+            null,
+            null
+        ).use { c ->
+            if (c.moveToFirst()) {
+                return readHourlyRow(c)
+            }
+        }
+        return HourlySensorBucket(bucketKey = bucketKey, dateIso = dateIso, hourOfDay = hourOfDay)
+    }
+
+    fun upsertHourlySensorBucket(bucket: HourlySensorBucket) {
+        if (bucket.bucketKey.isBlank()) return
+        val values = ContentValues().apply {
+            put("bucket_key", bucket.bucketKey)
+            put("date_iso", bucket.dateIso)
+            put("hour_of_day", bucket.hourOfDay)
+            put("hw_steps", bucket.hwSteps)
+            put("fallback_steps", bucket.fallbackSteps)
+            put("walk_sec", bucket.walkSec)
+            put("jog_sec", bucket.jogSec)
+            put("run_sec", bucket.runSec)
+            put("vehicle_sec", bucket.vehicleSec)
+            put("low_power_sec", bucket.lowPowerSec)
+            put("walk_m", bucket.walkMeters)
+            put("jog_run_m", bucket.jogRunMeters)
+            put("gps_m", bucket.gpsMeters)
+            put("stride_m", bucket.strideMeters)
+            put("max_speed_mps", bucket.maxSpeedMps)
+            put("max_cadence_spm", bucket.maxCadenceSpm)
+            put("max_accel_rms", bucket.maxAccelRms)
+            put("gps_fix_count", bucket.gpsFixCount)
+            put("gps_acc_sum", bucket.gpsAccSumMeters)
+        }
+        writableDatabase.insertWithOnConflict(
+            TABLE_HOURLY,
+            null,
+            values,
+            SQLiteDatabase.CONFLICT_REPLACE
+        )
+    }
+
+    fun getHourlySensorBucketsForDates(dateIsos: List<String>): Map<String, HourlySensorBucket> {
+        if (dateIsos.isEmpty()) return emptyMap()
+        val placeholders = dateIsos.joinToString(",") { "?" }
+        val out = LinkedHashMap<String, HourlySensorBucket>()
+        readableDatabase.query(
+            TABLE_HOURLY,
+            null,
+            "date_iso IN ($placeholders)",
+            dateIsos.toTypedArray(),
+            null,
+            null,
+            "date_iso ASC, hour_of_day ASC"
+        ).use { c ->
+            while (c.moveToNext()) {
+                val b = readHourlyRow(c)
+                out[b.bucketKey] = b
+            }
+        }
+        return out
+    }
+
+    private fun readHourlyRow(c: android.database.Cursor): HourlySensorBucket {
+        return HourlySensorBucket(
+            bucketKey = c.getString(c.getColumnIndexOrThrow("bucket_key")),
+            dateIso = c.getString(c.getColumnIndexOrThrow("date_iso")),
+            hourOfDay = c.getInt(c.getColumnIndexOrThrow("hour_of_day")),
+            hwSteps = c.getInt(c.getColumnIndexOrThrow("hw_steps")),
+            fallbackSteps = c.getInt(c.getColumnIndexOrThrow("fallback_steps")),
+            walkSec = c.getDouble(c.getColumnIndexOrThrow("walk_sec")),
+            jogSec = c.getDouble(c.getColumnIndexOrThrow("jog_sec")),
+            runSec = c.getDouble(c.getColumnIndexOrThrow("run_sec")),
+            vehicleSec = c.getDouble(c.getColumnIndexOrThrow("vehicle_sec")),
+            lowPowerSec = c.getDouble(c.getColumnIndexOrThrow("low_power_sec")),
+            walkMeters = c.getDouble(c.getColumnIndexOrThrow("walk_m")),
+            jogRunMeters = c.getDouble(c.getColumnIndexOrThrow("jog_run_m")),
+            gpsMeters = c.getDouble(c.getColumnIndexOrThrow("gps_m")),
+            strideMeters = c.getDouble(c.getColumnIndexOrThrow("stride_m")),
+            maxSpeedMps = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps")),
+            maxCadenceSpm = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm")),
+            maxAccelRms = c.getDouble(c.getColumnIndexOrThrow("max_accel_rms")),
+            gpsFixCount = c.getInt(c.getColumnIndexOrThrow("gps_fix_count")),
+            gpsAccSumMeters = c.getDouble(c.getColumnIndexOrThrow("gps_acc_sum"))
+        )
+    }
+
+    fun recordSensorTransition(event: SensorTransitionEvent) {
+        val values = ContentValues().apply {
+            put("epoch_ms", event.epochMs)
+            put("from_state", event.fromState)
+            put("to_state", event.toState)
+            if (event.gpsSpeedMps != null) put("gps_speed_mps", event.gpsSpeedMps) else putNull("gps_speed_mps")
+            if (event.gpsAccMeters != null) put("gps_acc_m", event.gpsAccMeters) else putNull("gps_acc_m")
+            put("cadence_spm", event.cadenceSpm)
+            put("accel_rms", event.accelRms)
+            if (event.minRawNorm != null) put("min_raw_norm", event.minRawNorm) else putNull("min_raw_norm")
+            if (event.peakToTroughNorm != null) put("peak_to_trough", event.peakToTroughNorm) else putNull("peak_to_trough")
+            put("is_low_power", if (event.isLowPower) 1 else 0)
+            put("pt_phase", event.ptPhase)
+        }
+        val db = writableDatabase
+        val rowId = db.insert(TABLE_TRANSITIONS, null, values)
+        if (rowId > 0L && rowId % 40L == 0L) {
+            db.execSQL("DELETE FROM $TABLE_TRANSITIONS WHERE id <= (SELECT MAX(id) - 320 FROM $TABLE_TRANSITIONS)")
+        }
+    }
+
+    fun getRecentSensorTransitions(limit: Int = 300): List<SensorTransitionEvent> {
+        val out = mutableListOf<SensorTransitionEvent>()
+        readableDatabase.query(
+            TABLE_TRANSITIONS,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "id DESC",
+            limit.toString()
+        ).use { c ->
+            val gpsSpdIdx = c.getColumnIndexOrThrow("gps_speed_mps")
+            val gpsAccIdx = c.getColumnIndexOrThrow("gps_acc_m")
+            val minNormIdx = c.getColumnIndexOrThrow("min_raw_norm")
+            val p2tIdx = c.getColumnIndexOrThrow("peak_to_trough")
+            while (c.moveToNext()) {
+                out.add(
+                    SensorTransitionEvent(
+                        epochMs = c.getLong(c.getColumnIndexOrThrow("epoch_ms")),
+                        fromState = c.getString(c.getColumnIndexOrThrow("from_state")),
+                        toState = c.getString(c.getColumnIndexOrThrow("to_state")),
+                        gpsSpeedMps = if (c.isNull(gpsSpdIdx)) null else c.getDouble(gpsSpdIdx),
+                        gpsAccMeters = if (c.isNull(gpsAccIdx)) null else c.getDouble(gpsAccIdx),
+                        cadenceSpm = c.getDouble(c.getColumnIndexOrThrow("cadence_spm")),
+                        accelRms = c.getDouble(c.getColumnIndexOrThrow("accel_rms")),
+                        minRawNorm = if (c.isNull(minNormIdx)) null else c.getDouble(minNormIdx),
+                        peakToTroughNorm = if (c.isNull(p2tIdx)) null else c.getDouble(p2tIdx),
+                        isLowPower = c.getInt(c.getColumnIndexOrThrow("is_low_power")) == 1,
+                        ptPhase = c.getString(c.getColumnIndexOrThrow("pt_phase"))
+                    )
+                )
+            }
+        }
+        return out
     }
 }

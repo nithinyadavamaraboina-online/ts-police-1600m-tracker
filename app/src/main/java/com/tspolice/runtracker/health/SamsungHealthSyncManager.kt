@@ -23,6 +23,7 @@ import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SamsungHealthComparator
+import com.tspolice.runtracker.domain.SamsungHourlyBucket
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import java.time.Duration
 import java.time.Instant
@@ -38,6 +39,17 @@ data class HealthSyncOutcome(
     val importedRunCount: Int = 0,
     val updatedStrideScale: Double = 1.0,
     val statusMessage: String = ""
+)
+
+data class DeepSamsungTuningDataset(
+    val syncOutcome: HealthSyncOutcome,
+    val sevenDaySnapshots: Map<String, SamsungDailySnapshot> = emptyMap(),
+    val intradayHourlyBuckets: Map<String, SamsungHourlyBucket> = emptyMap(),
+    val rawStepsRecordCount48h: Int = 0,
+    val rawDistanceRecordCount48h: Int = 0,
+    val rawExerciseRecordCount48h: Int = 0,
+    val avgStepBucketMinutes: Double = 0.0,
+    val grantedPermissions: List<String> = emptyList()
 )
 
 /**
@@ -607,5 +619,221 @@ class SamsungHealthSyncManager(
             if (startMs < e && endMs > s) return true
         }
         return false
+    }
+
+    /**
+     * Deep 7-day + 48-hour intraday Samsung Health pull used specifically for algorithm fine-tuning.
+     * Pulls 7 days of daily snapshots plus hour-by-hour (00..23) Steps, Distance, Walk/Run durations,
+     * Peak Speed, and Peak Cadence across Yesterday & Today!
+     */
+    suspend fun pullFineTuningDataset(): DeepSamsungTuningDataset {
+        val baseOutcome = syncTodayAndCalibrate()
+        val zone = ZoneId.systemDefault()
+        val today = LocalDate.now(zone)
+        val yesterday = today.minusDays(1)
+
+        if (getSdkStatus() != HealthConnectClient.SDK_AVAILABLE) {
+            return DeepSamsungTuningDataset(
+                syncOutcome = baseOutcome,
+                sevenDaySnapshots = repository.getAllCachedSamsungSnapshots()
+            )
+        }
+        val client = runCatching { HealthConnectClient.getOrCreate(context) }.getOrNull()
+            ?: return DeepSamsungTuningDataset(
+                syncOutcome = baseOutcome,
+                sevenDaySnapshots = repository.getAllCachedSamsungSnapshots()
+            )
+        val granted = runCatching { client.permissionController.getGrantedPermissions() }.getOrDefault(emptySet())
+        if (!granted.containsAll(MINIMUM_REQUIRED_PERMISSIONS)) {
+            return DeepSamsungTuningDataset(
+                syncOutcome = baseOutcome,
+                sevenDaySnapshots = repository.getAllCachedSamsungSnapshots(),
+                grantedPermissions = granted.sorted()
+            )
+        }
+
+        val sourcePkg = baseOutcome.snapshot?.sourcePackage
+            ?: baseOutcome.yesterdaySnapshot?.sourcePackage
+            ?: SamsungHealthComparator.SAMSUNG_HEALTH_PACKAGE
+        val sourceLabel = baseOutcome.snapshot?.sourceLabel
+            ?: baseOutcome.yesterdaySnapshot?.sourceLabel
+            ?: "Samsung Health"
+        val targetOrigins = setOf(DataOrigin(sourcePkg))
+
+        // 1. Pull full 7-day daily snapshots (Days -6..-2; Yesterday & Today already pulled in baseOutcome)
+        val sevenDays = LinkedHashMap<String, SamsungDailySnapshot>()
+        val nowInstant = Instant.now()
+        for (daysAgo in 6 downTo 2) {
+            val d = today.minusDays(daysAgo.toLong())
+            val dIso = d.toString()
+            val wStart = d.atStartOfDay(zone).toInstant()
+            val wEnd = d.plusDays(1).atStartOfDay(zone).toInstant()
+            runCatching {
+                val snap = pullDaySnapshot(
+                    client = client,
+                    granted = granted,
+                    dateIso = dIso,
+                    windowStart = wStart,
+                    windowEnd = wEnd,
+                    zone = zone,
+                    targetOrigins = targetOrigins,
+                    sourcePkg = sourcePkg,
+                    sourceLabel = sourceLabel
+                )
+                repository.saveSamsungSnapshot(snap)
+                sevenDays[dIso] = snap
+            }
+        }
+        baseOutcome.yesterdaySnapshot?.let { sevenDays[yesterday.toString()] = it }
+        baseOutcome.snapshot?.let { sevenDays[today.toString()] = it }
+
+        // 2. Pull 48-hour raw records for Yesterday + Today and build exact hourly buckets (00..23)
+        val yestStart = yesterday.atStartOfDay(zone).toInstant()
+        val safeNow = if (nowInstant.isAfter(yestStart)) nowInstant else yestStart.plusSeconds(1)
+        val filter48h = TimeRangeFilter.between(yestStart, safeNow)
+
+        val steps48h = runCatching {
+            client.readRecords(ReadRecordsRequest(StepsRecord::class, timeRangeFilter = filter48h, dataOriginFilter = targetOrigins)).records
+        }.getOrDefault(emptyList())
+
+        val dist48h = runCatching {
+            client.readRecords(ReadRecordsRequest(DistanceRecord::class, timeRangeFilter = filter48h, dataOriginFilter = targetOrigins)).records
+        }.getOrDefault(emptyList())
+
+        val canReadEx = HealthPermission.getReadPermission(ExerciseSessionRecord::class) in granted
+        val ex48h = if (canReadEx) {
+            runCatching {
+                client.readRecords(ReadRecordsRequest(ExerciseSessionRecord::class, timeRangeFilter = filter48h, dataOriginFilter = targetOrigins)).records
+            }.getOrDefault(emptyList())
+        } else emptyList()
+
+        val spd48h = if (HealthPermission.getReadPermission(SpeedRecord::class) in granted) {
+            runCatching {
+                client.readRecords(ReadRecordsRequest(SpeedRecord::class, timeRangeFilter = filter48h, dataOriginFilter = targetOrigins)).records
+            }.getOrDefault(emptyList())
+        } else emptyList()
+
+        val cad48h = if (HealthPermission.getReadPermission(StepsCadenceRecord::class) in granted) {
+            runCatching {
+                client.readRecords(ReadRecordsRequest(StepsCadenceRecord::class, timeRangeFilter = filter48h, dataOriginFilter = targetOrigins)).records
+            }.getOrDefault(emptyList())
+        } else emptyList()
+
+        val avgBucketMins = if (steps48h.isNotEmpty()) {
+            steps48h.map { max(1L, (it.endTime.toEpochMilli() - it.startTime.toEpochMilli()) / 1000L) / 60.0 }.average()
+        } else 0.0
+
+        val hourlyMap = LinkedHashMap<String, SamsungHourlyBucket>()
+        for (date in listOf(yesterday, today)) {
+            val dIso = date.toString()
+            for (hr in 0..23) {
+                val hStartMs = date.atTime(hr, 0).atZone(zone).toInstant().toEpochMilli()
+                val hEndMs = date.atTime(hr, 0).plusHours(1).atZone(zone).toInstant().toEpochMilli()
+                if (hStartMs >= safeNow.toEpochMilli()) {
+                    hourlyMap[String.format("%sT%02d", dIso, hr)] = SamsungHourlyBucket(dateIso = dIso, hourOfDay = hr)
+                    continue
+                }
+
+                var hSteps = 0.0
+                var hWalkSec = 0.0
+                var hJogRunSec = 0.0
+                for (sr in steps48h) {
+                    val rStart = sr.startTime.toEpochMilli()
+                    val rEnd = sr.endTime.toEpochMilli()
+                    val ovStart = max(rStart, hStartMs)
+                    val ovEnd = min(rEnd, hEndMs)
+                    if (ovEnd > ovStart) {
+                        val totalDur = max(1L, rEnd - rStart).toDouble()
+                        val frac = (ovEnd - ovStart) / totalDur
+                        val partSteps = sr.count * frac
+                        hSteps += partSteps
+                        val durSec = (ovEnd - ovStart) / 1000.0
+                        val cad = (sr.count.toDouble() / (totalDur / 1000.0)) * 60.0
+                        if (totalDur <= 900_000.0 && cad >= 132.0) {
+                            hJogRunSec += min(durSec, partSteps / 2.50)
+                        } else if (sr.count >= 6L) {
+                            hWalkSec += min(durSec, partSteps / 1.70)
+                        }
+                    }
+                }
+
+                var hDist = 0.0
+                for (dr in dist48h) {
+                    val rStart = dr.startTime.toEpochMilli()
+                    val rEnd = dr.endTime.toEpochMilli()
+                    val ovStart = max(rStart, hStartMs)
+                    val ovEnd = min(rEnd, hEndMs)
+                    if (ovEnd > ovStart) {
+                        val frac = (ovEnd - ovStart) / max(1L, rEnd - rStart).toDouble()
+                        hDist += dr.distance.inMeters * frac
+                    }
+                }
+                if (hDist < 1.0 && hSteps >= 5.0) {
+                    hDist = hSteps * 0.76
+                }
+
+                // Override/augment active seconds from explicit running/walking ExerciseSessionRecords in this hour
+                var exRunSec = 0.0
+                var exWalkSec = 0.0
+                for (ex in ex48h) {
+                    val ovStart = max(ex.startTime.toEpochMilli(), hStartMs)
+                    val ovEnd = min(ex.endTime.toEpochMilli(), hEndMs)
+                    if (ovEnd > ovStart) {
+                        val sec = (ovEnd - ovStart) / 1000.0
+                        when (ex.exerciseType) {
+                            ExerciseSessionRecord.EXERCISE_TYPE_RUNNING,
+                            ExerciseSessionRecord.EXERCISE_TYPE_RUNNING_TREADMILL -> exRunSec += sec
+                            ExerciseSessionRecord.EXERCISE_TYPE_WALKING,
+                            ExerciseSessionRecord.EXERCISE_TYPE_HIKING -> exWalkSec += sec
+                        }
+                    }
+                }
+                if (exRunSec > hJogRunSec) hJogRunSec = exRunSec
+                if (exWalkSec > hWalkSec) hWalkSec = exWalkSec
+
+                var hMaxSpeed = 0.0
+                for (sr in spd48h) {
+                    for (s in sr.samples) {
+                        val t = s.time.toEpochMilli()
+                        val v = s.speed.inMetersPerSecond
+                        if (t in hStartMs until hEndMs && v in 0.5..GaitClassifier.MAX_HUMAN_RUNNING_SPEED_MPS && v > hMaxSpeed) {
+                            hMaxSpeed = v
+                        }
+                    }
+                }
+
+                var hMaxCad = 0.0
+                for (cr in cad48h) {
+                    for (s in cr.samples) {
+                        val t = s.time.toEpochMilli()
+                        if (t in hStartMs until hEndMs && s.rate in 68.0..235.0 && s.rate > hMaxCad) {
+                            hMaxCad = s.rate
+                        }
+                    }
+                }
+
+                hourlyMap[String.format("%sT%02d", dIso, hr)] = SamsungHourlyBucket(
+                    dateIso = dIso,
+                    hourOfDay = hr,
+                    steps = kotlin.math.round(hSteps).toInt(),
+                    distanceMeters = hDist,
+                    walkSec = hWalkSec,
+                    jogRunSec = hJogRunSec,
+                    maxSpeedMps = hMaxSpeed,
+                    maxCadenceSpm = hMaxCad
+                )
+            }
+        }
+
+        return DeepSamsungTuningDataset(
+            syncOutcome = baseOutcome,
+            sevenDaySnapshots = sevenDays,
+            intradayHourlyBuckets = hourlyMap,
+            rawStepsRecordCount48h = steps48h.size,
+            rawDistanceRecordCount48h = dist48h.size,
+            rawExerciseRecordCount48h = ex48h.size,
+            avgStepBucketMinutes = avgBucketMins,
+            grantedPermissions = granted.sorted()
+        )
     }
 }

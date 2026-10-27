@@ -44,6 +44,7 @@ import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import com.tspolice.runtracker.health.SamsungHealthSyncManager
 import com.tspolice.runtracker.service.RunTrackingService
+import com.tspolice.runtracker.telemetry.TuningTelemetryManager
 import com.tspolice.runtracker.update.AppUpdater
 import com.tspolice.runtracker.update.UpdateCheckResult
 import com.tspolice.runtracker.update.UpdateReleaseInfo
@@ -60,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var repository: RunRepository
     private lateinit var appUpdater: AppUpdater
     private lateinit var healthSyncManager: SamsungHealthSyncManager
+    private lateinit var tuningTelemetryManager: TuningTelemetryManager
     private var trackingService: RunTrackingService? = null
     private var serviceBound = false
     private var lastHandledFinishId: Long? = null
@@ -76,6 +78,7 @@ class MainActivity : AppCompatActivity() {
     private var activeComparisonScope: ComparisonDayScope = ComparisonDayScope.TODAY
     private var latestDailySummaryForCompare: DailyActivitySummary = DailyActivitySummary()
     private var isHealthSyncInFlight = false
+    private var isTuningUploadInFlight = false
     private var lastHealthSyncElapsedMs = -120_000L
     private var lastSamsungRenderKey = ""
 
@@ -163,6 +166,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var samsungPrimaryBtn: TextView
     private lateinit var samsungSecondaryBtn: TextView
     private lateinit var samsungReportBtn: TextView
+    private lateinit var samsungSendTuningBtn: TextView
+    private lateinit var samsungTuningStatusText: TextView
     private lateinit var dailyHistoryListLayout: LinearLayout
 
     // Tab 1B: 1.6 km PT Trial views
@@ -222,6 +227,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var diagStepText: TextView
     private lateinit var diagStrideCalText: TextView
     private lateinit var diagStateText: TextView
+    private lateinit var labTuningStatusText: TextView
+    private lateinit var labSendTuningBtn: TextView
     private lateinit var updateStatusText: TextView
     private lateinit var checkUpdateBtn: TextView
 
@@ -267,6 +274,7 @@ class MainActivity : AppCompatActivity() {
         repository = RunRepository(this)
         appUpdater = AppUpdater(this)
         healthSyncManager = SamsungHealthSyncManager(this, repository)
+        tuningTelemetryManager = TuningTelemetryManager(this, repository, healthSyncManager)
         val todayNow = LocalDate.now()
         latestDailySummaryForCompare = repository.getDailyActivity(todayNow.toString())
         latestSamsungSnapshot = repository.getCachedSamsungSnapshot(todayNow.toString())
@@ -279,6 +287,7 @@ class MainActivity : AppCompatActivity() {
         selectTab(0)
         selectTrackerSubTab(0)
         refreshSettingsHighlights()
+        refreshTuningStatusLabels()
         refreshCachedDailyHistory(forceRender = true)
         renderSamsungComparisonCard(force = true)
         refreshProgressDashboard()
@@ -521,6 +530,7 @@ class MainActivity : AppCompatActivity() {
         navTabViews.forEachIndexed { i, tv -> tv.setActive(i == index) }
 
         if (index == 0) {
+            refreshTuningStatusLabels()
             refreshCachedDailyHistory(forceRender = true)
             if (!currentlyRecording && (SystemClock.elapsedRealtime() - lastHealthSyncElapsedMs) >= 45_000L) {
                 triggerSamsungHealthSync(userTriggered = false)
@@ -530,6 +540,7 @@ class MainActivity : AppCompatActivity() {
         } else if (index == 2) {
             refreshBatterySettingsState()
             refreshSettingsHighlights()
+            refreshTuningStatusLabels()
         }
     }
 
@@ -1089,6 +1100,32 @@ class MainActivity : AppCompatActivity() {
         btnRow.addView(samsungSecondaryBtn)
         btnRow.addView(samsungReportBtn)
         card.addView(btnRow)
+
+        samsungSendTuningBtn = AthleticTheme.createButton(
+            this,
+            "Pull & Send Fine-Tuning Data (7-Day + Hourly Logs)",
+            AthleticTheme.ButtonStyle.SUBTLE_OUTLINE,
+            42f
+        ).apply {
+            textSize = 12f
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+            setOnClickListener { triggerFineTuningUpload() }
+        }
+        card.addView(samsungSendTuningBtn)
+
+        samsungTuningStatusText = TextView(this).apply {
+            text = ""
+            visibility = View.GONE
+            textSize = 11f
+            gravity = Gravity.CENTER
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(5), 0, 0)
+        }
+        card.addView(samsungTuningStatusText)
 
         return card
     }
@@ -1869,7 +1906,40 @@ class MainActivity : AppCompatActivity() {
         tableCard.addView(tableWrap)
         col.addView(tableCard)
 
-        // 5. Live Sensor Diagnostics & Maintenance Card
+        // 5. App Fine-Tuning Telemetry Pull & Cloud Sync Card
+        val tuningCard = cardContainer(
+            topColor = AthleticColors.HERO_EMERALD_TOP,
+            bottomColor = AthleticColors.HERO_EMERALD_BOTTOM,
+            borderColor = AthleticColors.HERO_EMERALD_BORDER
+        )
+        tuningCard.addView(AthleticTheme.sectionLabel(this, "FINE-TUNING DATA PULL  •  SAMSUNG + DSP LOGS", AthleticColors.EMERALD_BRIGHT))
+        tuningCard.addView(TextView(this).apply {
+            text = "Pulls 7-day Samsung Health totals, 48h Yesterday & Today hourly step/distance buckets, hardware sensor FIFO specs & last 300 DSP gait transitions so thresholds & stride scale can be fine-tuned."
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(6), 0, dp(8))
+        })
+        labTuningStatusText = TextView(this).apply {
+            text = "Ready to pull & upload fine-tuning telemetry."
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            setPadding(0, 0, 0, dp(9))
+        }
+        tuningCard.addView(labTuningStatusText)
+        labSendTuningBtn = AthleticTheme.createButton(
+            this,
+            "Pull & Send Fine-Tuning Bundle",
+            AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
+            46f
+        ).apply {
+            textSize = 13f
+            setOnClickListener { triggerFineTuningUpload() }
+        }
+        tuningCard.addView(labSendTuningBtn)
+        col.addView(tuningCard)
+
+        // 6. Live Sensor Diagnostics & Maintenance Card
         val diagCard = cardContainer()
         diagCard.addView(AthleticTheme.sectionLabel(this, "SENSOR FUSION DIAGNOSTICS & DATA"))
         diagGpsText = TextView(this).apply {
@@ -2790,6 +2860,73 @@ class MainActivity : AppCompatActivity() {
             }
             renderSamsungComparisonCard(force = true)
             renderDailyHistoryCards(latestDailySummaryForCompare)
+        }
+    }
+
+    private fun refreshTuningStatusLabels() {
+        val lastSummary = repository.lastTuningSyncSummary
+        if (::samsungSendTuningBtn.isInitialized) {
+            samsungSendTuningBtn.isEnabled = !isTuningUploadInFlight
+            samsungSendTuningBtn.text = if (isTuningUploadInFlight) {
+                "Pulling 7-Day + Hourly Logs & Uploading..."
+            } else {
+                "Pull & Send Fine-Tuning Data (7-Day + Hourly Logs)"
+            }
+            samsungSendTuningBtn.setTextColor(
+                if (isTuningUploadInFlight) AthleticColors.TEXT_SECONDARY else AthleticColors.EMERALD_BRIGHT
+            )
+        }
+        if (::samsungTuningStatusText.isInitialized) {
+            if (lastSummary.isNotBlank()) {
+                samsungTuningStatusText.visibility = View.VISIBLE
+                samsungTuningStatusText.text = "Last Fine-Tuning Pull: $lastSummary"
+            } else {
+                samsungTuningStatusText.visibility = View.GONE
+            }
+        }
+        if (::labSendTuningBtn.isInitialized) {
+            labSendTuningBtn.isEnabled = !isTuningUploadInFlight
+            labSendTuningBtn.text = if (isTuningUploadInFlight) {
+                "Pulling & Uploading Tuning Bundle..."
+            } else {
+                "Pull & Send Fine-Tuning Bundle"
+            }
+        }
+        if (::labTuningStatusText.isInitialized) {
+            labTuningStatusText.text = if (lastSummary.isNotBlank()) {
+                "Last Sync: $lastSummary"
+            } else {
+                "Not sent yet — tap below to pull 7-day Samsung + 48h hourly sensor logs."
+            }
+        }
+    }
+
+    private fun triggerFineTuningUpload() {
+        if (isTuningUploadInFlight || !::tuningTelemetryManager.isInitialized) return
+        trackingService?.flushTuningBuffersNow()
+        isTuningUploadInFlight = true
+        lastHealthSyncElapsedMs = SystemClock.elapsedRealtime()
+        refreshTuningStatusLabels()
+
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                tuningTelemetryManager.pullBuildAndUploadTuningBundle(latestDailySummaryForCompare)
+            }
+            isTuningUploadInFlight = false
+            healthSyncStatus = result.deepSamsung.syncOutcome.status
+            result.deepSamsung.syncOutcome.snapshot?.let { latestSamsungSnapshot = it }
+            result.deepSamsung.syncOutcome.yesterdaySnapshot?.let { yesterdaySamsungSnapshot = it }
+            trackingService?.syncThresholdsFromPrefs()
+            refreshTuningStatusLabels()
+            refreshCachedDailyHistory(forceRender = true)
+            if (result.deepSamsung.syncOutcome.importedRunCount > 0) {
+                refreshProgressDashboard()
+            }
+            renderSamsungComparisonCard(force = true)
+            renderDailyHistoryCards(latestDailySummaryForCompare)
+            if (!isFinishing) {
+                SessionDialogs.showTuningUploadResultDialog(this@MainActivity, result)
+            }
         }
     }
 

@@ -20,6 +20,7 @@ import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
+import com.tspolice.runtracker.telemetry.TuningPullAndUploadResult
 import java.time.LocalDate
 import java.time.ZoneId
 import kotlin.math.abs
@@ -526,6 +527,103 @@ object SessionDialogs {
                 ctx.startActivity(Intent.createChooser(share, "Share 2-Day Accuracy Report"))
             }
             .setNegativeButton("Close", null)
+            .show()
+    }
+
+    /**
+     * Displays the result of pulling & uploading the 7-day + 48h intraday fine-tuning telemetry bundle,
+     * with 1-tap Sync Code copy and raw JSON share fallback.
+     */
+    fun showTuningUploadResultDialog(
+        ctx: Context,
+        result: TuningPullAndUploadResult
+    ) {
+        val scroll = ScrollView(ctx)
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(AthleticColors.SURFACE_BOTTOM)
+            setPadding(dp(ctx, 20f), dp(ctx, 18f), dp(ctx, 20f), dp(ctx, 12f))
+        }
+
+        val accentCol = if (result.uploadedToCloud) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
+        root.addView(
+            AthleticTheme.sectionLabel(
+                ctx,
+                if (result.uploadedToCloud) "FINE-TUNING BUNDLE UPLOADED ✓" else "FINE-TUNING BUNDLE SAVED LOCALLY",
+                accentCol
+            )
+        )
+
+        root.addView(TextView(ctx).apply {
+            text = result.headline
+            textSize = 18f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(ctx, 6f), 0, dp(ctx, 6f))
+        })
+
+        root.addView(TextView(ctx).apply {
+            text = if (result.uploadedToCloud) {
+                "Sync Code: ${result.syncCode}\nReply 'uploaded' (or paste this code) so we can pull your 7-day Samsung + 48h hourly sensor logs and fine-tune thresholds."
+            } else {
+                "No internet connection reached cloud relay — saved locally to:\n${result.localFilePath}\nTap 'Share JSON' below or retry on Wi-Fi/Mobile Data."
+            }
+            textSize = 12f
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            setTextColor(accentCol)
+            setPadding(dp(ctx, 11f), dp(ctx, 8f), dp(ctx, 11f), dp(ctx, 8f))
+            background = AthleticTheme.solidPill(
+                ctx,
+                if (result.uploadedToCloud) 0x2210B981 else 0x22F59E0B,
+                if (result.uploadedToCloud) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.HERO_AMBER_BORDER,
+                10f
+            )
+        })
+
+        val diagBox = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(ctx, 12f), dp(ctx, 10f), dp(ctx, 12f), dp(ctx, 10f))
+            background = AthleticTheme.solidPill(ctx, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 12f)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(ctx, 12f) }
+        }
+        diagBox.addView(AthleticTheme.sectionLabel(ctx, "AUTO-COMPUTED 48H TUNING DIAGNOSTICS", AthleticColors.CYAN_BRIGHT))
+        diagBox.addView(TextView(ctx).apply {
+            text = result.diagnosticsSummaryText
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(ctx, 6f), 0, 0)
+        })
+        root.addView(diagBox)
+
+        scroll.addView(root)
+        val copyLabel = if (result.uploadedToCloud) "Copy Sync Code" else "Copy JSON"
+        AlertDialog.Builder(ctx)
+            .setView(scroll)
+            .setPositiveButton(copyLabel) { _, _ ->
+                val clipPayload = if (result.uploadedToCloud) result.syncCode else result.rawJson
+                runCatching {
+                    val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    cm?.setPrimaryClip(ClipData.newPlainText("TS_Police_Tuning_Sync", clipPayload))
+                }
+                val toastMsg = if (result.uploadedToCloud) {
+                    "Copied Sync Code: ${result.syncCode}"
+                } else {
+                    "Copied Fine-Tuning JSON to clipboard"
+                }
+                Toast.makeText(ctx, toastMsg, Toast.LENGTH_LONG).show()
+            }
+            .setNeutralButton("Share JSON") { _, _ ->
+                val share = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "TS Police 1.6K Fine-Tuning Telemetry (${result.syncCode})")
+                    putExtra(Intent.EXTRA_TEXT, result.rawJson)
+                }
+                ctx.startActivity(Intent.createChooser(share, "Share Fine-Tuning JSON"))
+            }
+            .setNegativeButton("Done", null)
             .show()
     }
 }

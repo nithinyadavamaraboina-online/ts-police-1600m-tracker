@@ -349,3 +349,64 @@ object SamsungHealthComparator {
         return sb.toString().trimEnd()
     }
 }
+
+/**
+ * Per-hour Tracker sensor telemetry bucket (`YYYY-MM-DDTHH`) for deep algorithm fine-tuning.
+ */
+data class HourlySensorBucket(
+    val bucketKey: String,
+    val dateIso: String,
+    val hourOfDay: Int,
+    val hwSteps: Int = 0,
+    val fallbackSteps: Int = 0,
+    val walkSec: Double = 0.0,
+    val jogSec: Double = 0.0,
+    val runSec: Double = 0.0,
+    val vehicleSec: Double = 0.0,
+    val lowPowerSec: Double = 0.0,
+    val walkMeters: Double = 0.0,
+    val jogRunMeters: Double = 0.0,
+    val gpsMeters: Double = 0.0,
+    val strideMeters: Double = 0.0,
+    val maxSpeedMps: Double = 0.0,
+    val maxCadenceSpm: Double = 0.0,
+    val maxAccelRms: Double = 0.0,
+    val gpsFixCount: Int = 0,
+    val gpsAccSumMeters: Double = 0.0
+) {
+    val totalSteps: Int get() = hwSteps + fallbackSteps
+    val totalDistanceMeters: Double get() = max(walkMeters + jogRunMeters, gpsMeters + strideMeters)
+    val avgGpsAccuracyM: Double?
+        get() = if (gpsFixCount > 0) gpsAccSumMeters / gpsFixCount else null
+}
+
+/**
+ * Per-hour Samsung Health ground-truth bucket (`00`..`23`) pulled from Health Connect.
+ */
+data class SamsungHourlyBucket(
+    val dateIso: String,
+    val hourOfDay: Int,
+    val steps: Int = 0,
+    val distanceMeters: Double = 0.0,
+    val walkSec: Double = 0.0,
+    val jogRunSec: Double = 0.0,
+    val maxSpeedMps: Double = 0.0,
+    val maxCadenceSpm: Double = 0.0
+)
+
+/**
+ * Compact raw DSP feature snapshot recorded on each [MotionState] transition (last 300 kept).
+ */
+data class SensorTransitionEvent(
+    val epochMs: Long,
+    val fromState: String,
+    val toState: String,
+    val gpsSpeedMps: Double?,
+    val gpsAccMeters: Double?,
+    val cadenceSpm: Double,
+    val accelRms: Double,
+    val minRawNorm: Double?,
+    val peakToTroughNorm: Double?,
+    val isLowPower: Boolean,
+    val ptPhase: String
+)

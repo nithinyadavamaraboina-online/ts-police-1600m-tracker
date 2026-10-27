@@ -3,6 +3,7 @@ package com.tspolice.runtracker
 import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.GaitClassifier
+import com.tspolice.runtracker.domain.HourlySensorBucket
 import com.tspolice.runtracker.domain.MotionSignalProcessor
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.MotionStateAudioCue
@@ -663,6 +664,55 @@ class TrackerDomainTest {
         assertTrue(reportTxt.contains("[YESTERDAY • 2026-10-26]"))
         assertTrue(reportTxt.contains("[TODAY • 2026-10-27]"))
         assertTrue(reportTxt.contains("[2-DAY COMBINED"))
+    }
+
+    @Test
+    fun `fine tuning telemetry separates hardware steps from software fallback steps and computes hourly bucket stats`() {
+        val dsp = MotionSignalProcessor().apply { hardwareStepSensorAvailable = true }
+
+        // 1. Hardware step detector + step counter delta reconciliation attribute purely to hardwareStepsCount
+        dsp.onHardwareStepDetected(1000L, 4)
+        dsp.reconcileStepCounterDelta(2000L, hwDeltaSteps = 6, stepsCountedSinceLastCounter = 4) // +2 missed steps from batching
+        assertEquals(6, dsp.hardwareStepsCount)
+        assertEquals(0, dsp.fallbackSoftwareStepsCount)
+        assertEquals(6, dsp.totalSteps)
+
+        // 2. After >3.5s hardware step silence, software gait peak fallback attributes purely to fallbackSoftwareStepsCount
+        val freqHz = 2.0 // 120 spm brisk walk
+        for (i in 0..250) {
+            val tMs = 6000L + i * 20L
+            val tSec = (i * 20L) / 1000.0
+            val ay = (9.81 + 2.2 * sin(2.0 * Math.PI * freqHz * tSec)).toFloat()
+            dsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
+        }
+        assertEquals(6, dsp.hardwareStepsCount)
+        assertTrue("Expected software fallback steps > 6, got ${dsp.fallbackSoftwareStepsCount}", dsp.fallbackSoftwareStepsCount > 6)
+        assertEquals(dsp.hardwareStepsCount + dsp.fallbackSoftwareStepsCount, dsp.totalSteps)
+
+        // 3. HourlySensorBucket aggregates steps, GPS vs stride distance, and mean GPS accuracy cleanly
+        val bucket = HourlySensorBucket(
+            bucketKey = "2026-10-27T07",
+            dateIso = "2026-10-27",
+            hourOfDay = 7,
+            hwSteps = 1420,
+            fallbackSteps = 80,
+            walkSec = 420.0,
+            jogSec = 180.0,
+            runSec = 310.0,
+            vehicleSec = 25.0,
+            gpsMeters = 1520.0,
+            strideMeters = 190.0,
+            gpsFixCount = 40,
+            gpsAccSumMeters = 260.0
+        )
+        assertEquals(1500, bucket.totalSteps)
+        assertEquals(1710.0, bucket.totalDistanceMeters, 0.001)
+        assertEquals(6.5, bucket.avgGpsAccuracyM ?: 0.0, 0.001)
+
+        dsp.reset()
+        assertEquals(0, dsp.hardwareStepsCount)
+        assertEquals(0, dsp.fallbackSoftwareStepsCount)
+        assertEquals(0, dsp.totalSteps)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
