@@ -1,8 +1,8 @@
 {
-    "versionCode":  13,
-    "versionName":  "1.0.12",
+    "versionCode":  14,
+    "versionName":  "1.0.13",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "6a5a0f8f67bc5d955c7ad89204e52af8ec3ae7029615a9a7f68fb57d82a2aea9",
-    "changelog":  "Fix bike and driving slowdown/speedup gait latch, keep GPS active while riding, lock verified Samsung hardware pedometer, add 12s pre-vehicle rollback, and fix Samsung Health 24h step and intraday distance sync plus 1-tap Clean and Align.",
-    "publishedAt":  "2026-10-27T17:24:21Z"
+    "sha256":  "f72d096b6ad10563de674ab378951cc79f1e6fc865f36b0be05f4af4f7f829c9",
+    "changelog":  "Fix false Bike detected when speeding up from Jog to Run in 1.6K Trial and Open mode, fix false Stopped and Jog-to-Walk drops on missed hand-held steps, detect Slow-Jogging at walking speed via spring-mass bounce, and show live Stride Length.",
+    "publishedAt":  "2026-10-29T15:38:25Z"
 }

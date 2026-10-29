@@ -101,10 +101,16 @@ enum class PocketAudioMode(val shortLabel: String, val description: String) {
         MUTED -> false
         ALL_STATES -> true
         SMART_TRACK -> {
-            ptTrialPhase != PtTrialPhase.IDLE ||
-                newState.isJogOrRun() ||
-                previousState.isJogOrRun() ||
-                inOpenRunBout
+            when (ptTrialPhase) {
+                PtTrialPhase.RUNNING_TRIAL -> newState != MotionState.VEHICLE
+                PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN ->
+                    newState != MotionState.VEHICLE && newState != MotionState.STANDING
+                PtTrialPhase.IDLE -> {
+                    newState != MotionState.VEHICLE &&
+                        previousState != MotionState.VEHICLE &&
+                        (newState.isJogOrRun() || previousState.isJogOrRun() || inOpenRunBout)
+                }
+            }
         }
     }
 }
@@ -193,6 +199,7 @@ data class LiveTelemetry(
     val pausedDurationSec: Double = 0.0,
     val currentSpeedMps: Double = 0.0,
     val cadenceSpm: Double = 0.0,
+    val liveStrideLengthMeters: Double = 0.0,
     val dynamicAccelRms: Double = 0.0,
     val totalSteps: Int = 0,
     val gpsAccuracyMeters: Float? = null,

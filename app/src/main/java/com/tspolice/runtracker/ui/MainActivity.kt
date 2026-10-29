@@ -1751,6 +1751,12 @@ class MainActivity : AppCompatActivity() {
         }
         thresholdPresetButtons = thBtns
         profileCard.addView(threshRow)
+        profileCard.addView(TextView(this).apply {
+            text = "Gait Guide: Walk 68–130 spm (0.65–0.85m/step) • Slow-Jog 133+ spm + bounce (0.50–0.72m) • Jog 133–162 spm (0.85–1.08m) • Run/7:15 162–190+ spm (1.15–1.45m)"
+            textSize = 11f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(10), 0, dp(2))
+        })
         col.addView(profileCard)
 
         // 3. Pocket Audio 3-Mode Selector & Modern Pill Toggles Card
@@ -2221,8 +2227,12 @@ class MainActivity : AppCompatActivity() {
                 "Standing  •  GPS Sleeping (0% Battery Drain — Wakes on Steps)"
             snap.motionState == MotionState.STANDING ->
                 "Standing (Auto-Paused)  •  Step-Stride Ready"
-            else ->
-                "${snap.motionState.label}  •  ${TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)} (${snap.cadenceSpm.roundToInt()} spm)"
+            else -> {
+                val stridePart = if (snap.liveStrideLengthMeters >= 0.35) {
+                    String.format(" • %.2fm/step", snap.liveStrideLengthMeters)
+                } else ""
+                "${snap.motionState.label}  •  ${TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)} (${snap.cadenceSpm.roundToInt()} spm$stridePart)"
+            }
         }
         allDayGaitPill.setTextColor(
             if (snap.motionState == MotionState.STANDING) AthleticColors.TEXT_SECONDARY else snap.motionState.colorArgb
@@ -2239,7 +2249,11 @@ class MainActivity : AppCompatActivity() {
         dailyMaxCadenceVal.text = "${daily.maxCadenceSpm.roundToInt()} spm"
         dailyMaxCadenceSub.text = if (daily.maxCadenceSpm >= 168.0) "Target stride hit!" else "Peak stride rate"
         openLivePaceVal.text = TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)
-        openLivePaceSub.text = "${snap.cadenceSpm.roundToInt()} spm live cadence"
+        openLivePaceSub.text = if (snap.liveStrideLengthMeters >= 0.35) {
+            String.format("%d spm • %.2fm stride", snap.cadenceSpm.roundToInt(), snap.liveStrideLengthMeters)
+        } else {
+            "${snap.cadenceSpm.roundToInt()} spm live cadence"
+        }
         dailyTotalDistVal.text = formatDistanceShort(daily.totalDistanceMeters)
         dailyTotalDistSub.text = if (snap.isGpsLocked) {
             "GPS ±${snap.gpsAccuracyMeters?.toInt() ?: 0}m + Stride"
@@ -2292,7 +2306,11 @@ class MainActivity : AppCompatActivity() {
         metricPaceVal.text = TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)
         metricPaceSub.text = String.format("%.1f km/h ground speed", snap.currentSpeedMps * 3.6)
         metricCadenceVal.text = "${snap.cadenceSpm.roundToInt()} spm"
-        metricCadenceSub.text = "${snap.totalSteps} steps today"
+        metricCadenceSub.text = if (snap.liveStrideLengthMeters >= 0.35) {
+            String.format("Stride %.2f m/step • %d steps", snap.liveStrideLengthMeters, snap.totalSteps)
+        } else {
+            "${snap.totalSteps} steps today"
+        }
 
         val projSec = if (snap.ptTrialPhase == PtTrialPhase.RUNNING_TRIAL) {
             TsPoliceBenchmark.projected1600mFinishSec(snap.distanceMeters, snap.activeDurationSec, snap.currentSpeedMps)

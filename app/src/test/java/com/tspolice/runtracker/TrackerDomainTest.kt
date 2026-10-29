@@ -18,6 +18,7 @@ import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import com.tspolice.runtracker.update.VersionComparator
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -857,6 +858,161 @@ class TrackerDomainTest {
             currentStrideScale = 0.8106
         )
         assertTrue("Expected healed stride scale ~0.987x (in 0.96..1.01), got $healedScale", healedScale in 0.96..1.01)
+    }
+
+    @Test
+    fun `manual 1600m pt trial and open mode never false trigger bike when speeding up from jog to run with phone in hand`() {
+        // 1. Normal 24/7 Open Mode: accelerating from Jog (2.1 m/s) -> Run (3.3 m/s) -> 7:15 Target (3.85 m/s)
+        //    even when holding phone in hand where arm-swing centripetal force keeps p20RawNorm around 8.4 m/s^2!
+        val openClassifier = GaitClassifier()
+        var nowMs = 1_000L
+        val openProgression = listOf(
+            Triple(2.15, 146.0, 4.1),
+            Triple(2.65, 156.0, 5.2),
+            Triple(3.25, 166.0, 6.4),
+            Triple(3.85, 174.0, 7.9)
+        )
+        var jogStarted = false
+        for ((gps, cad, rms) in openProgression) {
+            for (tick in 1..8) {
+                nowMs += 250L
+                val st = openClassifier.update(
+                    nowMs = nowMs,
+                    gpsSpeedMps = gps,
+                    cadenceSpm = cad,
+                    dynamicAccelRms = rms,
+                    minRawNorm = 4.6,
+                    peakToTroughNorm = 11.2,
+                    p20RawNorm = 8.45,
+                    hfVibrationRms = 1.1,
+                    isManualWorkoutActive = false
+                )
+                if (st.isJogOrRun()) jogStarted = true
+                assertNotEquals("Speeding up from Jog to Run in Open Mode must NEVER say Bike/Vehicle!", MotionState.VEHICLE, st)
+                if (jogStarted) {
+                    assertNotEquals("Once jogging/running, speeding up must NEVER drop to Standing/Stopped!", MotionState.STANDING, st)
+                    assertNotEquals("Once jogging/running, speeding up must NEVER drop to Walking!", MotionState.WALKING, st)
+                }
+            }
+        }
+        assertTrue(jogStarted)
+        assertEquals(MotionState.TARGET_PACE, openClassifier.currentState())
+
+        // 2. Explicit 1.6K PT Trial Mode: even if runner sprints at 6.2 m/s OR holds phone rock-steady for 3 seconds
+        //    to read split pace (temporarily dropping hardware step cadence to 0.0 spm), NEVER triggers Bike or Stopped!
+        val ptClassifier = GaitClassifier()
+        var ptNowMs = 10_000L
+        for (tick in 1..6) {
+            ptNowMs += 250L
+            ptClassifier.update(
+                nowMs = ptNowMs,
+                gpsSpeedMps = 2.30,
+                cadenceSpm = 148.0,
+                dynamicAccelRms = 4.3,
+                p20RawNorm = 8.6,
+                isManualWorkoutActive = true
+            )
+        }
+        assertEquals(MotionState.JOGGING, ptClassifier.currentState())
+
+        // Speed up into full Run / Sprint + glance at screen (cadence = 0.0 for 2.5s while GPS = 3.55 m/s)
+        for (tick in 1..10) {
+            ptNowMs += 250L
+            val st = ptClassifier.update(
+                nowMs = ptNowMs,
+                gpsSpeedMps = 3.55,
+                cadenceSpm = 0.0,
+                dynamicAccelRms = 1.9,
+                p20RawNorm = 9.2,
+                isManualWorkoutActive = true
+            )
+            assertNotEquals("1.6K Trial must NEVER trigger Bike when glancing at screen!", MotionState.VEHICLE, st)
+            assertNotEquals("1.6K Trial must NEVER shout Stopped while moving at 3.55 m/s!", MotionState.STANDING, st)
+        }
+        assertEquals(MotionState.RUNNING, ptClassifier.currentState())
+    }
+
+    @Test
+    fun `slow jogging at walking speed detects as jogging with short stride length while brisk flat walk stays walking`() {
+        val classifier = GaitClassifier()
+
+        // 1. Slow-Jogging at Walking Speed: 1.25 m/s (4.5 km/h = 13:20 /km), 142 spm, vertical bounce RMS = 3.45 m/s^2
+        val slowJogState = classifier.classifyInstant(
+            gpsSpeedMps = 1.25,
+            cadenceSpm = 142.0,
+            dynamicAccelRms = 3.45
+        )
+        assertEquals("Slow-jogging at 1.25 m/s walking speed must detect as JOGGING", MotionState.JOGGING, slowJogState)
+        val slowJogStride = classifier.computeLiveStrideLengthMeters(1.25, 142.0, 3.45, slowJogState)
+        assertTrue("Slow-jog live stride at 1.25 m/s & 142 spm should be ~0.53m, got $slowJogStride", slowJogStride in 0.48..0.58)
+
+        // 2. Spot-Jogging in place / indoor warmup: 0.0 m/s Wi-Fi GPS, 140 spm, bounce RMS = 3.5 m/s^2
+        assertEquals(
+            MotionState.JOGGING,
+            classifier.classifyInstant(gpsSpeedMps = 0.0, cadenceSpm = 140.0, dynamicAccelRms = 3.50)
+        )
+
+        // 3. Brisk Flat Walking at even faster ground speed: 1.40 m/s (5.04 km/h), 115 spm, flat walk RMS = 2.15 m/s^2
+        val briskWalkState = classifier.classifyInstant(
+            gpsSpeedMps = 1.40,
+            cadenceSpm = 115.0,
+            dynamicAccelRms = 2.15
+        )
+        assertEquals("Brisk flat walking at 115 spm without aerial bounce must stay WALKING", MotionState.WALKING, briskWalkState)
+        val briskWalkStride = classifier.computeLiveStrideLengthMeters(1.40, 115.0, 2.15, briskWalkState)
+        assertTrue("Brisk walk stride at 1.40 m/s & 115 spm should be ~0.73m, got $briskWalkStride", briskWalkStride in 0.68..0.78)
+    }
+
+    @Test
+    fun `missed hardware step events while looking at screen heal cleanly without dropping jogging to walking or stopped`() {
+        val dsp = MotionSignalProcessor().apply {
+            hardwareStepSensorAvailable = true
+            verifiedHardwarePedometerActive = true
+        }
+        val classifier = GaitClassifier()
+
+        // Simulate 12 seconds of 150 spm jogging (400ms step period) where Samsung TYPE_STEP_DETECTOR
+        // drops single steps (800ms gap) and a double step (1200ms gap) while runner checks the screen,
+        // AND GPS temporarily drops to null (warming >24m accuracy on ground)!
+        val stepFreqHz = 2.50 // 150 spm
+        var nextHwStepMs = 400L
+        var stepIdx = 0
+        for (i in 0..600) {
+            val tMs = i * 20L
+            val tSec = tMs / 1000.0
+            val ay = (9.81 + 4.8 * sin(2.0 * Math.PI * stepFreqHz * tSec)).toFloat()
+            dsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
+
+            if (tMs >= nextHwStepMs) {
+                stepIdx++
+                // Drop step #8 (creates 800ms gap) and steps #16-#17 (creates 1200ms gap)!
+                val dropThisHwStep = (stepIdx == 8 || stepIdx == 16 || stepIdx == 17)
+                if (!dropThisHwStep) {
+                    dsp.onHardwareStepDetected(tMs, 1)
+                }
+                nextHwStepMs += 400L
+            }
+
+            if (tMs >= 1400L && i % 10 == 0) {
+                val cad = dsp.getCadenceSpm(tMs)
+                val rms = dsp.getDynamicAccelRms(tMs)
+                val gpsSimulated = if (tMs in 5000L..8500L) null else 1.85 // test pre-GPS null AND slow 1.85 m/s jog!
+                val state = classifier.update(
+                    nowMs = tMs,
+                    gpsSpeedMps = gpsSimulated,
+                    cadenceSpm = cad,
+                    dynamicAccelRms = rms,
+                    minRawNorm = dsp.getMinRawNorm(tMs),
+                    peakToTroughNorm = dsp.getPeakToTroughNorm(tMs),
+                    p20RawNorm = dsp.getP20RawNorm(tMs),
+                    hfVibrationRms = dsp.getHighFreqVibrationRms(tMs)
+                )
+                assertTrue("Expected healed jogging cadence ~140..160 spm at ${tMs}ms, got $cad", cad in 138.0..162.0)
+                if (tMs >= 3400L) {
+                    assertEquals("Jogging must NEVER drop to Walking or Stopped at ${tMs}ms!", MotionState.JOGGING, state)
+                }
+            }
+        }
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

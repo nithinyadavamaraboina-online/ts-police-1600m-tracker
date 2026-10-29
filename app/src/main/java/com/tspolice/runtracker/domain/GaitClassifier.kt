@@ -4,11 +4,13 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * Multi-sensor kinematic gait & vehicle classifier that fuses:
+ * Multi-sensor biomechanical gait & vehicle classifier that fuses:
  *  1. High-accuracy GPS ground speed (m/s)
- *  2. Hardware step cadence (steps/min from TYPE_STEP_DETECTOR / TYPE_STEP_COUNTER, with fallback only when no working HW sensor exists)
- *  3. 3-axis dynamic acceleration RMS + 20th-percentile gravity unloading norm (airborne flight vs seated saddle)
- *  4. Stateful Vehicle Latch & Dismount Physics (impossible to jump off a moving bike into Running/Jogging/Walking!)
+ *  2. Hardware step cadence (TYPE_STEP_DETECTOR / TYPE_STEP_COUNTER) with 1-to-2 missed-step healing
+ *     plus gait-band accelerometer cadence continuity when holding the phone to view the screen
+ *  3. 3-axis gait-band dynamic acceleration RMS (0.5–4.8 Hz) vs high-frequency engine vibration RMS (>6 Hz)
+ *  4. Spring-mass bounce detection so Slow-Jogging at Walking Speed (or Spot-Jogging) is recognized as JOGGING
+ *  5. Workout-Mode Vehicle Immunity: explicit 1.6 km PT Trials & 400m Intervals NEVER false-trigger Bike/Vehicle
  */
 class GaitClassifier(
     var runningSpeedThresholdMps: Double = DEFAULT_RUNNING_SPEED_MPS,
@@ -16,22 +18,38 @@ class GaitClassifier(
     var strideScaleFactor: Double = 1.0
 ) {
     companion object {
-        const val DEFAULT_WALKING_SPEED_MPS = 0.75      // ~2.7 km/h real walking speed
-        const val DEFAULT_JOGGING_SPEED_MPS = 1.85      // ~6.66 km/h (9:00 /km)
-        const val DEFAULT_RUNNING_SPEED_MPS = 3.05      // ~10.98 km/h (5:28 /km)
-        const val SPRINT_VERIFICATION_SPEED_MPS = 5.00  // ~18.0 km/h — above this requires verified airborne sprint physics
-        const val MAX_HUMAN_RUNNING_SPEED_MPS = 7.00    // ~25.2 km/h — unconditionally a bike/vehicle
-        const val MIN_WALKING_CADENCE_SPM = 68.0        // rejects random hand movement / chair shifting
+        // Biomechanical Speed Thresholds (m/s)
+        const val DEFAULT_WALKING_SPEED_MPS = 0.72       // ~2.6 km/h minimum purposeful walk speed
+        const val DEFAULT_JOGGING_SPEED_MPS = 1.90       // ~6.84 km/h (8:46 /km) standard jog transition speed
+        const val JOG_RETENTION_SPEED_MPS = 1.65         // ~5.94 km/h Schmitt-trigger hold so Jog never flickers to Walk
+        const val DEFAULT_RUNNING_SPEED_MPS = 3.05       // ~10.98 km/h (5:28 /km) running speed
+        const val SPRINT_VERIFICATION_SPEED_MPS = 5.30   // ~19.1 km/h — above this in open mode requires sprint impact
+        const val MAX_HUMAN_RUNNING_SPEED_MPS = 7.20     // ~25.9 km/h — open-mode bike/vehicle ceiling
+        const val MANUAL_WORKOUT_VEHICLE_MPS = 9.50      // ~34.2 km/h — manual 1.6K trials never trigger bike at human speeds
 
-        const val STANDING_TO_WALK_DEBOUNCE_MS = 1800L
-        const val VEHICLE_FAST_DEBOUNCE_MS = 0L         // instant commit above 5.2 m/s (18.7 km/h)
-        const val VEHICLE_DEBOUNCE_MS = 900L            // sub-second lock-in on slow bike / scooter
-        const val UPGRADE_DEBOUNCE_MS = 1400L
-        const val DOWNGRADE_DEBOUNCE_MS = 2000L
+        // Biomechanical Cadence (steps/min) & Bandpass Bounce RMS (m/s^2) Thresholds
+        // Note: 2-pole gait bandpass (`gaitNorm2 - baselineNorm`) has 0.69x gain and RMS adds 0.707x (= 0.49x of peak):
+        //   - Normal/brisk walk (+/-1.4..2.4 m/s^2 peak) -> bandpass RMS ~0.68..1.18 m/s^2 at 68..126 spm
+        //   - Slow-jog / smooth jog (+/-3.8..5.0 m/s^2 peak) -> bandpass RMS ~1.86..2.45 m/s^2 at 133..160 spm
+        //   - Running / 7:15 pace (+/-6.2..9.0 m/s^2 peak) -> bandpass RMS ~3.04..4.40 m/s^2 at 162..190+ spm
+        const val MIN_WALKING_CADENCE_SPM = 68.0
+        const val SLOW_JOG_CADENCE_SPM = 133.0
+        const val SLOW_JOG_MIN_BOUNCE_RMS = 1.85
+        const val BOUNCY_SLOW_JOG_CADENCE_SPM = 125.0
+        const val BOUNCY_SLOW_JOG_RMS = 2.45
+        const val JOG_RETENTION_CADENCE_SPM = 122.0
+        const val JOG_RETENTION_BOUNCE_RMS = 1.60
 
-        const val PARKED_STOP_REQUIRED_MS = 6000L       // must stay < 0.85 m/s for 6s before dismount can start
-        const val DISMOUNT_WALK_CONFIRM_MS = 5500L      // 5.5s (~9-10 real walking steps at <= 1.9 m/s) unlocks foot mode
-        const val VEHICLE_COOLDOWN_EXPIRY_MS = 180_000L // 3-min red-light memory so green-light acceleration stays VEHICLE
+        // Temporal Hysteresis Debounce Windows (ms)
+        const val STANDING_TO_WALK_DEBOUNCE_MS = 1700L
+        const val VEHICLE_DEBOUNCE_MS = 1100L
+        const val UPGRADE_DEBOUNCE_MS = 1200L
+        const val DOWNGRADE_DEBOUNCE_MS = 2000L          // Resists brief turns/glances; manual workouts extend stand hold to 3.5s
+
+        // Open-Mode Vehicle Latch & Dismount Verification
+        const val PARKED_STOP_REQUIRED_MS = 4500L        // 4.5s parked (<0.85 m/s) before on-foot dismount unlocks
+        const val DISMOUNT_FOOT_CONFIRM_MS = 3500L       // 3.5s (~6 real steps) of verified walk/jog unlocks foot mode
+        const val VEHICLE_COOLDOWN_EXPIRY_MS = 150_000L  // 2.5-min traffic-light memory in passive 24/7 mode
     }
 
     private var committedState: MotionState = MotionState.STANDING
@@ -39,13 +57,13 @@ class GaitClassifier(
     private var candidateSinceMs: Long = 0L
     private var lastUpdateMs: Long = -1L
 
-    // Stateful Bike / Vehicle Latch & Dismount Verification
+    // Stateful Bike / Vehicle Latch (used ONLY in passive 24/7 mode, NEVER in manual 1.6K / Interval workouts!)
     private var vehicleLatchActive: Boolean = false
     private var vehicleCooldownActive: Boolean = false
     private var lastVehicleMotionMs: Long = -1_000_000L
     private var continuousStoppedMs: Long = 0L
     private var parkedStopCompleted: Boolean = false
-    private var dismountWalkConfirmMs: Long = 0L
+    private var dismountFootConfirmMs: Long = 0L
 
     fun currentState(): MotionState = committedState
 
@@ -54,11 +72,6 @@ class GaitClassifier(
     fun candidateIsJogOrRun(): Boolean =
         !isInOrCoolingDownFromVehicle() && candidateState.isJogOrRun()
 
-    /**
-     * True whenever the user is riding a bike/vehicle or stopped at a traffic light awaiting
-     * a verified on-foot dismount walk. Used by RunTrackingService to keep GPS awake and block
-     * road-bump phantom steps/distance.
-     */
     fun isInOrCoolingDownFromVehicle(): Boolean =
         vehicleLatchActive || vehicleCooldownActive ||
             committedState == MotionState.VEHICLE || candidateState == MotionState.VEHICLE
@@ -66,15 +79,15 @@ class GaitClassifier(
     fun isVehicleLatched(): Boolean = vehicleLatchActive
 
     /**
-     * Called when the user explicitly starts a manual track session (Arm 1.6K Trial / Start 400m Intervals).
+     * Immediately clears any passive-mode vehicle latch when the runner arms/starts a 1.6K Trial or 400m Intervals.
      */
     fun clearVehicleLatchForManualWorkout() {
         vehicleLatchActive = false
         vehicleCooldownActive = false
         parkedStopCompleted = false
         continuousStoppedMs = 0L
-        dismountWalkConfirmMs = 0L
-        if (committedState == MotionState.VEHICLE) {
+        dismountFootConfirmMs = 0L
+        if (committedState == MotionState.VEHICLE || candidateState == MotionState.VEHICLE) {
             committedState = MotionState.STANDING
             candidateState = MotionState.STANDING
         }
@@ -90,128 +103,184 @@ class GaitClassifier(
         lastVehicleMotionMs = -1_000_000L
         continuousStoppedMs = 0L
         parkedStopCompleted = false
-        dismountWalkConfirmMs = 0L
+        dismountFootConfirmMs = 0L
     }
 
     /**
-     * Instant biomechanical classification before stateful vehicle-latch & temporal hysteresis.
-     *  - Uses `p20RawNorm` (20th-percentile gravity norm over 1.5s) when available so a single pothole
-     *    dipping `minRawNorm` on an Indian road can NEVER fake repeated human running flight phases!
-     *  - Requires BOTH cadence AND vertical impact (`&&`, never `||`) when GPS is unavailable so engine
-     *    or suspension buzz without GPS can never classify as Jogging or Running.
+     * Instant biomechanical classification before temporal hysteresis:
+     *  - Explicit manual workouts (`isManualWorkoutActive = true`) NEVER false-trigger `VEHICLE` at human speeds.
+     *  - Detects Slow-Jogging at Walking Speed (`0.0–1.85 m/s`) via spring-mass bounce (`>=133 spm & RMS >=3.0`
+     *    or `>=125 spm & RMS >=3.75`) so jogging slowly or spot-jogging is classified as `JOGGING`, not `WALKING`.
+     *  - Uses Schmitt-trigger retention when `alreadyJogOrRun` is true so `JOGGING` never flickers down to `WALKING`.
+     *  - Separates motorcycles/scooters in passive mode via step absence, impossible >2.10m stride, seated low-bounce
+     *    cruising, and high-frequency (>6 Hz) engine vibration dominance — NEVER overriding real running footsteps!
      */
+    @Suppress("UNUSED_PARAMETER")
     fun classifyInstant(
         gpsSpeedMps: Double?,
         cadenceSpm: Double,
         dynamicAccelRms: Double,
         minRawNorm: Double? = null,
         peakToTroughNorm: Double? = null,
-        p20RawNorm: Double? = null
+        p20RawNorm: Double? = null,
+        hfVibrationRms: Double? = null,
+        isManualWorkoutActive: Boolean = false,
+        alreadyJogOrRun: Boolean = committedState.isJogOrRun()
     ): MotionState {
         val hasValidGps = gpsSpeedMps != null && gpsSpeedMps.isFinite() && gpsSpeedMps >= 0.0
         val hasRhythmicSteps = cadenceSpm >= MIN_WALKING_CADENCE_SPM
         val impliedStepSpeed = estimateSpeedFromStepsMps(cadenceSpm, dynamicAccelRms)
-        val flightNorm = p20RawNorm ?: minRawNorm
+
+        // Spring-mass aerial bounce signature (distinguishes Slow-Jogging at walking speed from brisk flat Walking!)
+        val hasSpringMassJogBounce =
+            (cadenceSpm >= SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= SLOW_JOG_MIN_BOUNCE_RMS) ||
+                (cadenceSpm >= BOUNCY_SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= BOUNCY_SLOW_JOG_RMS) ||
+                (alreadyJogOrRun && cadenceSpm >= JOG_RETENTION_CADENCE_SPM && dynamicAccelRms >= JOG_RETENTION_BOUNCE_RMS)
 
         if (hasValidGps) {
             val gps = gpsSpeedMps!!
 
-            // Layer 1: Above human distance-running speed ceiling -> Bike / Vehicle
-            if (gps > MAX_HUMAN_RUNNING_SPEED_MPS) {
-                return MotionState.VEHICLE
-            }
-            if (gps > SPRINT_VERIFICATION_SPEED_MPS &&
-                (cadenceSpm < 172.0 || dynamicAccelRms < 7.2 || (flightNorm != null && flightNorm > 6.3))
-            ) {
-                return MotionState.VEHICLE
-            }
-
-            // Layer 2: Moving >= 1.95 m/s (7.0 km/h+) without rhythmic footsteps = Bike / Scooter / Car
-            if (!hasRhythmicSteps) {
-                return if (gps >= 1.95) MotionState.VEHICLE else MotionState.STANDING
-            }
-
-            // Layer 3: Biomechanical stride-length & cadence invariants
-            val impliedGpsStrideM = gps / (cadenceSpm / 60.0)
-            if (gps >= 2.35 && (impliedGpsStrideM > 1.85 || cadenceSpm < 124.0)) {
-                return MotionState.VEHICLE
-            }
-            if (gps >= 1.95 && impliedGpsStrideM > 1.58 && flightNorm != null && flightNorm > 7.0) {
-                return MotionState.VEHICLE
-            }
-
-            // Layer 4: Seated saddle vs airborne human jog/run check:
-            //  - Using p20RawNorm (20th percentile), human jogging/running spends ~25-35% of every stride in
-            //    aerial unloading (p20 <= 6.95 m/s^2), whereas a seated bike rider stays near ~9.8 m/s^2 even
-            //    if an isolated pothole momentarily spikes Peak-to-Trough!
-            if (gps >= 2.25 && p20RawNorm != null && p20RawNorm > 7.30) {
-                return MotionState.VEHICLE
-            }
-            if (gps >= 2.05 && flightNorm != null && peakToTroughNorm != null) {
-                if (flightNorm > 6.80 && peakToTroughNorm < 9.2) {
+            // -----------------------------------------------------------------
+            // A. VEHICLE / BIKE REJECTION
+            //    In explicit 1.6K PT Trial / 400m Interval mode, nobody turns on
+            //    a track test to ride a bike — disable vehicle triggers for all
+            //    human running & sprinting speeds (up to 9.5 m/s = 34.2 km/h)!
+            // -----------------------------------------------------------------
+            if (isManualWorkoutActive) {
+                if (gps > MANUAL_WORKOUT_VEHICLE_MPS && dynamicAccelRms < 2.5 && !hasRhythmicSteps) {
                     return MotionState.VEHICLE
+                }
+            } else {
+                // Passive 24/7 All-Day Mode vehicle checks:
+                if (gps > MAX_HUMAN_RUNNING_SPEED_MPS) {
+                    return MotionState.VEHICLE
+                }
+                if (gps > SPRINT_VERIFICATION_SPEED_MPS && (cadenceSpm < 164.0 || dynamicAccelRms < 6.0)) {
+                    return MotionState.VEHICLE
+                }
+                // Moving >= 2.10 m/s (7.6 km/h+) with zero rhythmic footsteps = Bike / Scooter / Car
+                if (!hasRhythmicSteps && gps >= 2.10) {
+                    return MotionState.VEHICLE
+                }
+                if (hasRhythmicSteps) {
+                    val impliedGpsStrideM = gps / (cadenceSpm / 60.0)
+                    // Impossible human step length (> 2.10m) or fast cruise with slow bump cadence
+                    if (gps >= 2.75 && (impliedGpsStrideM > 2.10 || (gps >= 3.55 && cadenceSpm < 118.0))) {
+                        return MotionState.VEHICLE
+                    }
+                    // Seated smooth scooter/motorcycle saddle: moving >= 3.0 m/s (10.8+ km/h) with tiny <2.25 m/s^2
+                    // gait bounce and seated ~1g gravity (impossible during 11+ km/h human running!)
+                    if (gps >= 3.00 && dynamicAccelRms < 2.25 &&
+                        (minRawNorm == null || minRawNorm > 7.20) &&
+                        (peakToTroughNorm == null || peakToTroughNorm < 5.8)
+                    ) {
+                        return MotionState.VEHICLE
+                    }
+                    // High-frequency (>6 Hz) engine/chassis vibration dominating low-frequency human gait bounce
+                    if (gps >= 2.40 && hfVibrationRms != null &&
+                        hfVibrationRms > 2.40 && hfVibrationRms > dynamicAccelRms * 1.30
+                    ) {
+                        return MotionState.VEHICLE
+                    }
                 }
             }
 
-            if (gps < DEFAULT_WALKING_SPEED_MPS && cadenceSpm < 74.0 && dynamicAccelRms < 0.85) {
+            // -----------------------------------------------------------------
+            // B. STANDING / STOPPED CHECK
+            // -----------------------------------------------------------------
+            if (!hasRhythmicSteps) {
+                // During an active manual workout, if GPS shows real forward motion (>= 0.85 m/s) AND body is moving
+                // (e.g. holding phone steady to check split time!), keep gait alive from GPS speed instead of shouting "Stopped!"
+                if (isManualWorkoutActive && gps >= 0.85 && dynamicAccelRms >= 0.90) {
+                    return when {
+                        gps >= targetSpeedThresholdMps -> MotionState.TARGET_PACE
+                        gps >= runningSpeedThresholdMps -> MotionState.RUNNING
+                        gps >= DEFAULT_JOGGING_SPEED_MPS || (alreadyJogOrRun && gps >= JOG_RETENTION_SPEED_MPS) ->
+                            MotionState.JOGGING
+                        else -> MotionState.WALKING
+                    }
+                }
                 return MotionState.STANDING
             }
 
-            // Fuse GPS ground speed with cadence-implied speed
-            val fusedSpeed = when {
-                gps < 0.85 && dynamicAccelRms >= 0.65 ->
-                    maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.94 * impliedStepSpeed)
-                impliedStepSpeed > gps * 1.45 && dynamicAccelRms >= 3.4 ->
-                    maxOf(0.78 * gps + 0.22 * impliedStepSpeed, 0.88 * impliedStepSpeed)
-                else ->
-                    0.78 * gps + 0.22 * impliedStepSpeed
+            if (gps < DEFAULT_WALKING_SPEED_MPS && cadenceSpm < 74.0 && dynamicAccelRms < 0.80) {
+                return MotionState.STANDING
+            }
+
+            // -----------------------------------------------------------------
+            // C. ON-FOOT GAIT CLASSIFICATION (WALK vs SLOW-JOG vs JOG vs RUN)
+            // -----------------------------------------------------------------
+            // Case 1: Stationary indoor Wi-Fi location fix (gps < 0.45 m/s) or treadmill / spot-jogging in place!
+            if (gps < 0.45) {
+                return when {
+                    cadenceSpm >= 176.0 && dynamicAccelRms >= 3.85 -> MotionState.TARGET_PACE
+                    cadenceSpm >= 162.0 && dynamicAccelRms >= 2.95 -> MotionState.RUNNING
+                    hasSpringMassJogBounce -> MotionState.JOGGING
+                    else -> MotionState.WALKING
+                }
+            }
+
+            // Case 2: Outdoor forward movement at Walking ground speed (0.45 .. 2.15 m/s = 1.6 .. 7.7 km/h):
+            //  - If the runner is bouncing with jogging cadence (`hasSpringMassJogBounce`), it IS Slow-Jogging (`JOGGING`)
+            //    even at 1.1 m/s walking speed! (And capped at JOGGING so 162 spm slow-jogging doesn't fake 11 km/h RUNNING.)
+            if (gps < 2.15) {
+                return if (gps >= DEFAULT_JOGGING_SPEED_MPS ||
+                    (alreadyJogOrRun && gps >= JOG_RETENTION_SPEED_MPS) ||
+                    hasSpringMassJogBounce
+                ) {
+                    MotionState.JOGGING
+                } else {
+                    MotionState.WALKING
+                }
+            }
+
+            // Case 3: Outdoor Jogging / Running / 7:15 Target Pace (gps >= 2.15 m/s):
+            // Weight real GPS ground speed at 86% so stride-scale variations never block entering RUNNING / TARGET_PACE!
+            val fusedSpeed = if (impliedStepSpeed > gps * 1.35 && dynamicAccelRms >= 4.0) {
+                maxOf(0.86 * gps + 0.14 * impliedStepSpeed, 0.90 * impliedStepSpeed)
+            } else {
+                0.86 * gps + 0.14 * impliedStepSpeed
             }
 
             return when {
-                fusedSpeed >= targetSpeedThresholdMps ||
-                    (cadenceSpm >= 176.0 && dynamicAccelRms >= 7.8 && gps >= 3.35) -> MotionState.TARGET_PACE
-                fusedSpeed >= runningSpeedThresholdMps ||
-                    (cadenceSpm >= 164.0 && dynamicAccelRms >= 6.0 && gps >= 2.45) -> MotionState.RUNNING
-                fusedSpeed >= DEFAULT_JOGGING_SPEED_MPS ||
-                    (cadenceSpm >= 136.0 && dynamicAccelRms >= 3.5 && gps >= 1.55) -> MotionState.JOGGING
-                else -> MotionState.WALKING
+                gps >= targetSpeedThresholdMps || fusedSpeed >= targetSpeedThresholdMps ||
+                    (cadenceSpm >= 175.0 && dynamicAccelRms >= 7.6 && gps >= 3.25) -> MotionState.TARGET_PACE
+                gps >= runningSpeedThresholdMps || fusedSpeed >= runningSpeedThresholdMps ||
+                    (cadenceSpm >= 162.0 && dynamicAccelRms >= 5.6 && gps >= 2.45) -> MotionState.RUNNING
+                else -> MotionState.JOGGING
             }
         }
 
-        // Indoor / pre-GPS-lock path: require genuine rhythmic step cadence (>= 68 spm) + footstrike impact
+        // ---------------------------------------------------------------------
+        // D. INDOOR / PRE-GPS-LOCK PATH (gpsSpeedMps == null)
+        // ---------------------------------------------------------------------
         if (!hasRhythmicSteps || dynamicAccelRms < 0.65) {
             return MotionState.STANDING
         }
         // Reject pure high-frequency engine/table buzz that lacks < 5 Hz vertical body oscillation
-        if (peakToTroughNorm != null && peakToTroughNorm < 1.70) {
-            return MotionState.STANDING
-        }
-        // Without GPS, prevent seated vibration (no aerial flight unloading) from EVER faking Jogging/Running
-        val seatedVibrationWithoutFlight =
-            (p20RawNorm != null && p20RawNorm > 7.20) ||
-                (flightNorm != null && peakToTroughNorm != null && flightNorm > 6.5 && peakToTroughNorm < 9.0)
-        if (seatedVibrationWithoutFlight) {
-            return if (cadenceSpm >= 130.0) {
-                MotionState.STANDING
-            } else {
-                MotionState.WALKING
+        if (!isManualWorkoutActive) {
+            if (peakToTroughNorm != null && peakToTroughNorm < 1.65) {
+                return MotionState.STANDING
+            }
+            if (hfVibrationRms != null && hfVibrationRms > 2.20 && hfVibrationRms > dynamicAccelRms * 1.25) {
+                return MotionState.STANDING
             }
         }
-        // Require BOTH cadence AND real footstrike RMS impact (never cadence alone!)
+
         return when {
-            cadenceSpm >= 176.0 && dynamicAccelRms >= 7.8 -> MotionState.TARGET_PACE
-            cadenceSpm >= 162.0 && dynamicAccelRms >= 5.6 -> MotionState.RUNNING
-            cadenceSpm >= 134.0 && dynamicAccelRms >= 3.4 -> MotionState.JOGGING
+            cadenceSpm >= 176.0 && dynamicAccelRms >= 3.85 -> MotionState.TARGET_PACE
+            cadenceSpm >= 162.0 && dynamicAccelRms >= 2.95 -> MotionState.RUNNING
+            hasSpringMassJogBounce -> MotionState.JOGGING
             else -> MotionState.WALKING
         }
     }
 
     /**
-     * Stateful update enforcing real-world dismount kinematics:
-     *  - You CANNOT jump from a moving bike (`VEHICLE`) directly into `RUNNING`, `JOGGING`, or `WALKING`.
-     *  - Slowing a bike down in traffic (`35 -> 15 -> 8 -> 4 km/h`) stays `VEHICLE` until the bike comes
-     *    to a complete parked stop (`< 0.85 m/s` for >= 6.0s) followed by >= 5.5s of verified walking steps.
-     *  - Stopping at a red traffic light and accelerating again snaps back to `VEHICLE` in 0ms!
+     * Stateful update with workout-aware hysteresis & passive-mode vehicle latch:
+     *  - When `isManualWorkoutActive == true` (1.6K PT Trial / 400m Intervals), vehicle latch is completely bypassed
+     *    and `STANDING` ("Stopped!") requires 3.6s of genuine zero-motion stillness.
+     *  - When `isManualWorkoutActive == false` (24/7 Open Mode), bike slowdowns stay `VEHICLE` until a 4.5s parked
+     *    stop followed by 3.5s of verified human footsteps (walking OR jogging!).
      */
     fun update(
         nowMs: Long,
@@ -220,7 +289,9 @@ class GaitClassifier(
         dynamicAccelRms: Double,
         minRawNorm: Double? = null,
         peakToTroughNorm: Double? = null,
-        p20RawNorm: Double? = null
+        p20RawNorm: Double? = null,
+        hfVibrationRms: Double? = null,
+        isManualWorkoutActive: Boolean = false
     ): MotionState {
         val dtMs = if (lastUpdateMs >= 0L && nowMs > lastUpdateMs) {
             (nowMs - lastUpdateMs).coerceIn(1L, 2500L)
@@ -229,18 +300,34 @@ class GaitClassifier(
         }
         lastUpdateMs = nowMs
 
+        if (isManualWorkoutActive && (vehicleLatchActive || vehicleCooldownActive)) {
+            clearVehicleLatchForManualWorkout()
+        }
+
         if (vehicleCooldownActive && !vehicleLatchActive && (nowMs - lastVehicleMotionMs) > VEHICLE_COOLDOWN_EXPIRY_MS) {
             vehicleCooldownActive = false
             parkedStopCompleted = false
-            dismountWalkConfirmMs = 0L
+            dismountFootConfirmMs = 0L
         }
 
-        val raw = classifyInstant(gpsSpeedMps, cadenceSpm, dynamicAccelRms, minRawNorm, peakToTroughNorm, p20RawNorm)
+        val raw = classifyInstant(
+            gpsSpeedMps = gpsSpeedMps,
+            cadenceSpm = cadenceSpm,
+            dynamicAccelRms = dynamicAccelRms,
+            minRawNorm = minRawNorm,
+            peakToTroughNorm = peakToTroughNorm,
+            p20RawNorm = p20RawNorm,
+            hfVibrationRms = hfVibrationRms,
+            isManualWorkoutActive = isManualWorkoutActive,
+            alreadyJogOrRun = committedState.isJogOrRun()
+        )
 
-        // 1. Immediate or fast entry into VEHICLE
+        // 1. Entry into VEHICLE (Passive 24/7 mode only, or >34 km/h car in manual mode)
         if (raw == MotionState.VEHICLE) {
-            val fastVehicle = vehicleLatchActive || vehicleCooldownActive ||
-                (gpsSpeedMps != null && gpsSpeedMps >= 5.20)
+            val fastVehicle = !isManualWorkoutActive && (
+                vehicleLatchActive || vehicleCooldownActive ||
+                    (gpsSpeedMps != null && gpsSpeedMps >= 5.50 && cadenceSpm < 68.0)
+                )
             if (fastVehicle) {
                 enterOrRefreshVehicleLatch(nowMs)
                 return MotionState.VEHICLE
@@ -250,15 +337,20 @@ class GaitClassifier(
                 candidateSinceMs = nowMs
                 return committedState
             }
-            if (nowMs - candidateSinceMs >= VEHICLE_DEBOUNCE_MS) {
-                enterOrRefreshVehicleLatch(nowMs)
+            val holdNeeded = if (isManualWorkoutActive) 5000L else VEHICLE_DEBOUNCE_MS
+            if (nowMs - candidateSinceMs >= holdNeeded) {
+                if (!isManualWorkoutActive) {
+                    enterOrRefreshVehicleLatch(nowMs)
+                } else {
+                    committedState = MotionState.VEHICLE
+                }
                 return MotionState.VEHICLE
             }
             return committedState
         }
 
-        // 2. Enforce Sticky Vehicle Latch & Red-Light Cooldown Physics
-        if (vehicleLatchActive || vehicleCooldownActive) {
+        // 2. Enforce Passive-Mode Sticky Vehicle Latch & Traffic-Light Cooldown
+        if (!isManualWorkoutActive && (vehicleLatchActive || vehicleCooldownActive)) {
             val hasGps = gpsSpeedMps != null && gpsSpeedMps.isFinite() && gpsSpeedMps >= 0.0
             val gps = gpsSpeedMps ?: -1.0
             val isStoppedSpeed = (hasGps && gps < 0.85) ||
@@ -269,11 +361,9 @@ class GaitClassifier(
                 if (continuousStoppedMs >= PARKED_STOP_REQUIRED_MS) {
                     parkedStopCompleted = true
                 }
-                dismountWalkConfirmMs = 0L
+                dismountFootConfirmMs = 0L
 
-                // After 12s completely motionless at a stop, let UI rest at STANDING while keeping
-                // vehicleCooldownActive armed so a green-light pull-away snaps straight back to VEHICLE!
-                if (parkedStopCompleted && continuousStoppedMs >= 12_000L && cadenceSpm < 40.0) {
+                if (parkedStopCompleted && continuousStoppedMs >= 10_000L && cadenceSpm < 45.0) {
                     vehicleLatchActive = false
                     committedState = MotionState.STANDING
                     candidateState = MotionState.STANDING
@@ -282,53 +372,49 @@ class GaitClassifier(
                 return committedState
             }
 
-            // Bike is moving (>= 0.85 m/s or active vibration):
-            // Case A: Moving at >= 1.90 m/s (6.8 km/h+) without having dismounted -> STILL ON THE BIKE!
-            if (hasGps && gps >= 1.90) {
-                val flightNorm = p20RawNorm ?: minRawNorm
-                val rareParkedToTrackRun = parkedStopCompleted &&
-                    continuousStoppedMs >= 30_000L &&
-                    raw.isJogOrRun() &&
-                    cadenceSpm >= 145.0 &&
-                    dynamicAccelRms >= 4.5 &&
-                    (flightNorm != null && flightNorm <= 6.4)
-                if (!rareParkedToTrackRun) {
-                    enterOrRefreshVehicleLatch(nowMs)
-                    return MotionState.VEHICLE
-                }
-            }
-
-            // Case B: Slow crawl (0.85..1.90 m/s or temporary tunnel GPS loss) WITHOUT having parked for 6s first!
+            // Moving without having parked for >= 4.5s first -> still slowing down / crawling on the bike!
             if (!parkedStopCompleted) {
                 enterOrRefreshVehicleLatch(nowMs)
                 return MotionState.VEHICLE
             }
 
-            // Case C: Bike DID stop >= 6s (`parkedStopCompleted == true`). Require 5.5s of genuine human walking
-            // (72..135 spm at <= 1.90 m/s) to confirm the rider actually stepped off and walked away!
-            val plausibleHumanWalk = raw == MotionState.WALKING &&
-                cadenceSpm in 72.0..135.0 &&
+            // Bike DID park >= 4.5s: check if rider genuinely stepped off and started walking or jogging on foot!
+            val noEngineDominance = hfVibrationRms == null || hfVibrationRms <= dynamicAccelRms * 1.10
+            val plausibleDismountWalk = raw == MotionState.WALKING &&
+                cadenceSpm in 70.0..138.0 &&
                 dynamicAccelRms in 0.70..5.5 &&
-                (!hasGps || gps in 0.50..1.90)
+                (!hasGps || gps in 0.45..1.95) &&
+                noEngineDominance
+            val plausibleDismountJog = raw.isJogOrRun() &&
+                cadenceSpm in 130.0..195.0 &&
+                dynamicAccelRms >= 3.2 &&
+                (!hasGps || gps in 0.50..4.50) &&
+                (minRawNorm != null && minRawNorm <= 6.8) &&
+                noEngineDominance
 
-            if (plausibleHumanWalk) {
-                dismountWalkConfirmMs += dtMs
-                if (dismountWalkConfirmMs >= DISMOUNT_WALK_CONFIRM_MS) {
-                    // Verified on-foot dismount complete!
+            if (plausibleDismountWalk || plausibleDismountJog) {
+                dismountFootConfirmMs += dtMs
+                if (dismountFootConfirmMs >= DISMOUNT_FOOT_CONFIRM_MS) {
+                    val unlockedState = if (plausibleDismountJog) MotionState.JOGGING else MotionState.WALKING
                     vehicleLatchActive = false
                     vehicleCooldownActive = false
                     parkedStopCompleted = false
                     continuousStoppedMs = 0L
-                    dismountWalkConfirmMs = 0L
-                    committedState = MotionState.WALKING
-                    candidateState = MotionState.WALKING
+                    dismountFootConfirmMs = 0L
+                    committedState = unlockedState
+                    candidateState = unlockedState
                     candidateSinceMs = nowMs
-                    return MotionState.WALKING
+                    return unlockedState
                 }
+                return committedState
             } else {
-                dismountWalkConfirmMs = 0L
+                dismountFootConfirmMs = 0L
+                if (hasGps && gps >= 1.90) {
+                    enterOrRefreshVehicleLatch(nowMs)
+                    return MotionState.VEHICLE
+                }
+                return committedState
             }
-            return committedState
         }
 
         // 3. Normal On-Foot Temporal Hysteresis
@@ -346,6 +432,10 @@ class GaitClassifier(
 
         val requiredHoldMs = when {
             committedState == MotionState.STANDING && raw == MotionState.WALKING -> STANDING_TO_WALK_DEBOUNCE_MS
+            committedState == MotionState.STANDING && raw.isJogOrRun() ->
+                if (isManualWorkoutActive) 900L else STANDING_TO_WALK_DEBOUNCE_MS
+            raw == MotionState.STANDING && isManualWorkoutActive -> 3500L // never shout "Stopped!" on a brief 1-2s stumble/turn!
+            committedState.isJogOrRun() && raw == MotionState.WALKING -> 2400L // smooth anti-flicker hold for Jogging
             raw.intensityRank > committedState.intensityRank -> UPGRADE_DEBOUNCE_MS
             else -> DOWNGRADE_DEBOUNCE_MS
         }
@@ -365,31 +455,63 @@ class GaitClassifier(
         lastVehicleMotionMs = nowMs
         continuousStoppedMs = 0L
         parkedStopCompleted = false
-        dismountWalkConfirmMs = 0L
+        dismountFootConfirmMs = 0L
     }
 
     /**
-     * Biomechanical stride-length curve (meters/step) calibrated across walking, jogging, and 1600m running.
+     * Impulse-aware biomechanical step ("stride") length curve (meters/step):
+     *  - Walking (68–128 spm): ~0.66–0.85 m/step
+     *  - Slow-Jogging at walking speed (128–162 spm, light bounce RMS ~3.0–3.6): ~0.58–0.76 m/step
+     *  - Normal Jogging (132–162 spm, moderate bounce RMS ~4.2–5.5): ~0.86–1.06 m/step
+     *  - Running / 7:15 Target Pace (160–195 spm, strong drive RMS >=6.0): ~1.14–1.46 m/step
      */
     fun estimateStrideLengthMeters(cadenceSpm: Double, dynamicAccelRms: Double): Double {
         if (cadenceSpm <= 25.0) return 0.0
         val baseStride = when {
             cadenceSpm < 100.0 -> 0.68 + ((cadenceSpm - 60.0).coerceAtLeast(0.0) * 0.003)
-            cadenceSpm < 135.0 -> 0.80 + ((cadenceSpm - 100.0) * 0.0045)
-            cadenceSpm < 163.0 -> 0.96 + ((cadenceSpm - 135.0) * 0.0080)
-            cadenceSpm < 185.0 -> 1.18 + ((cadenceSpm - 163.0) * 0.0095)
+            cadenceSpm < 126.0 -> 0.80 + ((cadenceSpm - 100.0) * 0.0035)
+            cadenceSpm < 163.0 -> {
+                // Separate short-step Slow-Jogging from full-stride Jogging using vertical/forward impulse!
+                val fullJogStride = 0.90 + ((cadenceSpm - 126.0) * 0.0072)
+                val slowJogFactor = (0.65 + ((dynamicAccelRms - 1.85).coerceAtLeast(0.0) / 0.85) * 0.35).coerceIn(0.65, 1.04)
+                fullJogStride * slowJogFactor
+            }
+            cadenceSpm < 185.0 -> {
+                val fullRunStride = 1.17 + ((cadenceSpm - 163.0) * 0.0095)
+                val driveFactor = (0.76 + ((dynamicAccelRms - 2.60).coerceAtLeast(0.0) / 1.40) * 0.28).coerceIn(0.76, 1.04)
+                fullRunStride * driveFactor
+            }
             else -> 1.39
         }
         val impulseBoost = when {
-            dynamicAccelRms >= 8.5 -> 1.05
-            dynamicAccelRms >= 6.0 -> 1.02
+            dynamicAccelRms >= 8.5 -> 1.04
+            dynamicAccelRms >= 6.5 -> 1.02
             else -> 1.00
         }
         val personalScale = strideScaleFactor.coerceIn(
             SamsungHealthComparator.MIN_STRIDE_SCALE,
             SamsungHealthComparator.MAX_STRIDE_SCALE
         )
-        return (baseStride * impulseBoost * personalScale).coerceIn(0.50, 1.72)
+        return (baseStride * impulseBoost * personalScale).coerceIn(0.45, 1.72)
+    }
+
+    /**
+     * Computes live step ("stride") length in meters: uses direct GPS speed / step-rate when GPS is locked
+     * outdoors (capturing exact 0.52m slow-jog steps vs 1.30m 7:15 running strides), falling back to the
+     * impulse-aware biomechanical curve indoors.
+     */
+    fun computeLiveStrideLengthMeters(
+        gpsSpeedMps: Double?,
+        cadenceSpm: Double,
+        dynamicAccelRms: Double,
+        motionState: MotionState
+    ): Double {
+        if (!motionState.countsAsActiveMovement || cadenceSpm < 55.0) return 0.0
+        val stepsPerSec = cadenceSpm / 60.0
+        if (gpsSpeedMps != null && gpsSpeedMps.isFinite() && gpsSpeedMps >= 0.55) {
+            return (gpsSpeedMps / stepsPerSec).coerceIn(0.38, 1.88)
+        }
+        return estimateStrideLengthMeters(cadenceSpm, dynamicAccelRms)
     }
 
     fun estimateSpeedFromStepsMps(cadenceSpm: Double, dynamicAccelRms: Double): Double {
@@ -400,38 +522,30 @@ class GaitClassifier(
 }
 
 /**
- * Sliding-window step cadence tracker + hybrid hardware/software pedometer:
- *  - Uses hardware TYPE_STEP_DETECTOR / TYPE_STEP_COUNTER exclusively once the device's hardware pedometer
- *    has proven it emits real step events (`verifiedHardwarePedometerActive = true`, e.g. Samsung S23 LSM6DSO),
- *    so quiet periods while sitting or riding a bike NEVER trigger software vibration overcounting!
- *  - Falls back to orientation-invariant bipolar gait-band accelerometer pedometer ONLY on devices that lack
- *    a step sensor or whose OEM step sensor has emitted 0 events ever (`verifiedHardwarePedometerActive = false`).
+ * Sliding-window step cadence tracker + hybrid pedometer:
+ *  - Counts passive all-day steps (`totalSteps`) strictly from hardware `TYPE_STEP_DETECTOR` / `TYPE_STEP_COUNTER`
+ *    once verified on the device (keeping 1:1 parity with Samsung Health and 0 bike overcounting).
+ *  - Heals 1–2 dropped hardware step events in `getCadenceSpm` (common when glancing at the phone screen in hand!)
+ *    AND maintains gait-band accelerometer cadence continuity (`accelStepTimestampsMs`) so holding the phone while
+ *    jogging/running NEVER drops cadence to 0 ("Bike detected!" / "Stopped!") or halves cadence to "Walking!".
  */
 class MotionSignalProcessor {
     private data class AccelFrame(
         val timestampMs: Long,
         val dynamicMag: Double,
-        val rawGravityNorm: Double?
+        val rawGravityNorm: Double?,
+        val hfResidualMag: Double = 0.0
     )
 
     private val stepTimestampsMs = ArrayDeque<Long>()
+    private val accelStepTimestampsMs = ArrayDeque<Long>()
     private val accelSamples = ArrayDeque<AccelFrame>()
     private val pendingSoftwareStepMs = ArrayDeque<Long>()
 
     var hardwareStepSensorAvailable: Boolean = false
-
-    /**
-     * Becomes true as soon as TYPE_STEP_DETECTOR or TYPE_STEP_COUNTER delivers >= 1 real step on this phone
-     * (and can be restored from SharedPreferences on startup). Prevents software accelerometer fallback from
-     * fabricating steps during bike rides or hand movement when hardware rightly stays silent!
-     */
     var verifiedHardwarePedometerActive: Boolean = false
-
-    /**
-     * Set to true by RunTrackingService while GaitClassifier's Vehicle Latch / Cooldown is active so
-     * road bumps do not inflate totalSteps or trigger software step fallback.
-     */
     var suppressStepsForVehicle: Boolean = false
+    var manualWorkoutActive: Boolean = false
 
     private var lastActualHardwareStepMs: Long = -100_000L
 
@@ -442,7 +556,7 @@ class MotionSignalProcessor {
     private var filterInitialized = false
     private var lastAccelSampleMs = -1L
 
-    // Bipolar peak-and-trough cycle state for fallback software pedometer
+    // Bipolar peak-and-trough cycle state for gait-band cadence & fallback pedometer
     private var awaitingTrough = false
     private var cyclePeakDelta = 0.0
     private var cyclePeakTimeMs = -10_000L
@@ -462,10 +576,12 @@ class MotionSignalProcessor {
 
     fun reset() {
         stepTimestampsMs.clear()
+        accelStepTimestampsMs.clear()
         accelSamples.clear()
         pendingSoftwareStepMs.clear()
         lastActualHardwareStepMs = -100_000L
         suppressStepsForVehicle = false
+        manualWorkoutActive = false
         baselineNorm = 9.81
         gaitNorm1 = 9.81
         gaitNorm2 = 9.81
@@ -484,9 +600,7 @@ class MotionSignalProcessor {
         verifiedHardwarePedometerActive = true
         lastActualHardwareStepMs = nowMs
         pendingSoftwareStepMs.clear()
-        // Always record step timestamp so dismount-walk cadence detection works right after parking,
-        // but do NOT inflate step totals while riding a bike!
-        recordStepTimestamp(nowMs)
+        recordTimestampInQueue(stepTimestampsMs, nowMs)
         if (!suppressStepsForVehicle) {
             val c = count.coerceIn(1, 12)
             totalSteps += c
@@ -495,14 +609,10 @@ class MotionSignalProcessor {
         pruneOld(nowMs)
     }
 
-    /**
-     * Reconciles cumulative Sensor.TYPE_STEP_COUNTER deltas (up to 300 pocket-batched steps)
-     * without double-counting steps already captured by TYPE_STEP_DETECTOR, and ignores deltas
-     * accumulated while riding a vehicle.
-     */
     fun reconcileStepCounterDelta(nowMs: Long, hwDeltaSteps: Int, stepsCountedSinceLastCounter: Int) {
         if (hwDeltaSteps <= 0) return
         verifiedHardwarePedometerActive = true
+        lastActualHardwareStepMs = nowMs
         if (suppressStepsForVehicle) {
             pruneOld(nowMs)
             return
@@ -511,21 +621,21 @@ class MotionSignalProcessor {
         if (missing > 0) {
             totalSteps += missing
             hardwareStepsCount += missing
-            recordStepTimestamp(nowMs)
+            recordTimestampInQueue(stepTimestampsMs, nowMs)
         }
         pruneOld(nowMs)
     }
 
-    private fun recordStepTimestamp(nowMs: Long) {
-        val prev = stepTimestampsMs.lastOrNull()
+    private fun recordTimestampInQueue(queue: ArrayDeque<Long>, nowMs: Long) {
+        val prev = queue.lastOrNull()
         if (prev != null) {
             val gap = nowMs - prev
-            if (gap < 235L) return // ignore duplicate burst event on same footstrike
-            if (gap > 1650L) {
-                stepTimestampsMs.clear()
+            if (gap < 235L) return
+            if (gap > 2200L) {
+                queue.clear()
             }
         }
-        stepTimestampsMs.addLast(nowMs)
+        queue.addLast(nowMs)
     }
 
     fun onAccelerationSample(
@@ -563,56 +673,73 @@ class MotionSignalProcessor {
 
         val gaitDelta = gaitNorm2 - baselineNorm
         val mag = if (includesGravity) abs(gaitDelta) else gaitNorm2.coerceAtLeast(0.0)
+        val hfResidual = if (includesGravity) abs(rawNorm - gaitNorm2) else 0.0
 
         accelSamples.addLast(
             AccelFrame(
                 timestampMs = nowMs,
                 dynamicMag = mag,
-                rawGravityNorm = if (includesGravity) gaitNorm2 else null
+                rawGravityNorm = if (includesGravity) rawNorm else null,
+                hfResidualMag = hfResidual
             )
         )
         pruneOld(nowMs)
 
-        // Software pedometer ONLY runs when this phone does NOT have a verified working hardware pedometer
-        // AND is not currently in Vehicle Latch/Cooldown!
-        var detectedStep = false
-        val hardwareActivelyFiring = (nowMs - lastActualHardwareStepMs) in 0L..2800L
-        val allowSoftwareFallback = !verifiedHardwarePedometerActive && !hardwareActivelyFiring && !suppressStepsForVehicle
-        if (allowSoftwareFallback) {
-            val minStepIntervalMs = 285L       // caps software cadence at <= 210 spm (rejects engine harmonics)
-            val peakArmThreshold = 0.85        // m/s^2 upward footstrike compression above baseline
-            val troughConfirmThreshold = -0.40 // m/s^2 unloading dip below baseline
-            val minPeakToTroughSwing = 1.45    // m/s^2 total bipolar step swing
+        if (suppressStepsForVehicle) {
+            pendingSoftwareStepMs.clear()
+            accelStepTimestampsMs.clear()
+            awaitingTrough = false
+            return false
+        }
 
-            if (!awaitingTrough) {
-                if (gaitDelta >= peakArmThreshold) {
-                    awaitingTrough = true
-                    cyclePeakDelta = gaitDelta
-                    cyclePeakTimeMs = nowMs
-                }
-            } else {
-                if (gaitDelta > cyclePeakDelta) {
-                    cyclePeakDelta = gaitDelta
-                    cyclePeakTimeMs = nowMs
-                } else if (nowMs - cyclePeakTimeMs > 900L) {
-                    awaitingTrough = false
-                    cyclePeakDelta = 0.0
-                } else if (
-                    gaitDelta <= troughConfirmThreshold &&
-                    (cyclePeakDelta - gaitDelta) >= minPeakToTroughSwing &&
-                    (nowMs - lastConfirmedSwStepMs) >= minStepIntervalMs
-                ) {
-                    awaitingTrough = false
-                    cyclePeakDelta = 0.0
-                    lastConfirmedSwStepMs = nowMs
+        val hardwareActivelyFiring = (nowMs - lastActualHardwareStepMs) in 0L..2800L
+        // Count fallback steps into `totalSteps` ONLY on devices without a verified HW pedometer,
+        // OR during an explicit manual 1.6K/Interval workout if HW step_detector went silent >3.2s while holding phone!
+        val countIntoStepTotals = (!verifiedHardwarePedometerActive && !hardwareActivelyFiring) ||
+            (manualWorkoutActive && (nowMs - lastActualHardwareStepMs) > 3200L)
+
+        var detectedStep = false
+        val minStepIntervalMs = 285L       // caps cadence at <= 210 spm (rejects engine harmonics)
+        val peakArmThreshold = 0.85        // m/s^2 upward footstrike compression above baseline
+        val troughConfirmThreshold = -0.40 // m/s^2 unloading dip below baseline
+        val minPeakToTroughSwing = 1.45    // m/s^2 total bipolar step swing
+
+        if (!awaitingTrough) {
+            if (gaitDelta >= peakArmThreshold) {
+                awaitingTrough = true
+                cyclePeakDelta = gaitDelta
+                cyclePeakTimeMs = nowMs
+            }
+        } else {
+            if (gaitDelta > cyclePeakDelta) {
+                cyclePeakDelta = gaitDelta
+                cyclePeakTimeMs = nowMs
+            } else if (nowMs - cyclePeakTimeMs > 900L) {
+                awaitingTrough = false
+                cyclePeakDelta = 0.0
+            } else if (
+                gaitDelta <= troughConfirmThreshold &&
+                (cyclePeakDelta - gaitDelta) >= minPeakToTroughSwing &&
+                (nowMs - lastConfirmedSwStepMs) >= minStepIntervalMs
+            ) {
+                awaitingTrough = false
+                cyclePeakDelta = 0.0
+                lastConfirmedSwStepMs = nowMs
+                recordGaitCadenceCycle(nowMs)
+                if (countIntoStepTotals) {
                     detectedStep = registerSoftwareStepCandidate(nowMs)
                 }
             }
-        } else if (suppressStepsForVehicle) {
-            pendingSoftwareStepMs.clear()
-            awaitingTrough = false
         }
         return detectedStep
+    }
+
+    private fun recordGaitCadenceCycle(nowMs: Long) {
+        val recentRms = getDynamicAccelRms(nowMs)
+        val recentHf = getHighFreqVibrationRms(nowMs)
+        // Reject high-frequency engine vibration from entering gait cadence continuity
+        if (recentHf > 2.20 && recentHf > recentRms * 1.20) return
+        recordTimestampInQueue(accelStepTimestampsMs, nowMs)
     }
 
     private fun registerSoftwareStepCandidate(nowMs: Long): Boolean {
@@ -624,7 +751,7 @@ class MotionSignalProcessor {
         val lastConfirmed = stepTimestampsMs.lastOrNull()
         if (lastConfirmed != null && (nowMs - lastConfirmed) <= 1550L && stepTimestampsMs.size >= 4) {
             pendingSoftwareStepMs.clear()
-            recordStepTimestamp(nowMs)
+            recordTimestampInQueue(stepTimestampsMs, nowMs)
             totalSteps++
             fallbackSoftwareStepsCount++
             return true
@@ -634,7 +761,7 @@ class MotionSignalProcessor {
         if (pendingSoftwareStepMs.size >= 4) {
             while (pendingSoftwareStepMs.isNotEmpty()) {
                 val ts = pendingSoftwareStepMs.removeFirst()
-                recordStepTimestamp(ts)
+                recordTimestampInQueue(stepTimestampsMs, ts)
                 totalSteps++
                 fallbackSoftwareStepsCount++
             }
@@ -643,59 +770,120 @@ class MotionSignalProcessor {
         return false
     }
 
+    /**
+     * Computes live step cadence (spm) with:
+     *  1. Automatic 1-to-2 missed-step interval healing (so if Samsung's step_detector drops a step while you
+     *     look at your phone screen, 150 spm stays 150 spm instead of dropping to 0 or 120 spm!).
+     *  2. Seamless gait-band accelerometer continuity during active workouts or brief hand-hold stabilization.
+     */
     fun getCadenceSpm(nowMs: Long): Double {
         pruneOld(nowMs)
-        val totalCount = stepTimestampsMs.size
+        val recentRms = getDynamicAccelRms(nowMs)
+        val recentHf = getHighFreqVibrationRms(nowMs)
+        val hwCad = computeCadenceFromQueue(stepTimestampsMs, nowMs, recentRms)
+
+        val allowAccelContinuity = !suppressStepsForVehicle &&
+            !(recentHf > 2.20 && recentHf > recentRms * 1.20) &&
+            (
+                !verifiedHardwarePedometerActive ||
+                    manualWorkoutActive ||
+                    ((nowMs - lastActualHardwareStepMs) in 0L..8_500L && recentRms >= 1.65)
+                )
+
+        if (!allowAccelContinuity) {
+            return hwCad
+        }
+
+        val accelCad = if (accelStepTimestampsMs.size >= 4) {
+            computeCadenceFromQueue(accelStepTimestampsMs, nowMs, recentRms)
+        } else 0.0
+
+        return when {
+            hwCad >= 65.0 && accelCad > hwCad * 1.10 && recentRms >= 1.65 -> accelCad
+            hwCad >= 65.0 -> hwCad
+            else -> accelCad
+        }
+    }
+
+    private fun computeCadenceFromQueue(
+        queue: ArrayDeque<Long>,
+        nowMs: Long,
+        recentRms: Double
+    ): Double {
+        val totalCount = queue.size
         if (totalCount < 3) return 0.0
 
-        val lastMs = stepTimestampsMs.last()
+        val lastMs = queue.last()
         val silenceMs = nowMs - lastMs
-        val recentRms = getDynamicAccelRms(nowMs)
-        if (silenceMs > 2400L || (silenceMs > 1600L && recentRms < 0.55)) {
+        val maxSilenceMs = if (recentRms >= 1.20) 3200L else 2200L
+        if (silenceMs > maxSilenceMs || (silenceMs > 1600L && recentRms < 0.55)) {
             return 0.0
         }
 
-        val startIdx = (totalCount - 6).coerceAtLeast(0)
+        val startIdx = (totalCount - 7).coerceAtLeast(0)
         val count = totalCount - startIdx
-        val intervalsMs = DoubleArray(count - 1)
-        var sumMs = 0.0
+        val rawIntervals = DoubleArray(count - 1)
         for (i in 0 until count - 1) {
-            val dt = (stepTimestampsMs[startIdx + i + 1] - stepTimestampsMs[startIdx + i]).toDouble()
-            intervalsMs[i] = dt
-            sumMs += dt
+            rawIntervals[i] = (queue[startIdx + i + 1] - queue[startIdx + i]).toDouble()
         }
-        val meanPeriodMs = (sumMs / intervalsMs.size).coerceAtLeast(255.0)
 
+        // Heal isolated 1-step or 2-step hardware sensor drops (dt ~= 2x or 3x reference step period)
+        val sortedRaw = rawIntervals.sortedArray()
+        val refPeriodMs = sortedRaw[(sortedRaw.size - 1) / 3].coerceAtLeast(255.0)
+        val healedIntervals = ArrayList<Double>(rawIntervals.size + 4)
+        for (dt in rawIntervals) {
+            val ratio = dt / refPeriodMs
+            when {
+                ratio in 1.68..2.38 && dt / 2.0 >= 260.0 -> {
+                    healedIntervals.add(dt / 2.0)
+                    healedIntervals.add(dt / 2.0)
+                }
+                ratio in 2.68..3.38 && dt / 3.0 >= 260.0 -> {
+                    healedIntervals.add(dt / 3.0)
+                    healedIntervals.add(dt / 3.0)
+                    healedIntervals.add(dt / 3.0)
+                }
+                else -> healedIntervals.add(dt)
+            }
+        }
+
+        val meanPeriodMs = (healedIntervals.sum() / healedIntervals.size).coerceAtLeast(255.0)
         var varianceSum = 0.0
-        for (dt in intervalsMs) {
+        for (dt in healedIntervals) {
             val diff = dt - meanPeriodMs
             varianceSum += diff * diff
         }
-        val stdDevMs = sqrt(varianceSum / intervalsMs.size)
+        val stdDevMs = sqrt(varianceSum / healedIntervals.size)
         val coeffOfVariation = stdDevMs / meanPeriodMs
-        if (coeffOfVariation > 0.34) {
+        if (coeffOfVariation > 0.36) {
             return 0.0
         }
 
-        val firstMs = stepTimestampsMs[startIdx]
-        val stepSpanMs = (lastMs - firstMs).coerceAtLeast(300L)
-        val effectiveSpanMs = if (silenceMs > meanPeriodMs * 1.35) {
-            (nowMs - firstMs).toDouble()
+        val decayThresholdRatio = if (recentRms >= 1.35) 2.65 else 1.45
+        val totalSpanMs = if (silenceMs > meanPeriodMs * decayThresholdRatio) {
+            healedIntervals.sum() + (silenceMs - meanPeriodMs * (decayThresholdRatio - 1.0))
         } else {
-            stepSpanMs.toDouble()
-        }
-        return (((count - 1).toDouble() / (effectiveSpanMs / 1000.0)) * 60.0).coerceIn(0.0, 220.0)
+            healedIntervals.sum()
+        }.coerceAtLeast(300.0)
+
+        return ((healedIntervals.size.toDouble() / (totalSpanMs / 1000.0)) * 60.0).coerceIn(0.0, 220.0)
     }
 
     fun getDynamicAccelRms(nowMs: Long): Double {
         pruneOld(nowMs)
         val recent = accelSamples.filter { nowMs - it.timestampMs <= 1500L }
         if (recent.isEmpty()) return 0.0
-        val meanSq = recent.sumOf { it.dynamicMag * dynamicWeight(it.dynamicMag) } / recent.size
+        val meanSq = recent.sumOf { it.dynamicMag * it.dynamicMag } / recent.size
         return sqrt(meanSq)
     }
 
-    private fun dynamicWeight(mag: Double): Double = mag
+    fun getHighFreqVibrationRms(nowMs: Long): Double {
+        pruneOld(nowMs)
+        val recent = accelSamples.filter { nowMs - it.timestampMs <= 1500L }
+        if (recent.isEmpty()) return 0.0
+        val meanSq = recent.sumOf { it.hfResidualMag * it.hfResidualMag } / recent.size
+        return sqrt(meanSq)
+    }
 
     fun getMinRawNorm(nowMs: Long): Double? {
         pruneOld(nowMs)
@@ -709,11 +897,6 @@ class MotionSignalProcessor {
         return minVal
     }
 
-    /**
-     * 20th-percentile gravity-included 3D norm over the last 1.5s.
-     * Human jogging/running spends ~25-35% of every stride airborne (< 6.8 m/s^2), whereas a seated
-     * motorcycle rider hitting an isolated pothole still has >80% of samples near ~9.8 m/s^2 (> 7.4 m/s^2)!
-     */
     fun getP20RawNorm(nowMs: Long): Double? {
         pruneOld(nowMs)
         val vals = ArrayList<Double>(80)
@@ -743,8 +926,11 @@ class MotionSignalProcessor {
     }
 
     private fun pruneOld(nowMs: Long) {
-        while (stepTimestampsMs.isNotEmpty() && nowMs - stepTimestampsMs.first() > 5000L) {
+        while (stepTimestampsMs.isNotEmpty() && nowMs - stepTimestampsMs.first() > 5500L) {
             stepTimestampsMs.removeFirst()
+        }
+        while (accelStepTimestampsMs.isNotEmpty() && nowMs - accelStepTimestampsMs.first() > 5500L) {
+            accelStepTimestampsMs.removeFirst()
         }
         while (accelSamples.isNotEmpty() && nowMs - accelSamples.first().timestampMs > 2500L) {
             accelSamples.removeFirst()

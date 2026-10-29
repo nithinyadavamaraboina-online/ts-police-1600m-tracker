@@ -83,7 +83,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         private const val STANDBY_IDLE_THRESHOLD_MS = 45_000L
         private const val GPS_FRESHNESS_MS = 5500L
         private const val MAX_ACCEPTABLE_GPS_ACCURACY_M = 26f
-        private const val MAX_PT_TRIAL_GPS_ACCURACY_M = 16f
+        private const val MAX_PT_TRIAL_GPS_ACCURACY_M = 24f
         private const val MAX_PLAUSIBLE_VEHICLE_SPEED_MPS = 55.0 // 198 km/h — keeps real bike/vehicle GPS speeds visible
         const val ACTION_MUTE_POCKET_AUDIO = "com.tspolice.runtracker.ACTION_MUTE_POCKET_AUDIO"
     }
@@ -139,6 +139,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var lastAnnouncedState: MotionState = MotionState.STANDING
     private var lastMilestoneSpeechMs: Long = -10_000L
     private var lastFinishSpeechMs: Long = -10_000L
+    private var lastStoppedPenaltySpeechElapsedMs: Long = -60_000L
     private var runMode: RunMode = RunMode.TIMED_1600M
     private var sessionStartedWallMs: Long = 0L
     private var lastTickElapsedMs: Long = 0L
@@ -576,7 +577,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (intervalPhase != IntervalPhase.IDLE) cancelIntervalWorkout(silent = true)
         gaitClassifier.clearVehicleLatchForManualWorkout()
         signalProcessor.suppressStepsForVehicle = false
+        signalProcessor.manualWorkoutActive = true
         wasInVehicleLatchLastTick = false
+        lastStoppedPenaltySpeechElapsedMs = -60_000L
         wakeFromLowPowerStandby()
         registerLocationIfPermitted()
         flushOpenBoutIfQualified()
@@ -623,6 +626,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         ptTrialPhase = PtTrialPhase.RUNNING_TRIAL
         isAutoStartArmed = false
         isRecording = true
+        signalProcessor.manualWorkoutActive = true
+        lastStoppedPenaltySpeechElapsedMs = -60_000L
         sessionStartedWallMs = System.currentTimeMillis() - (ptLaunchBufferSec * 1000.0).toLong()
         lastCompletedSessionId = null
         announcedFinal200mKick = false
@@ -687,6 +692,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         ptTrialPhase = PtTrialPhase.IDLE
         isRecording = false
         isAutoStartArmed = false
+        signalProcessor.manualWorkoutActive = isHighPrecisionSessionActive()
         syncPocketForegroundAndWakeLock()
 
         var savedId: Long? = null
@@ -738,6 +744,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         ptTrialPhase = PtTrialPhase.IDLE
         isRecording = false
         isAutoStartArmed = false
+        signalProcessor.manualWorkoutActive = isHighPrecisionSessionActive()
         ptJogRunConfirmMs = 0L
         ptLaunchBufferSec = 0.0
         ptLaunchBufferMeters = 0.0
@@ -762,7 +769,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (ptTrialPhase != PtTrialPhase.IDLE) cancelPtTrial()
         gaitClassifier.clearVehicleLatchForManualWorkout()
         signalProcessor.suppressStepsForVehicle = false
+        signalProcessor.manualWorkoutActive = true
         wasInVehicleLatchLastTick = false
+        lastStoppedPenaltySpeechElapsedMs = -60_000L
         wakeFromLowPowerStandby()
         registerLocationIfPermitted()
         flushOpenBoutIfQualified()
@@ -1189,13 +1198,17 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             if (smoothedGpsSpeedMps < 0.15) smoothedGpsSpeedMps = 0.0
         }
 
+        val isManualWorkout = isHighPrecisionSessionActive()
+        signalProcessor.manualWorkoutActive = isManualWorkout
+
         val cadenceSpm = signalProcessor.getCadenceSpm(nowMs)
         val accelRms = signalProcessor.getDynamicAccelRms(nowMs)
+        val hfVibrationRms = signalProcessor.getHighFreqVibrationRms(nowMs)
         val minRawNorm = signalProcessor.getMinRawNorm(nowMs)
         val peakToTroughNorm = signalProcessor.getPeakToTroughNorm(nowMs)
         val p20RawNorm = signalProcessor.getP20RawNorm(nowMs)
         val gpsReliableForGait = gpsFresh &&
-            (latestGpsAccuracyM == null || latestGpsAccuracyM!! <= 14f || smoothedGpsSpeedMps >= 0.70)
+            (latestGpsAccuracyM == null || latestGpsAccuracyM!! <= 22f || smoothedGpsSpeedMps >= 0.70)
         val gpsForClassifier = if (gpsReliableForGait) smoothedGpsSpeedMps else null
 
         val wasInVehicleLatchBefore = wasInVehicleLatchLastTick
@@ -1206,7 +1219,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             dynamicAccelRms = accelRms,
             minRawNorm = minRawNorm,
             peakToTroughNorm = peakToTroughNorm,
-            p20RawNorm = p20RawNorm
+            p20RawNorm = p20RawNorm,
+            hfVibrationRms = hfVibrationRms,
+            isManualWorkoutActive = isManualWorkout
         )
         val candState = gaitClassifier.candidateState()
         val inVehicleOrCooldown = gaitClassifier.isInOrCoolingDownFromVehicle()
@@ -1511,7 +1526,14 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             nm.notify(NOTIFICATION_ID, buildForegroundNotification(state, effectiveSpeedMps))
         }
 
-        broadcastTelemetry(effectiveSpeedMps, gpsFresh, cadenceSpm, accelRms)
+        val liveStrideM = gaitClassifier.computeLiveStrideLengthMeters(
+            gpsSpeedMps = gpsForClassifier,
+            cadenceSpm = cadenceSpm,
+            dynamicAccelRms = accelRms,
+            motionState = state
+        )
+
+        broadcastTelemetry(effectiveSpeedMps, gpsFresh, cadenceSpm, accelRms, liveStrideM)
     }
 
     private fun addAllDayDistanceDelta(deltaM: Double, state: MotionState) {
@@ -1699,6 +1721,14 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             return
         }
         if (!isRecording && (nowMs - lastFinishSpeechMs) in 0L..6000L) return
+
+        // Never spam "Stopped!" in the first 5s of launch or repeatedly within 25s
+        if (ptTrialPhase == PtTrialPhase.RUNNING_TRIAL && newState == MotionState.STANDING) {
+            if (activeDurationSec < 5.0 || (nowMs - lastStoppedPenaltySpeechElapsedMs) in 0L..25_000L) {
+                return
+            }
+            lastStoppedPenaltySpeechElapsedMs = nowMs
+        }
 
         requestAudioFocusQuietly()
         playStateTone(newState)
@@ -1926,7 +1956,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         effectiveSpeedMps: Double = 0.0,
         gpsFresh: Boolean = false,
         cadenceSpm: Double = 0.0,
-        accelRms: Double = 0.0
+        accelRms: Double = 0.0,
+        liveStrideLengthMeters: Double = 0.0
     ): LiveTelemetry {
         val daily = currentDailySnapshot()
         return LiveTelemetry(
@@ -1940,6 +1971,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             pausedDurationSec = pausedDurationSec,
             currentSpeedMps = effectiveSpeedMps,
             cadenceSpm = cadenceSpm,
+            liveStrideLengthMeters = liveStrideLengthMeters,
             dynamicAccelRms = accelRms,
             totalSteps = daily.totalSteps,
             gpsAccuracyMeters = latestGpsAccuracyM,
@@ -1974,9 +2006,10 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         effectiveSpeedMps: Double = 0.0,
         gpsFresh: Boolean = false,
         cadenceSpm: Double = 0.0,
-        accelRms: Double = 0.0
+        accelRms: Double = 0.0,
+        liveStrideLengthMeters: Double = 0.0
     ) {
-        val snap = snapshotTelemetry(effectiveSpeedMps, gpsFresh, cadenceSpm, accelRms)
+        val snap = snapshotTelemetry(effectiveSpeedMps, gpsFresh, cadenceSpm, accelRms, liveStrideLengthMeters)
         for (l in listeners) {
             l(snap)
         }
