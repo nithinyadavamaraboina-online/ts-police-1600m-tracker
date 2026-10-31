@@ -1193,14 +1193,13 @@ class TrackerDomainTest {
     }
 
     @Test
-    fun `brisk evening power walk at 136 spm in loose pocket stays walking while aerial slow jog detects as jogging`() {
+    fun `loose pocket evening slow jog at 134 to 149 spm detects as jogging even when pocket swing keeps p20 above 8`() {
         val classifier = GaitClassifier()
 
-        // 1. Reproduce Oct 31 18:14–18:24 brisk power-walk: 1.55..2.02 m/s, 134..139 spm, loose-pocket rms=3.55,
-        //    grounded p20RawNorm = 8.15 m/s^2 (no aerial flight phase) -> MUST stay WALKING in Open Mode!
-        for (cad in listOf(132.5, 136.5, 139.4)) {
+        // 1. Loose-pocket brisk walking (`98..122 spm` hardware pedometer cadence, `rms=3.55`) -> MUST stay WALKING!
+        for (cad in listOf(98.0, 112.0, 122.0)) {
             val st = classifier.classifyInstant(
-                gpsSpeedMps = 1.62,
+                gpsSpeedMps = 1.55,
                 cadenceSpm = cad,
                 dynamicAccelRms = 3.55,
                 minRawNorm = 3.10,
@@ -1208,33 +1207,24 @@ class TrackerDomainTest {
                 p20RawNorm = 8.15,
                 isManualWorkoutActive = false
             )
-            assertEquals("Brisk power-walk at $cad spm with grounded p20=8.15 must stay WALKING", MotionState.WALKING, st)
+            assertEquals("Brisk walk at $cad spm must stay WALKING", MotionState.WALKING, st)
         }
-        // Even a 2.02 m/s power-walk surge at 130 spm stays WALKING in passive Open Mode
-        assertEquals(
-            MotionState.WALKING,
-            classifier.classifyInstant(
-                gpsSpeedMps = 2.02,
-                cadenceSpm = 130.0,
-                dynamicAccelRms = 3.20,
-                p20RawNorm = 8.30,
-                isManualWorkoutActive = false
-            )
-        )
 
-        // 2. Genuine Slow-Jogging at 1.30 m/s walking speed: 146 spm + aerial unloading p20RawNorm = 5.90 m/s^2 -> JOGGING!
-        assertEquals(
-            MotionState.JOGGING,
-            classifier.classifyInstant(
-                gpsSpeedMps = 1.30,
-                cadenceSpm = 146.0,
-                dynamicAccelRms = 3.10,
-                minRawNorm = 2.40,
-                peakToTroughNorm = 24.0,
-                p20RawNorm = 5.90,
+        // 2. Reproduce exact Oct 31 18:14–18:24 real evening slow-jog on SM-S911B:
+        //    1.45..1.72 m/s walking ground speed, 134..149 spm hardware cadence, rms=3.03..4.55,
+        //    even when horizontal pocket swing keeps 3D p20RawNorm around 7.75..8.62 m/s^2 -> MUST detect as JOGGING!
+        for (cad in listOf(134.5, 138.5, 149.8)) {
+            val st = classifier.classifyInstant(
+                gpsSpeedMps = 1.52,
+                cadenceSpm = cad,
+                dynamicAccelRms = 3.16,
+                minRawNorm = 3.53,
+                peakToTroughNorm = 33.6,
+                p20RawNorm = 8.34,
                 isManualWorkoutActive = false
             )
-        )
+            assertEquals("Real slow-jog at $cad spm must detect as JOGGING even with p20=8.34", MotionState.JOGGING, st)
+        }
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

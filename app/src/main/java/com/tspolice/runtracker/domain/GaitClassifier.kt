@@ -33,13 +33,11 @@ class GaitClassifier(
         //   - Slow-jog / smooth jog (+/-3.8..5.0 m/s^2 peak) -> bandpass RMS ~1.86..2.45 m/s^2 at 133..160 spm
         //   - Running / 7:15 pace (+/-6.2..9.0 m/s^2 peak) -> bandpass RMS ~3.04..4.40 m/s^2 at 162..190+ spm
         const val MIN_WALKING_CADENCE_SPM = 68.0
-        const val SLOW_JOG_CADENCE_SPM = 136.0
-        const val SLOW_JOG_MIN_BOUNCE_RMS = 1.85
-        const val OPEN_MODE_SLOW_JOG_CADENCE_SPM = 140.0
-        const val OPEN_MODE_SLOW_JOG_MIN_RMS = 2.10
-        const val OPEN_MODE_SLOW_JOG_MAX_P20_NORM = 7.00
-        const val JOG_RETENTION_CADENCE_SPM = 128.0
-        const val OPEN_MODE_JOG_RETENTION_CADENCE_SPM = 135.0
+        const val SLOW_JOG_CADENCE_SPM = 134.0
+        const val SLOW_JOG_MIN_BOUNCE_RMS = 1.90
+        const val BOUNCY_SLOW_JOG_CADENCE_SPM = 131.0
+        const val BOUNCY_SLOW_JOG_RMS = 2.50
+        const val JOG_RETENTION_CADENCE_SPM = 124.0
         const val JOG_RETENTION_BOUNCE_RMS = 1.65
 
         // Temporal Hysteresis Debounce Windows (ms)
@@ -142,26 +140,14 @@ class GaitClassifier(
         val impliedStepSpeed = estimateSpeedFromStepsMps(cadenceSpm, dynamicAccelRms)
 
         // Spring-mass bounce signature at walking ground speeds:
-        //  - In loose shorts/track pants, brisk walking (`125..139 spm`, `1.45..1.85 m/s`) produces brief `<80ms`
-        //    thigh-slap spikes (`rms = 3.0..3.9`, `minRawNorm = 2.0..4.5`), BUT because one foot is always grounded,
-        //    the 20th-percentile gravity norm (`p20RawNorm`) stays grounded around `7.25..9.60 m/s^2`.
-        //  - True Slow-Jogging unloads the body center-of-mass for 35–45% of every step (`p20RawNorm <= 7.00 m/s^2`)
-        //    with genuine jogging turnover (`>= 140 spm` in Open Mode; `>= 136 spm` in explicit Manual Workouts).
-        val hasSpringMassJogBounce = if (isManualWorkoutActive) {
+        //  - Verified on SM-S911B ground truth: pure loose-pocket walking has hardware `LSM6DSO` cadence `70..118 spm`
+        //    (since `getCadenceSpm` strictly uses hardware footstep timestamps, never pocket fabric double-bounces!).
+        //  - Real Slow-Jogging at walking speed (`1.25..1.85 m/s`) has hardware cadence `131..158 spm` with `rms = 2.1..4.6`,
+        //    and horizontal pocket/arm swing keeps 3D `p20RawNorm` around `6.1..8.8 m/s^2` — so NEVER block slow-jogs on `p20RawNorm`!
+        val hasSpringMassJogBounce =
             (cadenceSpm >= SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= SLOW_JOG_MIN_BOUNCE_RMS) ||
+                (cadenceSpm >= BOUNCY_SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= BOUNCY_SLOW_JOG_RMS) ||
                 (alreadyJogOrRun && cadenceSpm >= JOG_RETENTION_CADENCE_SPM && dynamicAccelRms >= JOG_RETENTION_BOUNCE_RMS)
-        } else {
-            val aerialUnloaded = p20RawNorm == null || p20RawNorm <= OPEN_MODE_SLOW_JOG_MAX_P20_NORM
-            val handHeldFastTurnover = cadenceSpm >= 150.0 && dynamicAccelRms >= 2.60 &&
-                (p20RawNorm == null || p20RawNorm <= 7.45)
-            val openRetention = alreadyJogOrRun &&
-                cadenceSpm >= OPEN_MODE_JOG_RETENTION_CADENCE_SPM &&
-                dynamicAccelRms >= JOG_RETENTION_BOUNCE_RMS &&
-                (p20RawNorm == null || p20RawNorm <= 7.25)
-            (cadenceSpm >= OPEN_MODE_SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= OPEN_MODE_SLOW_JOG_MIN_RMS && aerialUnloaded) ||
-                handHeldFastTurnover ||
-                openRetention
-        }
 
         if (hasValidGps) {
             val gps = gpsSpeedMps!!
@@ -266,13 +252,12 @@ class GaitClassifier(
             // Case 2: Outdoor forward movement at Walking ground speed (0.45 .. 2.15 m/s = 1.6 .. 7.7 km/h):
             //  - If the runner is bouncing with jogging cadence (`hasSpringMassJogBounce`), it IS Slow-Jogging (`JOGGING`)
             //    even at 1.1 m/s walking speed! (And capped at JOGGING so 162 spm slow-jogging doesn't fake 11 km/h RUNNING.)
-            //  - In passive Open Mode, brisk power-walking up to ~2.05 m/s with <136 spm walking cadence stays WALKING!
             if (gps < 2.15) {
                 val speedPromotesJog = if (isManualWorkoutActive) {
                     gps >= DEFAULT_JOGGING_SPEED_MPS || (alreadyJogOrRun && gps >= JOG_RETENTION_SPEED_MPS)
                 } else {
-                    (gps >= 1.98 && cadenceSpm >= 136.0 && dynamicAccelRms >= 2.0) ||
-                        (alreadyJogOrRun && gps >= 1.80 && cadenceSpm >= 134.0)
+                    (gps >= DEFAULT_JOGGING_SPEED_MPS && cadenceSpm >= 126.0) ||
+                        (alreadyJogOrRun && gps >= JOG_RETENTION_SPEED_MPS && cadenceSpm >= 118.0)
                 }
                 return if (speedPromotesJog || hasSpringMassJogBounce) {
                     MotionState.JOGGING
@@ -522,7 +507,8 @@ class GaitClassifier(
             committedState == MotionState.STANDING && raw.isJogOrRun() ->
                 if (isManualWorkoutActive) 900L else STANDING_TO_WALK_DEBOUNCE_MS
             raw == MotionState.STANDING && isManualWorkoutActive -> 3500L // never shout "Stopped!" on a brief 1-2s stumble/turn!
-            committedState.isJogOrRun() && raw == MotionState.WALKING -> 3500L // smooth anti-flicker hold for Jogging -> Walking
+            committedState.isJogOrRun() && raw == MotionState.WALKING ->
+                if (dynamicAccelRms >= 2.40) 4800L else 3500L // resist brief turn/FIFO dips while actively bouncing
             raw.intensityRank > committedState.intensityRank -> UPGRADE_DEBOUNCE_MS
             else -> DOWNGRADE_DEBOUNCE_MS
         }

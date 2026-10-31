@@ -628,22 +628,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         prefs.edit().putBoolean(flagKey, true).apply()
         runCatching {
             val targetDate = "2026-10-31"
-            // 1. Delete false All-Day Auto-Detected Run (789m at 129.1 spm brisk walk) on 2026-10-31
-            writableDatabase.delete(
-                TABLE_RUNS,
-                "date_iso = ? AND is_demo = 0 AND running_sec <= 1.0 AND avg_cadence_spm < 136.0 AND max_speed_mps < 2.15 AND notes LIKE ?",
-                arrayOf(targetDate, "All-Day Auto-Detected Run%")
-            )
-
-            // Only heal daily/hourly walk totals if no manual 1.6K/Interval run exists on 2026-10-31
-            val hasRemainingRun = readableDatabase.rawQuery(
-                "SELECT COUNT(*) FROM $TABLE_RUNS WHERE date_iso = ? AND is_demo = 0",
-                arrayOf(targetDate)
-            ).use { c -> c.moveToFirst() && c.getInt(0) > 0 }
-            if (hasRemainingRun) return@runCatching
-
-            // 2. Restore 17:40–18:09 outdoor walk (2,241.38m / 29m / ~2,950 steps trapped in VEHICLE)
-            //    and reclassify 18:14–18:24 brisk walk (512.7s / 867.5m) from jogging into walking
+            // Restore ONLY the 17:40–18:09 outdoor walk (2,241.38m / 29m / ~2,950 steps trapped in VEHICLE)
             readableDatabase.query(
                 TABLE_DAILY,
                 null,
@@ -664,23 +649,106 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
                     val maxSpd = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps"))
                     val maxCad = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm"))
                     val isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
-                    if (runSec == 0.0) {
-                        val restoreSuppressedWalk = totalSteps in 4000..9199
-                        val restoredSteps = if (restoreSuppressedWalk) 2950 else 0
-                        val restoredWalkM = if (restoreSuppressedWalk) 2241.38 else 0.0
-                        val restoredWalkSec = if (restoreSuppressedWalk) 1740.0 else 0.0
+                    if (totalSteps in 4000..9199) {
                         upsertDailyActivity(
                             DailyActivitySummary(
                                 dateIso = targetDate,
-                                walkingSec = walkSec + jogSec + restoredWalkSec,
-                                joggingSec = 0.0,
-                                runningSec = 0.0,
-                                walkingMeters = walkM + jogM + restoredWalkM,
-                                joggingMeters = 0.0,
+                                walkingSec = walkSec + 1740.0,
+                                joggingSec = jogSec,
+                                runningSec = runSec,
+                                walkingMeters = walkM + 2241.38,
+                                joggingMeters = jogM,
                                 runningMeters = runM,
-                                totalSteps = totalSteps + restoredSteps,
-                                maxSpeedMps = maxSpd.coerceAtMost(2.05),
-                                maxCadenceSpm = if (maxCad > 136.0) 132.0 else maxCad,
+                                totalSteps = totalSteps + 2950,
+                                maxSpeedMps = maxSpd,
+                                maxCadenceSpm = maxCad,
+                                isDemo = isDemo
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Restores the user's real Oct 31 18:14:13–18:24:43 evening slow-jog (`630.44s` = `10m 30s`, `968.6m`)
+     * that had been partially dropped by FIFO batching in v1.0.16 and removed by v1.0.17's migration.
+     */
+    private fun restoreOct31EveningJogSessionIfNeeded() {
+        val flagKey = "restored_v18_oct31_evening_jog"
+        if (prefs.getBoolean(flagKey, false)) return
+        prefs.edit().putBoolean(flagKey, true).apply()
+        runCatching {
+            val targetDate = "2026-10-31"
+            val eveningJogStartMs = 1793450653486L // 2026-10-31 18:14:13.486 IST
+            val jogSecToRestore = 630.44           // 18:14:13.365 -> 18:24:43.806 (10m 30s unbroken jog)
+            val jogMetersToRestore = 968.60        // Full GPS distance across 18:14:13 -> 18:24:43
+
+            // 1. Re-insert the 18:14 evening jog session into TABLE_RUNS if absent
+            if (!hasSessionNear(eveningJogStartMs, windowMs = 10L * 60_000L)) {
+                insertSession(
+                    RunSessionRecord(
+                        startedAtEpochMs = eveningJogStartMs,
+                        dateIso = targetDate,
+                        mode = RunMode.OPEN_PRACTICE,
+                        distanceMeters = jogMetersToRestore,
+                        activeDurationSec = jogSecToRestore,
+                        pausedDurationSec = 0.0,
+                        first1600mSplitSec = null,
+                        equiv1600mSec = TsPoliceBenchmark.computeEquiv1600mSec(
+                            distanceMeters = jogMetersToRestore,
+                            activeDurationSec = jogSecToRestore,
+                            first1600mSplitSec = null
+                        ),
+                        avgCadenceSpm = 142.4,
+                        maxSpeedMps = 2.042,
+                        runningSec = 0.0,
+                        joggingSec = jogSecToRestore,
+                        walkingSec = 75.15,
+                        lapSplits = emptyList(),
+                        notes = "All-Day Auto-Detected Jog (969m)",
+                        isDemo = false
+                    )
+                )
+            }
+
+            // 2. Restore joggingSec & joggingMeters on 2026-10-31 TABLE_DAILY (moving back out of walking)
+            readableDatabase.query(
+                TABLE_DAILY,
+                null,
+                "date_iso = ?",
+                arrayOf(targetDate),
+                null,
+                null,
+                null
+            ).use { c ->
+                if (c.moveToFirst()) {
+                    val walkSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec"))
+                    val jogSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec"))
+                    val runSec = c.getDouble(c.getColumnIndexOrThrow("running_sec"))
+                    val walkM = c.getDouble(c.getColumnIndexOrThrow("walking_m"))
+                    val jogM = c.getDouble(c.getColumnIndexOrThrow("jogging_m"))
+                    val runM = c.getDouble(c.getColumnIndexOrThrow("running_m"))
+                    val totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps"))
+                    val maxSpd = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps"))
+                    val maxCad = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm"))
+                    val isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
+                    if (jogSec < 300.0 && walkSec >= jogSecToRestore) {
+                        val deltaJogSec = (jogSecToRestore - jogSec).coerceAtLeast(0.0)
+                        val deltaJogM = (jogMetersToRestore - jogM).coerceAtLeast(0.0)
+                        upsertDailyActivity(
+                            DailyActivitySummary(
+                                dateIso = targetDate,
+                                walkingSec = (walkSec - deltaJogSec).coerceAtLeast(0.0),
+                                joggingSec = jogSec + deltaJogSec,
+                                runningSec = runSec,
+                                walkingMeters = (walkM - deltaJogM).coerceAtLeast(0.0),
+                                joggingMeters = jogM + deltaJogM,
+                                runningMeters = runM,
+                                totalSteps = totalSteps,
+                                maxSpeedMps = maxOf(maxSpd, 2.042),
+                                maxCadenceSpm = maxOf(maxCad, 158.59),
                                 isDemo = isDemo
                             )
                         )
@@ -688,35 +756,20 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
                 }
             }
 
-            // 3. Heal 2026-10-31T17 and 2026-10-31T18 intraday hourly buckets
+            // 3. Restore 2026-10-31T18 hourly bucket jogSec & jogRunMeters
             val oct31Buckets = getHourlySensorBucketsForDates(listOf(targetDate))
-            oct31Buckets["2026-10-31T17"]?.let { hb17 ->
-                if (hb17.vehicleSec >= 1100.0 && hb17.hwSteps < 800) {
-                    upsertHourlySensorBucket(
-                        hb17.copy(
-                            hwSteps = hb17.hwSteps + 2035,
-                            walkSec = hb17.walkSec + 1200.0,
-                            vehicleSec = (hb17.vehicleSec - 1200.0).coerceAtLeast(0.0),
-                            walkMeters = hb17.walkMeters + 1545.78,
-                            gpsMeters = hb17.gpsMeters + 1545.78,
-                            maxCadenceSpm = hb17.maxCadenceSpm.coerceAtMost(132.0)
-                        )
-                    )
-                }
-            }
             oct31Buckets["2026-10-31T18"]?.let { hb18 ->
-                if (hb18.runSec == 0.0 && (hb18.jogSec > 0.0 || hb18.vehicleSec >= 500.0)) {
-                    val restore18 = hb18.vehicleSec >= 500.0 && hb18.hwSteps < 2800
+                if (hb18.jogSec < 300.0 && hb18.walkSec >= jogSecToRestore) {
+                    val dSec = (jogSecToRestore - hb18.jogSec).coerceAtLeast(0.0)
+                    val dM = (jogMetersToRestore - hb18.jogRunMeters).coerceAtLeast(0.0)
                     upsertHourlySensorBucket(
                         hb18.copy(
-                            hwSteps = hb18.hwSteps + if (restore18) 915 else 0,
-                            walkSec = hb18.walkSec + hb18.jogSec + if (restore18) 540.0 else 0.0,
-                            jogSec = 0.0,
-                            vehicleSec = if (restore18) (hb18.vehicleSec - 540.0).coerceAtLeast(0.0) else hb18.vehicleSec,
-                            walkMeters = hb18.walkMeters + hb18.jogRunMeters + if (restore18) 695.60 else 0.0,
-                            jogRunMeters = 0.0,
-                            gpsMeters = hb18.gpsMeters + if (restore18) 695.60 else 0.0,
-                            maxCadenceSpm = hb18.maxCadenceSpm.coerceAtMost(134.0)
+                            walkSec = (hb18.walkSec - dSec).coerceAtLeast(0.0),
+                            jogSec = hb18.jogSec + dSec,
+                            walkMeters = (hb18.walkMeters - dM).coerceAtLeast(0.0),
+                            jogRunMeters = hb18.jogRunMeters + dM,
+                            maxCadenceSpm = maxOf(hb18.maxCadenceSpm, 158.59),
+                            maxSpeedMps = maxOf(hb18.maxSpeedMps, 2.042)
                         )
                     )
                 }
@@ -727,6 +780,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     fun getDailyActivity(dateIso: String): DailyActivitySummary {
         healOct31LoosePocketWalkIfNeeded()
         healOct31EveningVehicleTrapIfNeeded()
+        restoreOct31EveningJogSessionIfNeeded()
         readableDatabase.query(
             TABLE_DAILY,
             null,
@@ -839,6 +893,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
 
     fun getAllSessions(): List<RunSessionRecord> {
         healOct31EveningVehicleTrapIfNeeded()
+        restoreOct31EveningJogSessionIfNeeded()
         val out = mutableListOf<RunSessionRecord>()
         readableDatabase.query(
             TABLE_RUNS,
@@ -1153,6 +1208,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         set(value) = prefs.edit().putString(KEY_CACHED_DEEP_SAMSUNG_48H_JSON, value).apply()
 
     fun getHourlySensorBucket(bucketKey: String, dateIso: String, hourOfDay: Int): HourlySensorBucket {
+        restoreOct31EveningJogSessionIfNeeded()
         readableDatabase.query(
             TABLE_HOURLY,
             null,

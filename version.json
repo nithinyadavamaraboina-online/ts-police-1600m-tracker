@@ -1,8 +1,8 @@
 {
-    "versionCode":  18,
-    "versionName":  "1.0.17",
+    "versionCode":  19,
+    "versionName":  "1.0.18",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "989ef523d64a7f417d295c57d7393cbffeaba20c95ecf60266b0a56af0b8b4e7",
-    "changelog":  "Fix post-bike dismount walk suppression, refine brisk-walk vs slow-jog p20 aerial filter, preserve hardware FIFO footstrike timestamps, and heal Oct 31 evening walk data.",
-    "publishedAt":  "2026-10-31T15:02:54Z"
+    "sha256":  "b53e402b69e92a5a1d7a4e4440e9fe952cc56265c6e0a2a8c99f08777684e5bd",
+    "changelog":  "Restore Oct 31 18:14-18:24 evening jog session (969m / 10m30s) and fix loose-pocket slow-jog detection without p20 over-filtering.",
+    "publishedAt":  "2026-10-31T15:58:35Z"
 }

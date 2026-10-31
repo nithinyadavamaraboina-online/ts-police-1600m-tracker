@@ -1649,16 +1649,17 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     private fun flushOpenBoutIfQualified() {
-        if (openBoutStartedWallMs > 0L && openBoutJogRunMeters >= 600.0 && openBoutActiveSec >= 90.0) {
-            val avgCad = if (openBoutCadenceCount > 0) openBoutCadenceSum / openBoutCadenceCount else 155.0
+        if (openBoutStartedWallMs > 0L && openBoutJogRunMeters >= 300.0 && openBoutActiveSec >= 60.0) {
+            val avgCad = if (openBoutCadenceCount > 0) openBoutCadenceSum / openBoutCadenceCount else 142.0
             val avgSpeedMps = openBoutJogRunMeters / openBoutActiveSec
-            val isGenuineJogOrRunBout = openBoutRunSec >= 5.0 || avgSpeedMps >= 2.05 || avgCad >= 138.0
+            val isGenuineJogOrRunBout = openBoutRunSec >= 5.0 || avgSpeedMps >= 1.85 || avgCad >= 124.0
             if (isGenuineJogOrRunBout) {
                 val equiv = TsPoliceBenchmark.computeEquiv1600mSec(
                     distanceMeters = openBoutJogRunMeters,
                     activeDurationSec = openBoutActiveSec,
                     first1600mSplitSec = openBoutFirst1600Sec
                 )
+                val labelKind = if (openBoutRunSec >= openBoutActiveSec * 0.25 || avgSpeedMps >= 2.60) "Run" else "Jog"
                 val savedId = repository.insertSession(
                     RunSessionRecord(
                         startedAtEpochMs = openBoutStartedWallMs,
@@ -1675,7 +1676,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                         joggingSec = openBoutJogSec,
                         walkingSec = openBoutWalkSec,
                         lapSplits = emptyList(),
-                        notes = "All-Day Auto-Detected Run (${openBoutJogRunMeters.toInt()}m)",
+                        notes = "All-Day Auto-Detected $labelKind (${openBoutJogRunMeters.toInt()}m)",
                         isDemo = false
                     )
                 )
