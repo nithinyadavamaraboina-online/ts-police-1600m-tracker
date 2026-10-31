@@ -56,7 +56,14 @@ import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SensorTransitionEvent
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
+import com.tspolice.runtracker.health.SamsungHealthSyncManager
+import com.tspolice.runtracker.telemetry.TuningTelemetryManager
 import com.tspolice.runtracker.ui.MainActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.util.Locale
@@ -97,9 +104,15 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private val listeners = CopyOnWriteArraySet<(LiveTelemetry) -> Unit>()
 
     private lateinit var repository: RunRepository
+    private lateinit var tuningTelemetryManager: TuningTelemetryManager
     private lateinit var sensorManager: SensorManager
     private lateinit var locationManager: LocationManager
     private var wakeLock: PowerManager.WakeLock? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile
+    private var serviceAlive = false
+    private var remotePullListenerThread: Thread? = null
+    private var lastAutoTelemetryCheckElapsedMs: Long = 0L
 
     private val signalProcessor = MotionSignalProcessor()
     private val gaitClassifier = GaitClassifier()
@@ -261,7 +274,13 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
     override fun onCreate() {
         super.onCreate()
+        serviceAlive = true
         repository = RunRepository(this)
+        tuningTelemetryManager = TuningTelemetryManager(
+            context = applicationContext,
+            repository = repository,
+            healthSyncManager = SamsungHealthSyncManager(applicationContext, repository)
+        )
         signalProcessor.verifiedHardwarePedometerActive = repository.hasVerifiedHardwarePedometer
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
@@ -306,6 +325,13 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 ttsReady = true
             }
         }
+
+        startRemotePullCommandListener()
+        mainHandler.postDelayed({
+            if (serviceAlive) {
+                triggerBackgroundAutoTelemetryIfDue(reason = "service_startup", checkPendingCommands = true)
+            }
+        }, 5_000L)
     }
 
     override fun onBind(intent: Intent?): IBinder {
@@ -327,6 +353,10 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     override fun onDestroy() {
+        serviceAlive = false
+        remotePullListenerThread?.interrupt()
+        remotePullListenerThread = null
+        serviceScope.cancel()
         flushOpenBoutIfQualified()
         persistDailySummaryNow()
         mainHandler.removeCallbacksAndMessages(null)
@@ -735,6 +765,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             vibratePulse(320L)
         }
         persistDailySummaryNow()
+        if (savedId != null) {
+            triggerBackgroundAutoTelemetryIfDue(reason = "pt_trial_finished", force = true)
+        }
         broadcastTelemetry()
         return savedId
     }
@@ -889,6 +922,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         }
         syncPocketForegroundAndWakeLock()
         persistDailySummaryNow()
+        if (repsDone > 0) {
+            triggerBackgroundAutoTelemetryIfDue(reason = "intervals_finished", force = true)
+        }
         broadcastTelemetry()
     }
 
@@ -1526,6 +1562,11 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             nm.notify(NOTIFICATION_ID, buildForegroundNotification(state, effectiveSpeedMps))
         }
 
+        if (nowMs - lastAutoTelemetryCheckElapsedMs >= 15L * 60_000L) {
+            lastAutoTelemetryCheckElapsedMs = nowMs
+            triggerBackgroundAutoTelemetryIfDue(reason = "periodic_background", checkPendingCommands = true)
+        }
+
         val liveStrideM = gaitClassifier.computeLiveStrideLengthMeters(
             gpsSpeedMps = gpsForClassifier,
             cadenceSpm = cadenceSpm,
@@ -1616,8 +1657,64 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 )
             )
             lastCompletedSessionId = savedId
+            persistDailySummaryNow()
+            triggerBackgroundAutoTelemetryIfDue(reason = "open_run_finished", force = true)
         }
         resetOpenBout()
+    }
+
+    private fun startRemotePullCommandListener() {
+        if (remotePullListenerThread?.isAlive == true) return
+        remotePullListenerThread = Thread({
+            tuningTelemetryManager.listenForRemotePullCommandsBlocking(
+                shouldContinue = { serviceAlive },
+                onPullCommand = { reqId ->
+                    mainHandler.post {
+                        if (!serviceAlive) return@post
+                        persistDailySummaryNow()
+                        val liveSnap = currentDailySnapshot()
+                        serviceScope.launch {
+                            runCatching {
+                                tuningTelemetryManager.pullBuildAndUploadTuningBundle(
+                                    liveTodayOverride = liveSnap,
+                                    triggerReason = "remote_pull_live",
+                                    requestId = reqId
+                                )
+                            }
+                        }
+                    }
+                }
+            )
+        }, "TSPolice-RemotePullListener").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun triggerBackgroundAutoTelemetryIfDue(
+        reason: String,
+        force: Boolean = false,
+        checkPendingCommands: Boolean = false
+    ) {
+        if (!::tuningTelemetryManager.isInitialized) return
+        persistDailySummaryNow()
+        val liveSnap = currentDailySnapshot()
+        serviceScope.launch {
+            runCatching {
+                val handledCmd = if (checkPendingCommands) {
+                    tuningTelemetryManager.checkAndHandlePendingPullCommands { liveSnap }
+                } else {
+                    false
+                }
+                if (!handledCmd) {
+                    tuningTelemetryManager.maybeAutoSyncIfDue(
+                        liveTodayOverride = liveSnap,
+                        reason = reason,
+                        force = force
+                    )
+                }
+            }
+        }
     }
 
     private fun resetOpenBout() {

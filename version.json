@@ -1,8 +1,8 @@
 {
-    "versionCode":  14,
-    "versionName":  "1.0.13",
+    "versionCode":  15,
+    "versionName":  "1.0.14",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "f72d096b6ad10563de674ab378951cc79f1e6fc865f36b0be05f4af4f7f829c9",
-    "changelog":  "Fix false Bike detected when speeding up from Jog to Run in 1.6K Trial and Open mode, fix false Stopped and Jog-to-Walk drops on missed hand-held steps, detect Slow-Jogging at walking speed via spring-mass bounce, and show live Stride Length.",
-    "publishedAt":  "2026-10-29T15:38:25Z"
+    "sha256":  "98b447e3727302300735346e478d5087273b63b76b5025d17c4e6fbdc462cb26",
+    "changelog":  "Add hands-free live remote telemetry pull (PULL_NOW) and automatic background cloud sync after workouts, app opens, and periodic intervals.",
+    "publishedAt":  "2026-10-31T03:03:06Z"
 }

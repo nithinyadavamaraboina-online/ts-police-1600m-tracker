@@ -30,6 +30,7 @@
     <uses-permission android:name="android.permission.health.READ_EXERCISE" />
     <uses-permission android:name="android.permission.health.READ_SPEED" />
     <uses-permission android:name="android.permission.health.READ_STEPS_CADENCE" />
+    <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND" />
 
     <!-- Package visibility for Samsung Health & Android Health Connect -->
     <queries>

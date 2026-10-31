@@ -6,12 +6,19 @@ param(
     [string]$Since = "48h",
 
     [Parameter(Mandatory = $false)]
-    [string]$InputFile = ""
+    [string]$InputFile = "",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipLivePing,
+
+    [Parameter(Mandatory = $false)]
+    [int]$WaitLiveSeconds = 16
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Channel = "tspolice-tune-9f4c2e7b18a6d305e419"
+$CmdChannel = "tspolice-cmd-9f4c2e7b18a6d305e419"
 $DistDir = Join-Path $RepoRoot "dist"
 $HistoryDir = Join-Path $DistDir "tuning-history"
 New-Item -ItemType Directory -Force -Path $HistoryDir | Out-Null
@@ -24,6 +31,46 @@ function Get-HttpUtf8Text {
         return [System.Text.Encoding]::UTF8.GetString($resp.Content)
     }
     return [string]$resp.Content
+}
+
+function Parse-RelayMessages {
+    param([string]$NdjsonText)
+    $Messages = @()
+    if ([string]::IsNullOrWhiteSpace($NdjsonText)) { return $Messages }
+    foreach ($line in ($NdjsonText -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        try {
+            $obj = $trimmed | ConvertFrom-Json
+            if ($obj.event -eq "message") {
+                $Messages += $obj
+            }
+        } catch {
+            # Ignore malformed line
+        }
+    }
+    return $Messages
+}
+
+function Download-MessageJson {
+    param($MsgObj)
+    $Code = [string]$MsgObj.id
+    $AttUrl = ""
+    if ($null -ne $MsgObj.attachment -and -not [string]::IsNullOrWhiteSpace($MsgObj.attachment.url)) {
+        $AttUrl = [string]$MsgObj.attachment.url
+    } elseif (-not [string]::IsNullOrWhiteSpace($Code)) {
+        $AttUrl = "https://ntfy.sh/file/$Code.json"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($AttUrl)) {
+        try {
+            return Get-HttpUtf8Text -Url $AttUrl
+        } catch {
+            if (-not [string]::IsNullOrWhiteSpace($MsgObj.message) -and $MsgObj.message.Trim().StartsWith("{")) {
+                return [string]$MsgObj.message
+            }
+        }
+    }
+    return $null
 }
 
 $RawJson = $null
@@ -44,50 +91,60 @@ if (-not [string]::IsNullOrWhiteSpace($InputFile)) {
     $ResolvedCode = $CleanCode
     $ResolvedSource = $FileUrl
 } else {
-    $PollUrl = "https://ntfy.sh/$Channel/json?poll=1&since=$Since"
-    Write-Host "Checking cloud tuning relay for recent phone uploads (since $Since)..." -ForegroundColor Cyan
-    $NdjsonText = ""
-    try {
-        $NdjsonText = Get-HttpUtf8Text -Url $PollUrl
-    } catch {
-        Write-Warning "Cloud poll error: $($_.Exception.Message)"
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($NdjsonText)) {
-        $Messages = @()
-        foreach ($line in ($NdjsonText -split "`r?`n")) {
-            $trimmed = $line.Trim()
-            if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
-            try {
-                $obj = $trimmed | ConvertFrom-Json
-                if ($obj.event -eq "message") {
-                    $Messages += $obj
-                }
-            } catch {
-                # Ignore malformed line
-            }
-        }
-
-        if ($Messages.Count -gt 0) {
-            $Latest = $Messages | Sort-Object time | Select-Object -Last 1
-            $ResolvedCode = [string]$Latest.id
-            $AttUrl = ""
-            if ($null -ne $Latest.attachment -and -not [string]::IsNullOrWhiteSpace($Latest.attachment.url)) {
-                $AttUrl = [string]$Latest.attachment.url
-            } elseif (-not [string]::IsNullOrWhiteSpace($ResolvedCode)) {
-                $AttUrl = "https://ntfy.sh/file/$ResolvedCode.json"
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($AttUrl)) {
+    # 1. Send Hands-Free Live Remote Pull Command (`PULL_NOW`) to wake phone in pocket & upload fresh snapshot!
+    $ReqId = [Guid]::NewGuid().ToString("N").Substring(0, 10)
+    $PingSentEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if (-not $SkipLivePing -and $WaitLiveSeconds -gt 0) {
+        $CmdPayload = "PULL_NOW:$ReqId"
+        Write-Host "Sending live remote pull trigger to phone (req:$ReqId)..." -ForegroundColor Cyan
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri "https://ntfy.sh/$CmdChannel" -Method Post -Body $CmdPayload -ContentType "text/plain" -UseBasicParsing -TimeoutSec 10 | Out-Null
+            $Deadline = (Get-Date).AddSeconds($WaitLiveSeconds)
+            while ((Get-Date) -lt $Deadline) {
+                Start-Sleep -Seconds 2
+                $LivePollText = ""
                 try {
-                    $RawJson = Get-HttpUtf8Text -Url $AttUrl
-                    $ResolvedSource = "Cloud Relay (Code: $ResolvedCode)"
-                } catch {
-                    if (-not [string]::IsNullOrWhiteSpace($Latest.message) -and $Latest.message.Trim().StartsWith("{")) {
-                        $RawJson = [string]$Latest.message
-                        $ResolvedSource = "Cloud Inline Message (Code: $ResolvedCode)"
+                    $LivePollText = Get-HttpUtf8Text -Url "https://ntfy.sh/$Channel/json?poll=1&since=60s"
+                } catch {}
+                $LiveMsgs = Parse-RelayMessages -NdjsonText $LivePollText
+                $Matched = $LiveMsgs | Where-Object {
+                    ($null -ne $_.title -and $_.title -match "req:$ReqId") -or ($_.time -ge ($PingSentEpoch - 1))
+                } | Sort-Object time | Select-Object -Last 1
+                if ($null -ne $Matched) {
+                    $CandidateJson = Download-MessageJson -MsgObj $Matched
+                    if (-not [string]::IsNullOrWhiteSpace($CandidateJson)) {
+                        $RawJson = $CandidateJson
+                        $ResolvedCode = [string]$Matched.id
+                        $ResolvedSource = "Live Hands-Free Remote Pull (Code: $ResolvedCode)"
+                        Write-Host "Received live snapshot from phone in $([int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $PingSentEpoch))s!" -ForegroundColor Green
+                        break
                     }
                 }
+            }
+        } catch {
+            Write-Warning "Live trigger warning: $($_.Exception.Message)"
+        }
+    }
+
+    # 2. Fallback to latest periodic auto-synced snapshot on cloud relay if phone is currently offline / pre-v1.0.14
+    if ([string]::IsNullOrWhiteSpace($RawJson)) {
+        $PollUrl = "https://ntfy.sh/$Channel/json?poll=1&since=$Since"
+        Write-Host "Checking cloud tuning relay for latest auto-synced upload (since $Since)..." -ForegroundColor Cyan
+        $NdjsonText = ""
+        try {
+            $NdjsonText = Get-HttpUtf8Text -Url $PollUrl
+        } catch {
+            Write-Warning "Cloud poll error: $($_.Exception.Message)"
+        }
+        $Messages = Parse-RelayMessages -NdjsonText $NdjsonText
+        if ($Messages.Count -gt 0) {
+            $Latest = $Messages | Sort-Object time | Select-Object -Last 1
+            $CandidateJson = Download-MessageJson -MsgObj $Latest
+            if (-not [string]::IsNullOrWhiteSpace($CandidateJson)) {
+                $RawJson = $CandidateJson
+                $ResolvedCode = [string]$Latest.id
+                $ResolvedSource = "Cloud Auto-Sync Relay (Code: $ResolvedCode)"
             }
         }
     }

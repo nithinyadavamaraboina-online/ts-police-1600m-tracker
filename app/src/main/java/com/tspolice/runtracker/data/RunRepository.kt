@@ -53,6 +53,12 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_CACHED_SAMSUNG_MAP_JSON = "cached_samsung_snapshots_map_v2"
         private const val KEY_IMPORTED_EXT_WORKOUTS = "imported_external_workout_ids"
         private const val KEY_LAST_TUNING_SYNC_SUMMARY = "last_tuning_sync_summary"
+        private const val KEY_LAST_TUNING_SYNC_EPOCH_MS = "last_tuning_sync_epoch_ms"
+        private const val KEY_LAST_TUNING_SYNC_DATE_ISO = "last_tuning_sync_date_iso"
+        private const val KEY_LAST_TUNING_SYNC_STEPS = "last_tuning_sync_steps"
+        private const val KEY_LAST_HANDLED_PULL_EPOCH_SEC = "last_handled_pull_epoch_sec"
+        private const val KEY_LAST_HANDLED_PULL_ID = "last_handled_pull_id"
+        private const val KEY_CACHED_DEEP_SAMSUNG_48H_JSON = "cached_deep_samsung_48h_json"
         private const val KEY_VERIFIED_HW_PEDOMETER = "verified_hw_pedometer_active"
     }
 
@@ -933,6 +939,30 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     var lastTuningSyncSummary: String
         get() = prefs.getString(KEY_LAST_TUNING_SYNC_SUMMARY, "") ?: ""
         set(value) = prefs.edit().putString(KEY_LAST_TUNING_SYNC_SUMMARY, value).apply()
+
+    var lastTuningSyncEpochMs: Long
+        get() = prefs.getLong(KEY_LAST_TUNING_SYNC_EPOCH_MS, 0L)
+        set(value) = prefs.edit().putLong(KEY_LAST_TUNING_SYNC_EPOCH_MS, value).apply()
+
+    var lastTuningSyncDateIso: String
+        get() = prefs.getString(KEY_LAST_TUNING_SYNC_DATE_ISO, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_LAST_TUNING_SYNC_DATE_ISO, value).apply()
+
+    var lastTuningSyncSteps: Int
+        get() = prefs.getInt(KEY_LAST_TUNING_SYNC_STEPS, -1)
+        set(value) = prefs.edit().putInt(KEY_LAST_TUNING_SYNC_STEPS, value).apply()
+
+    var lastHandledRemotePullEpochSec: Long
+        get() = prefs.getLong(KEY_LAST_HANDLED_PULL_EPOCH_SEC, 0L)
+        set(value) = prefs.edit().putLong(KEY_LAST_HANDLED_PULL_EPOCH_SEC, value).apply()
+
+    var lastHandledRemotePullId: String
+        get() = prefs.getString(KEY_LAST_HANDLED_PULL_ID, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_LAST_HANDLED_PULL_ID, value).apply()
+
+    var cachedDeepSamsung48hJson: String
+        get() = prefs.getString(KEY_CACHED_DEEP_SAMSUNG_48H_JSON, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_CACHED_DEEP_SAMSUNG_48H_JSON, value).apply()
 
     fun getHourlySensorBucket(bucketKey: String, dateIso: String, hourOfDay: Int): HourlySensorBucket {
         readableDatabase.query(

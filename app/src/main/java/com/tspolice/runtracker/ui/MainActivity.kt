@@ -2903,6 +2903,25 @@ class MainActivity : AppCompatActivity() {
             }
             renderSamsungComparisonCard(force = true)
             renderDailyHistoryCards(latestDailySummaryForCompare)
+
+            // Hands-free automatic background telemetry + Samsung 48h upload (no manual button tap needed!)
+            if (::tuningTelemetryManager.isInitialized && !isTuningUploadInFlight) {
+                trackingService?.flushTuningBuffersNow()
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        val handledCmd = tuningTelemetryManager.checkAndHandlePendingPullCommands {
+                            latestDailySummaryForCompare
+                        }
+                        if (!handledCmd) {
+                            tuningTelemetryManager.maybeAutoSyncIfDue(
+                                liveTodayOverride = latestDailySummaryForCompare,
+                                reason = "app_open"
+                            )
+                        }
+                    }
+                }
+                refreshTuningStatusLabels()
+            }
         }
     }
 

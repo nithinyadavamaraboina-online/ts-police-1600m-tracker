@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.PowerManager
 import com.tspolice.runtracker.data.RunRepository
 import com.tspolice.runtracker.domain.DailyActivitySummary
+import com.tspolice.runtracker.domain.HealthSyncStatus
 import com.tspolice.runtracker.domain.HourlySensorBucket
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SamsungHealthComparator
@@ -14,6 +15,8 @@ import com.tspolice.runtracker.domain.SamsungHourlyBucket
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import com.tspolice.runtracker.health.DeepSamsungTuningDataset
 import com.tspolice.runtracker.health.SamsungHealthSyncManager
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -49,13 +52,43 @@ class TuningTelemetryManager(
 ) {
     companion object {
         const val CLOUD_TELEMETRY_CHANNEL = "tspolice-tune-9f4c2e7b18a6d305e419"
+        const val CLOUD_COMMAND_CHANNEL = "tspolice-cmd-9f4c2e7b18a6d305e419"
         private const val UPLOAD_ENDPOINT = "https://ntfy.sh/$CLOUD_TELEMETRY_CHANNEL"
+        private const val COMMAND_POLL_URL = "https://ntfy.sh/$CLOUD_COMMAND_CHANNEL/json?poll=1&since=6h"
+        private const val COMMAND_STREAM_URL = "https://ntfy.sh/$CLOUD_COMMAND_CHANNEL/json?since=90s"
         const val LOCAL_EXPORT_FILENAME = "ts_police_tuning_latest.json"
+
+        private val uploadMutex = Mutex()
+
+        private val EVENT_MSG_REGEX = Regex(""""event"\s*:\s*"message"""")
+        private val PULL_REQ_ID_REGEX = Regex("""PULL_NOW(?:[:\s"\\]+|\\"reqId\\"\s*:\s*\\")([A-Za-z0-9_-]{3,40})""", RegexOption.IGNORE_CASE)
+        private val MSG_ID_REGEX = Regex(""""id"\s*:\s*"([A-Za-z0-9_-]+)"""")
+        private val TIME_SEC_REGEX = Regex(""""time"\s*:\s*(\d+)""")
+
+        /**
+         * Parses a single NDJSON line from the remote pull command channel using pure Kotlin regex
+         * (zero allocation on keepalive lines and 100% pure-JVM unit-testable).
+         * Returns `(requestId, eventTimeEpochSec)` if the line is an actionable `PULL_NOW` command.
+         */
+        fun parseRemotePullCommandLine(rawLine: String): Pair<String, Long>? {
+            val trimmed = rawLine.trim()
+            if (trimmed.isEmpty() || !trimmed.startsWith("{")) return null
+            if (!trimmed.contains("PULL_NOW", ignoreCase = true)) return null
+            if (!EVENT_MSG_REGEX.containsMatchIn(trimmed)) return null
+
+            val timeSec = TIME_SEC_REGEX.find(trimmed)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
+            val explicitReqId = PULL_REQ_ID_REGEX.find(trimmed)?.groupValues?.getOrNull(1).orEmpty()
+            val msgId = MSG_ID_REGEX.find(trimmed)?.groupValues?.getOrNull(1).orEmpty()
+            val finalId = explicitReqId.ifBlank { msgId.ifBlank { "pull_$timeSec" } }
+            return finalId to timeSec
+        }
     }
 
     suspend fun pullBuildAndUploadTuningBundle(
-        liveTodayOverride: DailyActivitySummary? = null
-    ): TuningPullAndUploadResult {
+        liveTodayOverride: DailyActivitySummary? = null,
+        triggerReason: String = "manual",
+        requestId: String? = null
+    ): TuningPullAndUploadResult = uploadMutex.withLock {
         val deepSamsung = healthSyncManager.pullFineTuningDataset()
         val zone = ZoneId.systemDefault()
         val today = LocalDate.now(zone)
@@ -85,6 +118,18 @@ class TuningTelemetryManager(
         val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val batteryUnrestricted = pm?.isIgnoringBatteryOptimizations(context.packageName) ?: false
 
+        // Cache or hydrate 48h Samsung Health intraday buckets so locked-screen background remote pulls
+        // still include full Samsung intraday context even when Android 14/15 blocks background HC reads!
+        val effectiveSamsungHourly = LinkedHashMap<String, SamsungHourlyBucket>()
+        if (deepSamsung.syncOutcome.status == HealthSyncStatus.SYNCED && deepSamsung.intradayHourlyBuckets.isNotEmpty()) {
+            effectiveSamsungHourly.putAll(deepSamsung.intradayHourlyBuckets)
+            runCatching {
+                repository.cachedDeepSamsung48hJson = encodeDeepSamsungCache(yesterdayIso, todayIso, deepSamsung)
+            }
+        } else {
+            effectiveSamsungHourly.putAll(decodeCachedSamsungHourly(yesterdayIso, todayIso))
+        }
+
         // Compute actionable auto-tuning insights from the 48-hour dataset
         val diagInsights = buildAutoTuningInsights(
             yesterdayTracker = yesterdayTracker,
@@ -92,14 +137,18 @@ class TuningTelemetryManager(
             todayTracker = todayTracker,
             todaySamsung = todaySamsung,
             hourlyTracker = hourlyTrackerMap,
-            hourlySamsung = deepSamsung.intradayHourlyBuckets,
+            hourlySamsung = effectiveSamsungHourly,
             batteryUnrestricted = batteryUnrestricted,
             strideScale = repository.effectiveStrideScale()
         )
 
         val root = JSONObject()
-        root.put("schemaVersion", 3)
+        root.put("schemaVersion", 4)
         root.put("generatedAtIso", Instant.now().toString())
+        root.put("triggerReason", triggerReason)
+        if (!requestId.isNullOrBlank()) {
+            root.put("requestId", requestId)
+        }
         root.put("localTimezone", zone.id)
         root.put("todayIso", todayIso)
         root.put("yesterdayIso", yesterdayIso)
@@ -145,7 +194,7 @@ class TuningTelemetryManager(
             for (hr in 0..23) {
                 val bKey = String.format("%sT%02d", dIso, hr)
                 val trkH = hourlyTrackerMap[bKey]
-                val samH = deepSamsung.intradayHourlyBuckets[bKey]
+                val samH = effectiveSamsungHourly[bKey]
                 if (trkH != null || (samH != null && (samH.steps > 0 || samH.distanceMeters > 1.0))) {
                     intradayArr.put(encodeHourlyComparisonRow(bKey, dIso, hr, trkH, samH))
                 }
@@ -217,14 +266,22 @@ class TuningTelemetryManager(
             }
             return arr
         }
-        root.put(
-            "rawHealthConnectRecords48h",
+        val rawSpansObj = if (deepSamsung.syncOutcome.status == HealthSyncStatus.SYNCED &&
+            (deepSamsung.rawStepSpans48h.isNotEmpty() || deepSamsung.rawDistanceSpans48h.isNotEmpty())
+        ) {
             JSONObject().apply {
                 put("steps", encodeSpans(deepSamsung.rawStepSpans48h))
                 put("distances", encodeSpans(deepSamsung.rawDistanceSpans48h))
                 put("exercises", encodeSpans(deepSamsung.rawExerciseSpans48h))
             }
-        )
+        } else {
+            decodeCachedRawSpansObj(yesterdayIso, todayIso) ?: JSONObject().apply {
+                put("steps", encodeSpans(deepSamsung.rawStepSpans48h))
+                put("distances", encodeSpans(deepSamsung.rawDistanceSpans48h))
+                put("exercises", encodeSpans(deepSamsung.rawExerciseSpans48h))
+            }
+        }
+        root.put("rawHealthConnectRecords48h", rawSpansObj)
 
         // 9. Last 300 Raw DSP Gait State Transitions
         val transArr = JSONArray()
@@ -257,13 +314,17 @@ class TuningTelemetryManager(
         runCatching { outFile.writeText(jsonText, Charsets.UTF_8) }
 
         // Upload to cloud fine-tuning channel
-        val uploadPair = uploadBundleToCloud(jsonText, todayIso)
+        val uploadPair = uploadBundleToCloud(jsonText, todayIso, triggerReason, requestId)
         val nowClock = Instant.now().atZone(zone).format(DateTimeFormatter.ofPattern("dd MMM HH:mm"))
 
         return if (uploadPair != null) {
             val (code, url) = uploadPair
-            val summaryLine = "Synced $nowClock  •  Code: $code"
+            val modeTag = if (triggerReason == "manual") "" else " (Auto)"
+            val summaryLine = "Synced$modeTag $nowClock  •  Code: $code"
             repository.lastTuningSyncSummary = summaryLine
+            repository.lastTuningSyncEpochMs = System.currentTimeMillis()
+            repository.lastTuningSyncDateIso = todayIso
+            repository.lastTuningSyncSteps = todayTracker.totalSteps
             TuningPullAndUploadResult(
                 uploadedToCloud = true,
                 syncCode = code,
@@ -290,16 +351,164 @@ class TuningTelemetryManager(
         }
     }
 
-    private fun uploadBundleToCloud(jsonPayload: String, dateIso: String): Pair<String, String>? {
+    /**
+     * Hands-free automatic cloud telemetry sync:
+     *  - Uploads immediately on `force == true` (e.g. finished 1.6K/400m/Open run or live remote pull request)
+     *  - Uploads automatically on the first wakeup of each calendar day (`lastTuningSyncDateIso != todayIso`)
+     *  - Uploads silently on foreground app open (`reason == "app_open"`) if >=8m elapsed & >=20 new steps (or >=40m)
+     *  - Uploads every 90m on active step days or every 5h heartbeat in the background so cloud relay stays 100% live!
+     */
+    suspend fun maybeAutoSyncIfDue(
+        liveTodayOverride: DailyActivitySummary? = null,
+        reason: String = "periodic_background",
+        force: Boolean = false,
+        requestId: String? = null
+    ): TuningPullAndUploadResult? {
+        val nowEpochMs = System.currentTimeMillis()
+        val todayIso = LocalDate.now(ZoneId.systemDefault()).toString()
+        val currentSteps = (liveTodayOverride?.takeIf { it.dateIso == todayIso }
+            ?: repository.getDailyActivity(todayIso)).totalSteps
+        val lastEpochMs = repository.lastTuningSyncEpochMs
+        val elapsedMs = (nowEpochMs - lastEpochMs).coerceAtLeast(0L)
+        val stepDelta = if (repository.lastTuningSyncSteps < 0) currentSteps else abs(currentSteps - repository.lastTuningSyncSteps)
+        val firstOfToday = repository.lastTuningSyncDateIso != todayIso
+
+        val shouldUpload = when {
+            force || !requestId.isNullOrBlank() -> true
+            firstOfToday && elapsedMs >= 60_000L -> true
+            reason == "app_open" ->
+                elapsedMs >= 8L * 60_000L && (stepDelta >= 20 || elapsedMs >= 40L * 60_000L)
+            else ->
+                (elapsedMs >= 90L * 60_000L && stepDelta >= 35) || (elapsedMs >= 5L * 3600_000L)
+        }
+
+        if (!shouldUpload) return null
+        return pullBuildAndUploadTuningBundle(
+            liveTodayOverride = liveTodayOverride,
+            triggerReason = reason,
+            requestId = requestId
+        )
+    }
+
+    /**
+     * Polls `CLOUD_COMMAND_CHANNEL` once (used by JobScheduler & service startup) for any recent `PULL_NOW` request.
+     */
+    suspend fun checkAndHandlePendingPullCommands(
+        liveTodayProvider: () -> DailyActivitySummary?
+    ): Boolean {
+        val pending = runCatching { fetchLatestUnhandledPullCommand() }.getOrNull() ?: return false
+        val (reqId, cmdEpochSec) = pending
+        markPullCommandHandled(reqId, cmdEpochSec)
+        val res = pullBuildAndUploadTuningBundle(
+            liveTodayOverride = liveTodayProvider(),
+            triggerReason = "remote_pull_poll",
+            requestId = reqId
+        )
+        return res.uploadedToCloud
+    }
+
+    /**
+     * Long-lived, near-zero-battery streaming command listener run on a single daemon IO thread inside
+     * [com.tspolice.runtracker.service.RunTrackingService]. Wakes within ~1 second whenever the PC runs
+     * `scripts/pull-tuning-data.ps1` and triggers an immediate hands-free snapshot upload!
+     */
+    fun listenForRemotePullCommandsBlocking(
+        shouldContinue: () -> Boolean,
+        onPullCommand: (requestId: String) -> Unit
+    ) {
+        var backoffMs = 5_000L
+        while (shouldContinue()) {
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(COMMAND_STREAM_URL).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 15_000
+                    readTimeout = 95_000 // ntfy sends keepalive JSON lines every ~45s
+                    setRequestProperty("Accept", "application/x-ndjson")
+                }
+                if (conn.responseCode in 200..299) {
+                    backoffMs = 5_000L
+                    conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+                        while (shouldContinue()) {
+                            val line = reader.readLine() ?: break
+                            val parsed = parseRemotePullCommandLine(line) ?: continue
+                            val (reqId, timeSec) = parsed
+                            if (isNewPullCommand(reqId, timeSec)) {
+                                markPullCommandHandled(reqId, timeSec)
+                                onPullCommand(reqId)
+                            }
+                        }
+                    }
+                }
+            } catch (_: InterruptedException) {
+                break
+            } catch (_: Exception) {
+                // Network offline or socket rotated — sleep with gentle backoff
+            } finally {
+                runCatching { conn?.disconnect() }
+            }
+            if (!shouldContinue()) break
+            try {
+                Thread.sleep(backoffMs)
+            } catch (_: InterruptedException) {
+                break
+            }
+            backoffMs = (backoffMs * 2L).coerceAtMost(60_000L)
+        }
+    }
+
+    private fun isNewPullCommand(reqId: String, timeSec: Long): Boolean {
+        if (reqId.isBlank()) return false
+        if (reqId == repository.lastHandledRemotePullId) return false
+        val lastSec = repository.lastHandledRemotePullEpochSec
+        return timeSec <= 0L || timeSec >= lastSec
+    }
+
+    private fun markPullCommandHandled(reqId: String, timeSec: Long) {
+        repository.lastHandledRemotePullId = reqId
+        if (timeSec > repository.lastHandledRemotePullEpochSec) {
+            repository.lastHandledRemotePullEpochSec = timeSec
+        }
+    }
+
+    private fun fetchLatestUnhandledPullCommand(): Pair<String, Long>? {
+        val conn = (URL(COMMAND_POLL_URL).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10_000
+            readTimeout = 12_000
+        }
+        return try {
+            if (conn.responseCode !in 200..299) return null
+            val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            var latest: Pair<String, Long>? = null
+            for (line in body.lineSequence()) {
+                val parsed = parseRemotePullCommandLine(line) ?: continue
+                if (isNewPullCommand(parsed.first, parsed.second)) {
+                    latest = parsed
+                }
+            }
+            latest
+        } finally {
+            runCatching { conn.disconnect() }
+        }
+    }
+
+    private fun uploadBundleToCloud(
+        jsonPayload: String,
+        dateIso: String,
+        triggerReason: String,
+        requestId: String?
+    ): Pair<String, String>? {
         return runCatching {
             val bytes = jsonPayload.toByteArray(Charsets.UTF_8)
+            val reqSuffix = if (!requestId.isNullOrBlank()) " req:$requestId" else ""
             val conn = (URL(UPLOAD_ENDPOINT).openConnection() as HttpURLConnection).apply {
                 requestMethod = "PUT"
                 connectTimeout = 12_000
                 readTimeout = 20_000
                 doOutput = true
                 setRequestProperty("Filename", "ts-police-tuning-$dateIso.json")
-                setRequestProperty("Title", "TS Police 1.6K Fine-Tuning Snapshot ($dateIso)")
+                setRequestProperty("Title", "TS Police 1.6K Fine-Tuning Snapshot ($dateIso) [$triggerReason$reqSuffix]")
                 setRequestProperty("Content-Type", "application/json; charset=utf-8")
                 setFixedLengthStreamingMode(bytes.size)
             }
@@ -572,6 +781,97 @@ class TuningTelemetryManager(
                 put("distanceDeltaM", (trk.totalDistanceMeters - sam.distanceMeters).roundToInt())
             }
         }
+    }
+
+    private fun encodeDeepSamsungCache(
+        yesterdayIso: String,
+        todayIso: String,
+        deepSamsung: DeepSamsungTuningDataset
+    ): String {
+        val hourlyObj = JSONObject()
+        for ((k, b) in deepSamsung.intradayHourlyBuckets) {
+            if (b.steps > 0 || b.distanceMeters > 0.5) {
+                hourlyObj.put(
+                    k,
+                    JSONObject().apply {
+                        put("dateIso", b.dateIso)
+                        put("hourOfDay", b.hourOfDay)
+                        put("steps", b.steps)
+                        put("distanceMeters", round2(b.distanceMeters))
+                        put("walkSec", round2(b.walkSec))
+                        put("jogRunSec", round2(b.jogRunSec))
+                        put("maxSpeedMps", round3(b.maxSpeedMps))
+                        put("maxCadenceSpm", round2(b.maxCadenceSpm))
+                    }
+                )
+            }
+        }
+        fun encodeSpansArr(spans: List<com.tspolice.runtracker.health.RawHealthRecordSpan>): JSONArray {
+            val arr = JSONArray()
+            for (sp in spans) {
+                arr.put(
+                    JSONObject().apply {
+                        put("startLocal", sp.startLocalIso)
+                        put("endLocal", sp.endLocalIso)
+                        put("durationMin", round2(sp.durationMinutes))
+                        put("value", round2(sp.value))
+                        put("extra", sp.extra)
+                        put("sourcePkg", sp.sourcePkg)
+                    }
+                )
+            }
+            return arr
+        }
+        return JSONObject().apply {
+            put("yesterdayIso", yesterdayIso)
+            put("todayIso", todayIso)
+            put("hourly", hourlyObj)
+            put(
+                "rawSpans",
+                JSONObject().apply {
+                    put("steps", encodeSpansArr(deepSamsung.rawStepSpans48h))
+                    put("distances", encodeSpansArr(deepSamsung.rawDistanceSpans48h))
+                    put("exercises", encodeSpansArr(deepSamsung.rawExerciseSpans48h))
+                }
+            )
+        }.toString()
+    }
+
+    private fun decodeCachedSamsungHourly(yesterdayIso: String, todayIso: String): Map<String, SamsungHourlyBucket> {
+        val raw = repository.cachedDeepSamsung48hJson
+        if (raw.isBlank()) return emptyMap()
+        return runCatching {
+            val root = JSONObject(raw)
+            val hObj = root.optJSONObject("hourly") ?: return emptyMap()
+            val out = LinkedHashMap<String, SamsungHourlyBucket>()
+            for (k in hObj.keys()) {
+                val o = hObj.optJSONObject(k) ?: continue
+                val dIso = o.optString("dateIso")
+                if (dIso != yesterdayIso && dIso != todayIso) continue
+                out[k] = SamsungHourlyBucket(
+                    dateIso = dIso,
+                    hourOfDay = o.optInt("hourOfDay"),
+                    steps = o.optInt("steps"),
+                    distanceMeters = o.optDouble("distanceMeters"),
+                    walkSec = o.optDouble("walkSec"),
+                    jogRunSec = o.optDouble("jogRunSec"),
+                    maxSpeedMps = o.optDouble("maxSpeedMps"),
+                    maxCadenceSpm = o.optDouble("maxCadenceSpm")
+                )
+            }
+            out
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun decodeCachedRawSpansObj(yesterdayIso: String, todayIso: String): JSONObject? {
+        val raw = repository.cachedDeepSamsung48hJson
+        if (raw.isBlank()) return null
+        return runCatching {
+            val root = JSONObject(raw)
+            val cachedToday = root.optString("todayIso")
+            if (cachedToday != todayIso && cachedToday != yesterdayIso) return null
+            root.optJSONObject("rawSpans")
+        }.getOrNull()
     }
 
     private fun round2(v: Double): Double = kotlin.math.round(v * 100.0) / 100.0

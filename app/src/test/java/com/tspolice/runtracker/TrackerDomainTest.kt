@@ -15,6 +15,7 @@ import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
+import com.tspolice.runtracker.telemetry.TuningTelemetryManager
 import com.tspolice.runtracker.update.VersionComparator
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -1013,6 +1014,18 @@ class TrackerDomainTest {
                 }
             }
         }
+    }
+
+    @Test
+    fun `remote pull command parser extracts pull now request id and ignores keepalive frames`() {
+        val keepaliveLine = """{"id":"k1","time":1793415000,"event":"keepalive","topic":"tspolice-cmd-9f4c2e7b18a6d305e419"}"""
+        assertEquals(null, TuningTelemetryManager.parseRemotePullCommandLine(keepaliveLine))
+
+        val plainPullLine = """{"id":"m99","time":1793415123,"event":"message","topic":"tspolice-cmd-9f4c2e7b18a6d305e419","message":"PULL_NOW:a1b2c3d4e5"}"""
+        val parsed = TuningTelemetryManager.parseRemotePullCommandLine(plainPullLine)
+        assertNotNull(parsed)
+        assertEquals("a1b2c3d4e5", parsed!!.first)
+        assertEquals(1793415123L, parsed.second)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
