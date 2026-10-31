@@ -1143,6 +1143,100 @@ class TrackerDomainTest {
         assertTrue("Brisk walk should commit WALKING cleanly", walkCommitted)
     }
 
+    @Test
+    fun `stepping off parked bike with 2 mps gps jump unlocks continuous outdoor walk immediately and never traps in vehicle`() {
+        // 1. Reproduce exact Oct 31 17:36–18:09 SM-S911B dismount bug:
+        //    - Ride bike at 7.63 m/s -> park at 0.0 m/s for 12s -> initial 2.02 m/s GPS bounce while cad=0.0 -> walk at 1.29 m/s & 104 spm!
+        val classifier = GaitClassifier()
+        var nowMs = 1_000L
+        assertEquals(MotionState.VEHICLE, classifier.update(nowMs, gpsSpeedMps = 7.63, cadenceSpm = 0.0, dynamicAccelRms = 2.8))
+
+        // Park bike for 12s -> settles to STANDING with parkedStopCompleted = true
+        for (i in 1..30) {
+            nowMs += 400L
+            classifier.update(nowMs, gpsSpeedMps = 0.0, cadenceSpm = 0.0, dynamicAccelRms = 0.15)
+        }
+        assertEquals(MotionState.STANDING, classifier.currentState())
+
+        // Initial 2.02 m/s GPS bounce as user steps away (before 4 steps accumulate, cad = 0.0):
+        // MUST NOT re-latch VEHICLE or wipe parkedStopCompleted!
+        nowMs += 400L
+        val bounceState = classifier.update(nowMs, gpsSpeedMps = 2.02, cadenceSpm = 0.0, dynamicAccelRms = 1.67)
+        assertNotEquals("2.02 m/s walking startup GPS jump must NEVER re-latch VEHICLE!", MotionState.VEHICLE, bounceState)
+        assertFalse(classifier.isVehicleLatched())
+
+        // Continuous non-stop walk at 1.29 m/s & 104 spm unlocks WALKING within 4s
+        var unlockedState = MotionState.STANDING
+        for (i in 1..10) {
+            nowMs += 400L
+            unlockedState = classifier.update(nowMs, gpsSpeedMps = 1.29, cadenceSpm = 104.0, dynamicAccelRms = 2.1, p20RawNorm = 8.4)
+        }
+        assertEquals(MotionState.WALKING, unlockedState)
+        assertFalse(classifier.isInOrCoolingDownFromVehicle())
+
+        // 2. Fail-safe unparked escape: even if GPS completely missed the 4.5s parking stop under trees,
+        //    12.5s of steady 1.29 m/s + 104 spm footsteps escapes VEHICLE instead of trapping a 30-minute walk!
+        val unparkedClassifier = GaitClassifier()
+        var t2 = 50_000L
+        assertEquals(MotionState.VEHICLE, unparkedClassifier.update(t2, gpsSpeedMps = 6.8, cadenceSpm = 0.0, dynamicAccelRms = 3.1))
+        for (i in 1..12) { // first 4.8s -> stays VEHICLE (guards slowing bike crawl)
+            t2 += 400L
+            assertEquals(MotionState.VEHICLE, unparkedClassifier.update(t2, gpsSpeedMps = 1.29, cadenceSpm = 104.0, dynamicAccelRms = 2.1))
+        }
+        var escapedState = MotionState.VEHICLE
+        for (i in 1..22) { // reaches >12.0s sustained foot walk -> unlocks WALKING!
+            t2 += 400L
+            escapedState = unparkedClassifier.update(t2, gpsSpeedMps = 1.29, cadenceSpm = 104.0, dynamicAccelRms = 2.1)
+        }
+        assertEquals("Sustained >12s verified walking must escape unparked VEHICLE latch!", MotionState.WALKING, escapedState)
+        assertFalse(unparkedClassifier.isInOrCoolingDownFromVehicle())
+    }
+
+    @Test
+    fun `brisk evening power walk at 136 spm in loose pocket stays walking while aerial slow jog detects as jogging`() {
+        val classifier = GaitClassifier()
+
+        // 1. Reproduce Oct 31 18:14–18:24 brisk power-walk: 1.55..2.02 m/s, 134..139 spm, loose-pocket rms=3.55,
+        //    grounded p20RawNorm = 8.15 m/s^2 (no aerial flight phase) -> MUST stay WALKING in Open Mode!
+        for (cad in listOf(132.5, 136.5, 139.4)) {
+            val st = classifier.classifyInstant(
+                gpsSpeedMps = 1.62,
+                cadenceSpm = cad,
+                dynamicAccelRms = 3.55,
+                minRawNorm = 3.10,
+                peakToTroughNorm = 36.0,
+                p20RawNorm = 8.15,
+                isManualWorkoutActive = false
+            )
+            assertEquals("Brisk power-walk at $cad spm with grounded p20=8.15 must stay WALKING", MotionState.WALKING, st)
+        }
+        // Even a 2.02 m/s power-walk surge at 130 spm stays WALKING in passive Open Mode
+        assertEquals(
+            MotionState.WALKING,
+            classifier.classifyInstant(
+                gpsSpeedMps = 2.02,
+                cadenceSpm = 130.0,
+                dynamicAccelRms = 3.20,
+                p20RawNorm = 8.30,
+                isManualWorkoutActive = false
+            )
+        )
+
+        // 2. Genuine Slow-Jogging at 1.30 m/s walking speed: 146 spm + aerial unloading p20RawNorm = 5.90 m/s^2 -> JOGGING!
+        assertEquals(
+            MotionState.JOGGING,
+            classifier.classifyInstant(
+                gpsSpeedMps = 1.30,
+                cadenceSpm = 146.0,
+                dynamicAccelRms = 3.10,
+                minRawNorm = 2.40,
+                peakToTroughNorm = 24.0,
+                p20RawNorm = 5.90,
+                isManualWorkoutActive = false
+            )
+        )
+    }
+
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
         val is1600 = mode == RunMode.TIMED_1600M
         return RunSessionRecord(

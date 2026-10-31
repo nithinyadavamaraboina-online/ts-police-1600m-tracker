@@ -35,9 +35,11 @@ class GaitClassifier(
         const val MIN_WALKING_CADENCE_SPM = 68.0
         const val SLOW_JOG_CADENCE_SPM = 136.0
         const val SLOW_JOG_MIN_BOUNCE_RMS = 1.85
-        const val BOUNCY_SLOW_JOG_CADENCE_SPM = 132.0
-        const val BOUNCY_SLOW_JOG_RMS = 2.45
-        const val JOG_RETENTION_CADENCE_SPM = 126.0
+        const val OPEN_MODE_SLOW_JOG_CADENCE_SPM = 140.0
+        const val OPEN_MODE_SLOW_JOG_MIN_RMS = 2.10
+        const val OPEN_MODE_SLOW_JOG_MAX_P20_NORM = 7.00
+        const val JOG_RETENTION_CADENCE_SPM = 128.0
+        const val OPEN_MODE_JOG_RETENTION_CADENCE_SPM = 135.0
         const val JOG_RETENTION_BOUNCE_RMS = 1.65
 
         // Temporal Hysteresis Debounce Windows (ms)
@@ -47,8 +49,10 @@ class GaitClassifier(
         const val DOWNGRADE_DEBOUNCE_MS = 2000L          // Resists brief turns/glances; manual workouts extend stand hold to 3.5s
 
         // Open-Mode Vehicle Latch & Dismount Verification
-        const val PARKED_STOP_REQUIRED_MS = 4500L        // 4.5s parked (<0.85 m/s) before on-foot dismount unlocks
+        const val PARKED_STOP_REQUIRED_MS = 4500L        // 4.5s parked (<0.85 m/s) before fast on-foot dismount unlocks
         const val DISMOUNT_FOOT_CONFIRM_MS = 3500L       // 3.5s (~6 real steps) of verified walk/jog unlocks foot mode
+        const val UNPARKED_FOOT_ESCAPE_MS = 12_000L      // 12s (~20 real steps at walking GPS speed) fail-safe dismount escape
+        const val COOLDOWN_RELATCH_SPEED_MPS = 2.55      // >=9.2 km/h required to re-latch vehicle after parking (ignores 2.0 m/s walk GPS jump)
         const val VEHICLE_COOLDOWN_EXPIRY_MS = 150_000L  // 2.5-min traffic-light memory in passive 24/7 mode
     }
 
@@ -65,6 +69,7 @@ class GaitClassifier(
     private var continuousStoppedMs: Long = 0L
     private var parkedStopCompleted: Boolean = false
     private var dismountFootConfirmMs: Long = 0L
+    private var unparkedFootEscapeMs: Long = 0L
 
     fun currentState(): MotionState = committedState
 
@@ -88,6 +93,7 @@ class GaitClassifier(
         parkedStopCompleted = false
         continuousStoppedMs = 0L
         dismountFootConfirmMs = 0L
+        unparkedFootEscapeMs = 0L
         if (committedState == MotionState.VEHICLE || candidateState == MotionState.VEHICLE) {
             committedState = MotionState.STANDING
             candidateState = MotionState.STANDING
@@ -106,13 +112,14 @@ class GaitClassifier(
         continuousStoppedMs = 0L
         parkedStopCompleted = false
         dismountFootConfirmMs = 0L
+        unparkedFootEscapeMs = 0L
     }
 
     /**
      * Instant biomechanical classification before temporal hysteresis:
      *  - Explicit manual workouts (`isManualWorkoutActive = true`) NEVER false-trigger `VEHICLE` at human speeds.
-     *  - Detects Slow-Jogging at Walking Speed (`0.0–1.85 m/s`) via spring-mass bounce (`>=133 spm & RMS >=3.0`
-     *    or `>=125 spm & RMS >=3.75`) so jogging slowly or spot-jogging is classified as `JOGGING`, not `WALKING`.
+     *  - Detects Slow-Jogging at Walking Speed (`0.0–1.85 m/s`) via spring-mass bounce + aerial unloading (`p20RawNorm`)
+     *    while keeping brisk loose-pocket power-walking (`125–139 spm`, grounded `p20RawNorm ~ 7.3–9.6`) cleanly in `WALKING`.
      *  - Uses Schmitt-trigger retention when `alreadyJogOrRun` is true so `JOGGING` never flickers down to `WALKING`.
      *  - Separates motorcycles/scooters in passive mode via step absence, impossible >2.10m stride, seated low-bounce
      *    cruising, and high-frequency (>6 Hz) engine vibration dominance — NEVER overriding real running footsteps!
@@ -135,14 +142,26 @@ class GaitClassifier(
         val impliedStepSpeed = estimateSpeedFromStepsMps(cadenceSpm, dynamicAccelRms)
 
         // Spring-mass bounce signature at walking ground speeds:
-        // IMPORTANT: Loose shorts/track-pants pocket pendulum slap during pure 100 spm walking routinely produces
-        // `rms = 2.5..3.5 m/s^2`, `minRawNorm = 1.2..3.9 m/s^2`, and `peakToTrough = 30..51 m/s^2`!
-        // Therefore, Slow-Jogging at walking speed MUST have genuine jogging step turnover (`>= 132..136 spm` from
-        // the hardware pedometer), NEVER acceleration spikes alone at 95..120 spm walking cadence!
-        val hasSpringMassJogBounce =
+        //  - In loose shorts/track pants, brisk walking (`125..139 spm`, `1.45..1.85 m/s`) produces brief `<80ms`
+        //    thigh-slap spikes (`rms = 3.0..3.9`, `minRawNorm = 2.0..4.5`), BUT because one foot is always grounded,
+        //    the 20th-percentile gravity norm (`p20RawNorm`) stays grounded around `7.25..9.60 m/s^2`.
+        //  - True Slow-Jogging unloads the body center-of-mass for 35–45% of every step (`p20RawNorm <= 7.00 m/s^2`)
+        //    with genuine jogging turnover (`>= 140 spm` in Open Mode; `>= 136 spm` in explicit Manual Workouts).
+        val hasSpringMassJogBounce = if (isManualWorkoutActive) {
             (cadenceSpm >= SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= SLOW_JOG_MIN_BOUNCE_RMS) ||
-                (cadenceSpm >= BOUNCY_SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= BOUNCY_SLOW_JOG_RMS) ||
                 (alreadyJogOrRun && cadenceSpm >= JOG_RETENTION_CADENCE_SPM && dynamicAccelRms >= JOG_RETENTION_BOUNCE_RMS)
+        } else {
+            val aerialUnloaded = p20RawNorm == null || p20RawNorm <= OPEN_MODE_SLOW_JOG_MAX_P20_NORM
+            val handHeldFastTurnover = cadenceSpm >= 150.0 && dynamicAccelRms >= 2.60 &&
+                (p20RawNorm == null || p20RawNorm <= 7.45)
+            val openRetention = alreadyJogOrRun &&
+                cadenceSpm >= OPEN_MODE_JOG_RETENTION_CADENCE_SPM &&
+                dynamicAccelRms >= JOG_RETENTION_BOUNCE_RMS &&
+                (p20RawNorm == null || p20RawNorm <= 7.25)
+            (cadenceSpm >= OPEN_MODE_SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= OPEN_MODE_SLOW_JOG_MIN_RMS && aerialUnloaded) ||
+                handHeldFastTurnover ||
+                openRetention
+        }
 
         if (hasValidGps) {
             val gps = gpsSpeedMps!!
@@ -247,11 +266,15 @@ class GaitClassifier(
             // Case 2: Outdoor forward movement at Walking ground speed (0.45 .. 2.15 m/s = 1.6 .. 7.7 km/h):
             //  - If the runner is bouncing with jogging cadence (`hasSpringMassJogBounce`), it IS Slow-Jogging (`JOGGING`)
             //    even at 1.1 m/s walking speed! (And capped at JOGGING so 162 spm slow-jogging doesn't fake 11 km/h RUNNING.)
+            //  - In passive Open Mode, brisk power-walking up to ~2.05 m/s with <136 spm walking cadence stays WALKING!
             if (gps < 2.15) {
-                return if (gps >= DEFAULT_JOGGING_SPEED_MPS ||
-                    (alreadyJogOrRun && gps >= JOG_RETENTION_SPEED_MPS) ||
-                    hasSpringMassJogBounce
-                ) {
+                val speedPromotesJog = if (isManualWorkoutActive) {
+                    gps >= DEFAULT_JOGGING_SPEED_MPS || (alreadyJogOrRun && gps >= JOG_RETENTION_SPEED_MPS)
+                } else {
+                    (gps >= 1.98 && cadenceSpm >= 136.0 && dynamicAccelRms >= 2.0) ||
+                        (alreadyJogOrRun && gps >= 1.80 && cadenceSpm >= 134.0)
+                }
+                return if (speedPromotesJog || hasSpringMassJogBounce) {
                     MotionState.JOGGING
                 } else {
                     MotionState.WALKING
@@ -385,6 +408,7 @@ class GaitClassifier(
         if (!isManualWorkoutActive && (vehicleLatchActive || vehicleCooldownActive)) {
             val hasGps = gpsSpeedMps != null && gpsSpeedMps.isFinite() && gpsSpeedMps >= 0.0
             val gps = gpsSpeedMps ?: -1.0
+            val noEngineDominance = hfVibrationRms == null || hfVibrationRms <= dynamicAccelRms * 1.10
             val isStoppedSpeed = (hasGps && gps < 0.85) ||
                 (!hasGps && dynamicAccelRms < 0.75 && cadenceSpm < 50.0)
 
@@ -394,6 +418,7 @@ class GaitClassifier(
                     parkedStopCompleted = true
                 }
                 dismountFootConfirmMs = 0L
+                unparkedFootEscapeMs = 0L
 
                 if (parkedStopCompleted && continuousStoppedMs >= 10_000L && cadenceSpm < 45.0) {
                     vehicleLatchActive = false
@@ -404,22 +429,49 @@ class GaitClassifier(
                 return committedState
             }
 
-            // Moving without having parked for >= 4.5s first -> still slowing down / crawling on the bike!
+            // Moving without having parked for >= 4.5s first:
+            //  - Slowing/crawling on a bike (or losing GPS in an underpass) stays VEHICLE.
+            //  - FAIL-SAFE ESCAPE: if GPS missed the brief parking stop under trees/buildings, 12.0s (~20 consecutive
+            //    rhythmic footsteps) of verified human walking speed (`0.50..2.05 m/s`) unlocks WALKING cleanly so a
+            //    continuous outdoor walk is NEVER trapped in VEHICLE for 30 minutes!
             if (!parkedStopCompleted) {
-                enterOrRefreshVehicleLatch(nowMs)
-                return MotionState.VEHICLE
+                val sustainedUnparkedFootWalk = hasGps &&
+                    gps in 0.50..2.05 &&
+                    cadenceSpm in 74.0..142.0 &&
+                    dynamicAccelRms in 0.80..5.8 &&
+                    noEngineDominance
+                if (sustainedUnparkedFootWalk) {
+                    unparkedFootEscapeMs += dtMs
+                    if (unparkedFootEscapeMs >= UNPARKED_FOOT_ESCAPE_MS) {
+                        vehicleLatchActive = false
+                        vehicleCooldownActive = false
+                        parkedStopCompleted = false
+                        continuousStoppedMs = 0L
+                        dismountFootConfirmMs = 0L
+                        unparkedFootEscapeMs = 0L
+                        committedState = MotionState.WALKING
+                        candidateState = MotionState.WALKING
+                        candidateSinceMs = nowMs
+                        return MotionState.WALKING
+                    }
+                    committedState = MotionState.VEHICLE
+                    candidateState = MotionState.VEHICLE
+                    return MotionState.VEHICLE
+                } else {
+                    enterOrRefreshVehicleLatch(nowMs)
+                    return MotionState.VEHICLE
+                }
             }
 
             // Bike DID park >= 4.5s: check if rider genuinely stepped off and started walking or jogging on foot!
-            val noEngineDominance = hfVibrationRms == null || hfVibrationRms <= dynamicAccelRms * 1.10
             val plausibleDismountWalk = raw == MotionState.WALKING &&
-                cadenceSpm in 70.0..138.0 &&
-                dynamicAccelRms in 0.70..5.5 &&
-                (!hasGps || gps in 0.45..1.95) &&
+                cadenceSpm in 70.0..140.0 &&
+                dynamicAccelRms in 0.70..5.8 &&
+                (!hasGps || gps in 0.45..2.12) &&
                 noEngineDominance
             val plausibleDismountJog = raw.isJogOrRun() &&
-                cadenceSpm in 130.0..195.0 &&
-                dynamicAccelRms >= 3.2 &&
+                cadenceSpm in 135.0..195.0 &&
+                dynamicAccelRms >= 2.8 &&
                 (!hasGps || gps in 0.50..4.50) &&
                 (minRawNorm != null && minRawNorm <= 6.8) &&
                 noEngineDominance
@@ -433,6 +485,7 @@ class GaitClassifier(
                     parkedStopCompleted = false
                     continuousStoppedMs = 0L
                     dismountFootConfirmMs = 0L
+                    unparkedFootEscapeMs = 0L
                     committedState = unlockedState
                     candidateState = unlockedState
                     candidateSinceMs = nowMs
@@ -441,7 +494,9 @@ class GaitClassifier(
                 return committedState
             } else {
                 dismountFootConfirmMs = 0L
-                if (hasGps && gps >= 1.90) {
+                // Require >= 2.55 m/s (9.2 km/h) to re-latch VEHICLE from parked cooldown so an initial ~2.0 m/s GPS
+                // jump when stepping away from a parked bike NEVER wipes `parkedStopCompleted`!
+                if (hasGps && gps >= COOLDOWN_RELATCH_SPEED_MPS) {
                     enterOrRefreshVehicleLatch(nowMs)
                     return MotionState.VEHICLE
                 }
@@ -488,6 +543,7 @@ class GaitClassifier(
         continuousStoppedMs = 0L
         parkedStopCompleted = false
         dismountFootConfirmMs = 0L
+        unparkedFootEscapeMs = 0L
     }
 
     /**
@@ -885,17 +941,27 @@ class MotionSignalProcessor {
             rawIntervals[i] = (queue[startIdx + i + 1] - queue[startIdx + i]).toDouble()
         }
 
-        // Heal isolated 1-step or 2-step hardware sensor drops:
-        //  - For jogging/running (`refPeriodMs <= 445ms` = >=135 spm), split 2x (~800ms) or 3x (~1200ms) dropped steps.
-        //  - For walking (`refPeriodMs > 445ms`), ONLY split genuine >980ms / >1450ms missed-step gaps so asymmetric
-        //    left/right pocket walking steps (e.g. 430ms, 740ms) are NEVER halved into fake 370ms (162 spm) jogging!
+        // Heal isolated 1-step or 2-step hardware sensor drops (requires >= 3 intervals / >= 4 steps):
+        //  - Use true even/odd median so 2-interval `[400ms, 720ms]` startup walks never anchor on `400ms`!
+        //  - For jogging/running (`refPeriodMs <= 430ms` = >=140 spm), split 2x (~800ms) or 3x (~1200ms) dropped steps.
+        //  - For walking (`refPeriodMs > 430ms`), ONLY split genuine >980ms / >1450ms missed-step gaps so asymmetric
+        //    left/right pocket walking steps (e.g. 435ms, 760ms) are NEVER halved into fake 380ms (158 spm) jogging!
         val sortedRaw = rawIntervals.sortedArray()
-        val refPeriodMs = sortedRaw[(sortedRaw.size - 1) / 2].coerceAtLeast(285.0)
+        val mid = sortedRaw.size / 2
+        val medianPeriodMs = if (sortedRaw.size % 2 == 1) {
+            sortedRaw[mid]
+        } else {
+            (sortedRaw[mid - 1] + sortedRaw[mid]) / 2.0
+        }
+        val refPeriodMs = medianPeriodMs.coerceAtLeast(285.0)
+        val allowDropSplit = rawIntervals.size >= 3
         val healedIntervals = ArrayList<Double>(rawIntervals.size + 4)
         for (dt in rawIntervals) {
             val ratio = dt / refPeriodMs
-            val canSplit2x = ratio in 1.70..2.36 && (dt >= 980.0 || (refPeriodMs <= 445.0 && dt / 2.0 >= 335.0))
-            val canSplit3x = ratio in 2.70..3.36 && (dt >= 1450.0 || (refPeriodMs <= 445.0 && dt / 3.0 >= 335.0))
+            val canSplit2x = allowDropSplit && ratio in 1.70..2.36 &&
+                (dt >= 980.0 || (refPeriodMs <= 430.0 && dt / 2.0 >= 335.0))
+            val canSplit3x = allowDropSplit && ratio in 2.70..3.36 &&
+                (dt >= 1450.0 || (refPeriodMs <= 430.0 && dt / 3.0 >= 335.0))
             when {
                 canSplit2x -> {
                     healedIntervals.add(dt / 2.0)

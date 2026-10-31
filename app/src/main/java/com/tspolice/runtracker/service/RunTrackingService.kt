@@ -1046,15 +1046,25 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         lastStepCounterHwValue = null
     }
 
+    private fun resolveSensorTimestampMs(event: SensorEvent, fallbackNowMs: Long): Long {
+        val eventMs = event.timestamp / 1_000_000L
+        return if (eventMs > 0L && abs(fallbackNowMs - eventMs) <= 20_000L) {
+            eventMs.coerceAtMost(fallbackNowMs)
+        } else {
+            fallbackNowMs
+        }
+    }
+
     override fun onSensorChanged(event: SensorEvent) {
         val nowMs = SystemClock.elapsedRealtime()
+        val sensorMs = resolveSensorTimestampMs(event, nowMs)
         when (event.sensor.type) {
             Sensor.TYPE_STEP_DETECTOR -> {
                 val steps = event.values.firstOrNull()?.toInt()?.coerceAtLeast(1) ?: 1
                 if (!repository.hasVerifiedHardwarePedometer) {
                     repository.hasVerifiedHardwarePedometer = true
                 }
-                signalProcessor.onHardwareStepDetected(nowMs, steps)
+                signalProcessor.onHardwareStepDetected(sensorMs, steps)
                 wakeFromLowPowerStandby()
             }
             Sensor.TYPE_STEP_COUNTER -> {
@@ -1066,7 +1076,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                         repository.hasVerifiedHardwarePedometer = true
                     }
                     val alreadyCounted = (signalProcessor.totalSteps - stepsAtLastStepCounter).coerceAtLeast(0)
-                    signalProcessor.reconcileStepCounterDelta(nowMs, hwDelta, alreadyCounted)
+                    signalProcessor.reconcileStepCounterDelta(sensorMs, hwDelta, alreadyCounted)
                     if (hwDelta > 0) wakeFromLowPowerStandby()
                 }
                 lastStepCounterHwValue = cumulative
@@ -1074,7 +1084,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             }
             Sensor.TYPE_LINEAR_ACCELERATION -> {
                 val step = signalProcessor.onAccelerationSample(
-                    nowMs = nowMs,
+                    nowMs = sensorMs,
                     ax = event.values[0],
                     ay = event.values[1],
                     az = event.values[2],
@@ -1084,13 +1094,13 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             }
             Sensor.TYPE_ACCELEROMETER -> {
                 val step = signalProcessor.onAccelerationSample(
-                    nowMs = nowMs,
+                    nowMs = sensorMs,
                     ax = event.values[0],
                     ay = event.values[1],
                     az = event.values[2],
                     includesGravity = true
                 )
-                if (step || (isLowPowerStandby && signalProcessor.getDynamicAccelRms(nowMs) >= 0.75)) {
+                if (step || (isLowPowerStandby && signalProcessor.getDynamicAccelRms(sensorMs) >= 0.75)) {
                     wakeFromLowPowerStandby()
                 }
             }
@@ -1641,34 +1651,38 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private fun flushOpenBoutIfQualified() {
         if (openBoutStartedWallMs > 0L && openBoutJogRunMeters >= 600.0 && openBoutActiveSec >= 90.0) {
             val avgCad = if (openBoutCadenceCount > 0) openBoutCadenceSum / openBoutCadenceCount else 155.0
-            val equiv = TsPoliceBenchmark.computeEquiv1600mSec(
-                distanceMeters = openBoutJogRunMeters,
-                activeDurationSec = openBoutActiveSec,
-                first1600mSplitSec = openBoutFirst1600Sec
-            )
-            val savedId = repository.insertSession(
-                RunSessionRecord(
-                    startedAtEpochMs = openBoutStartedWallMs,
-                    dateIso = dailyDateIso.ifBlank { LocalDate.now().toString() },
-                    mode = RunMode.OPEN_PRACTICE,
+            val avgSpeedMps = openBoutJogRunMeters / openBoutActiveSec
+            val isGenuineJogOrRunBout = openBoutRunSec >= 5.0 || avgSpeedMps >= 2.05 || avgCad >= 138.0
+            if (isGenuineJogOrRunBout) {
+                val equiv = TsPoliceBenchmark.computeEquiv1600mSec(
                     distanceMeters = openBoutJogRunMeters,
                     activeDurationSec = openBoutActiveSec,
-                    pausedDurationSec = openBoutPausedSec,
-                    first1600mSplitSec = openBoutFirst1600Sec,
-                    equiv1600mSec = equiv,
-                    avgCadenceSpm = avgCad,
-                    maxSpeedMps = openBoutMaxSpeed,
-                    runningSec = openBoutRunSec,
-                    joggingSec = openBoutJogSec,
-                    walkingSec = openBoutWalkSec,
-                    lapSplits = emptyList(),
-                    notes = "All-Day Auto-Detected Run (${openBoutJogRunMeters.toInt()}m)",
-                    isDemo = false
+                    first1600mSplitSec = openBoutFirst1600Sec
                 )
-            )
-            lastCompletedSessionId = savedId
-            persistDailySummaryNow()
-            triggerBackgroundAutoTelemetryIfDue(reason = "open_run_finished", force = true)
+                val savedId = repository.insertSession(
+                    RunSessionRecord(
+                        startedAtEpochMs = openBoutStartedWallMs,
+                        dateIso = dailyDateIso.ifBlank { LocalDate.now().toString() },
+                        mode = RunMode.OPEN_PRACTICE,
+                        distanceMeters = openBoutJogRunMeters,
+                        activeDurationSec = openBoutActiveSec,
+                        pausedDurationSec = openBoutPausedSec,
+                        first1600mSplitSec = openBoutFirst1600Sec,
+                        equiv1600mSec = equiv,
+                        avgCadenceSpm = avgCad,
+                        maxSpeedMps = openBoutMaxSpeed,
+                        runningSec = openBoutRunSec,
+                        joggingSec = openBoutJogSec,
+                        walkingSec = openBoutWalkSec,
+                        lapSplits = emptyList(),
+                        notes = "All-Day Auto-Detected Run (${openBoutJogRunMeters.toInt()}m)",
+                        isDemo = false
+                    )
+                )
+                lastCompletedSessionId = savedId
+                persistDailySummaryNow()
+                triggerBackgroundAutoTelemetryIfDue(reason = "open_run_finished", force = true)
+            }
         }
         resetOpenBout()
     }
