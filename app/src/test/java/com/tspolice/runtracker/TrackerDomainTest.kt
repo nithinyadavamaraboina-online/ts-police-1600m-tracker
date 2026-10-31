@@ -1028,6 +1028,116 @@ class TrackerDomainTest {
         assertEquals(1793415123L, parsed.second)
     }
 
+    @Test
+    fun `android 16 full day future end time record clamping and legacy 080x stride scale healing work cleanly`() {
+        // 1. Samsung Health Android 16 stamps Today's daily StepsRecord as [00:00 .. 23:59:59.999] (future endTime!).
+        //    effectiveRecordEndEpochMs clamps future endTime to `nowMs` so intraday buckets never lose 63% of Today's steps!
+        val dayStartMs = 1_793_385_000_000L // 00:00 local
+        val midnightFutureMs = dayStartMs + 86_399_999L // 23:59:59.999 tonight
+        val morningNowMs = dayStartMs + (8L * 3600_000L + 50L * 60_000L) // 08:50 AM
+        assertEquals(
+            morningNowMs,
+            SamsungHealthComparator.effectiveRecordEndEpochMs(dayStartMs, midnightFutureMs, morningNowMs)
+        )
+        // Past completed day (Yesterday 00:00 .. 23:59:59.999 < morningNowMs) stays untouched
+        val yestStartMs = dayStartMs - 86_400_000L
+        val yestEndMs = dayStartMs - 1L
+        assertEquals(
+            yestEndMs,
+            SamsungHealthComparator.effectiveRecordEndEpochMs(yestStartMs, yestEndMs, morningNowMs)
+        )
+
+        // 2. When Samsung Health has only passive-estimated distance (0 raw DistanceRecords) and a legacy
+        //    pre-fix partial sync had pinned stride scale to 0.801x, multi-day calibration heals to runner height scale!
+        val yestTrk = DailyActivitySummary(dateIso = "2026-10-30", walkingSec = 1990.0, walkingMeters = 2594.0, totalSteps = 5621)
+        val todayTrk = DailyActivitySummary(dateIso = "2026-10-31", walkingSec = 2152.0, joggingSec = 286.0, walkingMeters = 2593.0, joggingMeters = 350.0, totalSteps = 4558)
+        val yestSam = SamsungDailySnapshot(dateIso = "2026-10-30", steps = 5925, distanceMeters = 4555.0, rawHealthConnectDistanceMeters = 0.0, distanceIncludedPassiveEstimate = true)
+        val todaySam = SamsungDailySnapshot(dateIso = "2026-10-31", steps = 4697, distanceMeters = 3611.0, rawHealthConnectDistanceMeters = 0.0, distanceIncludedPassiveEstimate = true)
+
+        assertFalse(SamsungHealthComparator.hasCompleteRawDistanceForCalibration(yestSam))
+        assertFalse(SamsungHealthComparator.hasCompleteRawDistanceForCalibration(todaySam))
+
+        val height174Scale = TsPoliceBenchmark.heightStrideScale(174) // ~1.0116x
+        val healedScale = SamsungHealthComparator.computeMultiDayCalibratedStrideScale(
+            yesterdayTracker = yestTrk,
+            yesterdaySamsung = yestSam,
+            todayTracker = todayTrk,
+            todaySamsung = todaySam,
+            currentStrideScale = 0.8013,
+            fallbackHeightScale = height174Scale
+        )
+        assertEquals(height174Scale, healedScale, 0.005)
+    }
+
+    @Test
+    fun `pavement slow jogging with pocket single leg half counted steps and sharp heel shock stays jogging without ping pong`() {
+        val dsp = MotionSignalProcessor().apply {
+            hardwareStepSensorAvailable = true
+            verifiedHardwarePedometerActive = true
+        }
+        val classifier = GaitClassifier()
+
+        // Reproduce exact Oct 31 morning telemetry (07:28-08:03 on SM-S911B):
+        //  - User slow-jogs at ~1.12 m/s (148 spm = 405ms true step period) on pavement
+        //  - Sharp asphalt heel-strike spikes rawNorm up to ~38 m/s^2 while aerial flight unloads minRawNorm to ~2.8 m/s^2
+        //  - Pocket step_detector only catches same-side leg (~74..102 spm) AND pauses batching for 2.5s mid-bout!
+        val stepPeriodMs = 405L
+        var nextTrueStepMs = 405L
+        var stepNum = 0
+        var jogCommitted = false
+
+        for (i in 0..550) {
+            val tMs = i * 20L
+            val phaseInStep = (tMs % stepPeriodMs).toDouble() / stepPeriodMs
+            // Realistic pavement slow-jog waveform: aerial unloading (~2.6 m/s^2) + sharp 36 m/s^2 impact spike!
+            val ay = when {
+                phaseInStep < 0.12 -> 36.5f // sharp heel/midfoot asphalt strike!
+                phaseInStep < 0.45 -> 13.5f
+                phaseInStep < 0.80 -> 2.65f // aerial flight unloading!
+                else -> 8.5f
+            }
+            dsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
+
+            if (tMs >= nextTrueStepMs) {
+                stepNum++
+                // Simulate pocket single-leg half-counting (drops every odd step after step 6)
+                // PLUS a complete 2.4s hardware step batching pause at steps 18..23!
+                val inBatchPause = stepNum in 18..23
+                val halfCountDrop = stepNum > 6 && (stepNum % 2 == 1)
+                if (!inBatchPause && !halfCountDrop) {
+                    dsp.onHardwareStepDetected(tMs, 1)
+                }
+                nextTrueStepMs += stepPeriodMs
+            }
+
+            if (tMs >= 1600L && i % 10 == 0) {
+                val cad = dsp.getCadenceSpm(tMs)
+                val rms = dsp.getDynamicAccelRms(tMs)
+                val state = classifier.update(
+                    nowMs = tMs,
+                    gpsSpeedMps = 1.12,
+                    cadenceSpm = cad,
+                    dynamicAccelRms = rms,
+                    minRawNorm = dsp.getMinRawNorm(tMs),
+                    peakToTroughNorm = dsp.getPeakToTroughNorm(tMs),
+                    p20RawNorm = dsp.getP20RawNorm(tMs),
+                    hfVibrationRms = dsp.getHighFreqVibrationRms(tMs),
+                    isManualWorkoutActive = false
+                )
+                if (state == MotionState.JOGGING) jogCommitted = true
+                if (jogCommitted) {
+                    assertEquals(
+                        "Pavement slow-jog must NEVER ping-pong to WALKING or STANDING at ${tMs}ms (cad=$cad, rms=$rms)",
+                        MotionState.JOGGING,
+                        state
+                    )
+                }
+                assertTrue("Cadence must never spike to fake >205 spm, got $cad", cad <= 205.0)
+            }
+        }
+        assertTrue("Slow-jogging should commit JOGGING cleanly", jogCommitted)
+    }
+
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
         val is1600 = mode == RunMode.TIMED_1600M
         return RunSessionRecord(

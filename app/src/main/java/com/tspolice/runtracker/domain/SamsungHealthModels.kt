@@ -74,10 +74,29 @@ object SamsungHealthComparator {
     const val SAMSUNG_HEALTH_PACKAGE = "com.sec.android.app.shealth"
     const val HEALTH_CONNECT_PACKAGE = "com.google.android.apps.healthdata"
 
-    const val MIN_STRIDE_SCALE = 0.80
+    const val MIN_STRIDE_SCALE = 0.88
     const val MAX_STRIDE_SCALE = 1.25
     private const val DEFAULT_UNSCALED_WALK_STRIDE_M = 0.77
     private const val DEFAULT_UNSCALED_RUN_STRIDE_M = 1.14
+
+    /**
+     * Samsung Health on Android 15/16 writes Today's ongoing daily `StepsRecord` / `DistanceRecord`
+     * with a 24-hour span `[00:00 .. 23:59:59.999]` whose `endTime` is in the future (midnight tonight).
+     * Clamping future `recordEndMs` to `nowEpochMs` prevents time-slicing logic from discarding Today's
+     * already-completed steps into future hours!
+     */
+    fun effectiveRecordEndEpochMs(
+        recordStartMs: Long,
+        recordEndMs: Long,
+        nowEpochMs: Long
+    ): Long {
+        if (recordEndMs <= recordStartMs) return recordStartMs + 1L
+        return if (recordStartMs <= nowEpochMs && recordEndMs > nowEpochMs + 60_000L) {
+            max(recordStartMs + 60_000L, nowEpochMs)
+        } else {
+            recordEndMs
+        }
+    }
 
     fun combineDailySummaries(
         yesterday: DailyActivitySummary,
@@ -122,7 +141,7 @@ object SamsungHealthComparator {
         )
     }
 
-    private fun hasCompleteRawDistanceForCalibration(snap: SamsungDailySnapshot?): Boolean {
+    fun hasCompleteRawDistanceForCalibration(snap: SamsungDailySnapshot?): Boolean {
         if (snap == null || snap.steps < 250 || snap.rawHealthConnectDistanceMeters < 150.0) return false
         if (snap.distanceIncludedPassiveEstimate) return false
         val rawStride = snap.rawHealthConnectDistanceMeters / snap.steps
@@ -132,14 +151,16 @@ object SamsungHealthComparator {
     /**
      * Uses only days whose raw Health Connect DistanceRecord covers the whole day's steps (`0.62..1.52 m/step`),
      * preventing Samsung Health's intra-day workout-only DistanceRecords (e.g. 2.1km walk out of 6,000 steps)
-     * from dragging down personal stride calibration!
+     * from dragging down personal stride calibration! If neither day has complete raw distance and a legacy
+     * pre-fix scale was stuck near the old 0.80x floor, heals cleanly back to [fallbackHeightScale].
      */
     fun computeMultiDayCalibratedStrideScale(
         yesterdayTracker: DailyActivitySummary,
         yesterdaySamsung: SamsungDailySnapshot?,
         todayTracker: DailyActivitySummary,
         todaySamsung: SamsungDailySnapshot?,
-        currentStrideScale: Double = 1.0
+        currentStrideScale: Double = 1.0,
+        fallbackHeightScale: Double = 1.0
     ): Double {
         val yestValid = hasCompleteRawDistanceForCalibration(yesterdaySamsung)
         val todayValid = hasCompleteRawDistanceForCalibration(todaySamsung)
@@ -152,6 +173,7 @@ object SamsungHealthComparator {
             }
             yestValid -> computeCalibratedStrideScale(yesterdayTracker, yesterdaySamsung!!, currentStrideScale)
             todayValid -> computeCalibratedStrideScale(todayTracker, todaySamsung!!, currentStrideScale)
+            currentStrideScale < 0.89 -> fallbackHeightScale.coerceIn(MIN_STRIDE_SCALE, MAX_STRIDE_SCALE)
             else -> currentStrideScale.coerceIn(MIN_STRIDE_SCALE, MAX_STRIDE_SCALE)
         }
     }

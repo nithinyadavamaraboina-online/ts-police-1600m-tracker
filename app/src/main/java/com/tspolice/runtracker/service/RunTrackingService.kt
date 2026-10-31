@@ -1403,7 +1403,10 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 jogRunMeters = hb.jogRunMeters + if (stepFallbackDeltaM > 0.0 && effStateForDist.isJogOrRun()) stepFallbackDeltaM else 0.0,
                 strideMeters = hb.strideMeters + stepFallbackDeltaM,
                 maxSpeedMps = max(hb.maxSpeedMps, effectiveSpeedMps),
-                maxCadenceSpm = if (!inVehicleOrCooldown) max(hb.maxCadenceSpm, cadenceSpm) else hb.maxCadenceSpm,
+                maxCadenceSpm = if (!inVehicleOrCooldown && state.countsAsActiveMovement) {
+                    val cappedCad = if (state.isJogOrRun() || effectiveSpeedMps >= 2.15) cadenceSpm else cadenceSpm.coerceAtMost(165.0)
+                    max(hb.maxCadenceSpm, cappedCad)
+                } else hb.maxCadenceSpm,
                 maxAccelRms = max(hb.maxAccelRms, accelRms)
             )
             if (countStepNow || state != MotionState.STANDING || stepFallbackDeltaM > 0.0) {
@@ -1437,8 +1440,15 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 ) {
                     dailyMaxSpeedMps = effectiveSpeedMps
                 }
-                if (cadenceSpm in 68.0..235.0 && cadenceSpm > dailyMaxCadenceSpm) {
-                    dailyMaxCadenceSpm = cadenceSpm
+                if (cadenceSpm in 68.0..210.0) {
+                    val cappedDailyCad = if (state.isJogOrRun() || effectiveSpeedMps >= 2.15) {
+                        cadenceSpm
+                    } else {
+                        cadenceSpm.coerceAtMost(165.0)
+                    }
+                    if (cappedDailyCad > dailyMaxCadenceSpm) {
+                        dailyMaxCadenceSpm = cappedDailyCad
+                    }
                 }
                 dailyDirty = true
             }

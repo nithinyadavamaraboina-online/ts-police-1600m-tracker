@@ -179,8 +179,11 @@ class SamsungHealthSyncManager(
 
         return try {
             val twoDayStart = yesterday.atStartOfDay(zone).toInstant()
+            val tomorrowStart = today.plusDays(1).atStartOfDay(zone).toInstant()
             val nowInstant = Instant.now().let { if (it.isAfter(twoDayStart)) it else twoDayStart.plusSeconds(1) }
-            val twoDayFilter = TimeRangeFilter.between(twoDayStart, nowInstant)
+            // Include Today's full calendar day [00:00..24:00) so Samsung Health's 24h daily StepsRecord
+            // (00:00..23:59:59.999) is never pro-rated down by time-of-day!
+            val twoDayFilter = TimeRangeFilter.between(twoDayStart, maxOf(nowInstant, tomorrowStart))
             val selfPkg = context.packageName
             val canReadExercise = HealthPermission.getReadPermission(ExerciseSessionRecord::class) in granted
 
@@ -248,12 +251,17 @@ class SamsungHealthSyncManager(
                 "Health Connect"
             }
 
-            // Pull Yesterday [00:00..24:00) AND Today [00:00..now) cleanly
+            // Pull Yesterday [00:00..24:00) AND Today [00:00..24:00) cleanly:
+            // Note: Samsung Health on Android 16 stamps Today's daily StepsRecord with endTime = 23:59:59.999.
+            // Querying up to `tomorrowStart` prevents HealthConnectClient.aggregate() from pro-rating Today's
+            // already-walked steps by `(now - 00:00) / 24h`!
             val yesterdayStart = yesterday.atStartOfDay(zone).toInstant()
             val todayStart = today.atStartOfDay(zone).toInstant()
             val safeNow = if (nowInstant.isAfter(todayStart)) nowInstant else todayStart.plusSeconds(1)
+            val todayQueryEnd = maxOf(safeNow, tomorrowStart)
 
-            val defaultWalkStrideM = 0.76 * TsPoliceBenchmark.heightStrideScale(repository.runnerHeightCm)
+            val heightScale = TsPoliceBenchmark.heightStrideScale(repository.runnerHeightCm)
+            val defaultWalkStrideM = 0.76 * heightScale
 
             val yesterdaySnapshot = pullDaySnapshot(
                 client = client,
@@ -284,7 +292,7 @@ class SamsungHealthSyncManager(
                 granted = granted,
                 dateIso = todayIso,
                 windowStart = todayStart,
-                windowEnd = safeNow,
+                windowEnd = todayQueryEnd,
                 zone = zone,
                 targetOrigins = targetOrigins,
                 sourcePkg = sourcePkg,
@@ -295,23 +303,32 @@ class SamsungHealthSyncManager(
             repository.saveSamsungSnapshot(yesterdaySnapshot)
             repository.saveSamsungSnapshot(todaySnapshot)
 
-            // Auto-calibrate personal stride scale from Yesterday + Today combined ground truth
+            // Auto-calibrate personal stride scale ONLY when Yesterday or Today has non-estimated raw distance;
+            // heal any legacy pre-fix partial-sync scale (<0.89x) back to runner's height baseline!
             val localYesterday = repository.getDailyActivity(yesterdayIso)
             val localToday = repository.getDailyActivity(todayIso)
             var currentScale = repository.strideCalibrationScale
             if (repository.autoCalibrateFromSamsung) {
+                val hasRawCalData =
+                    SamsungHealthComparator.hasCompleteRawDistanceForCalibration(yesterdaySnapshot) ||
+                        SamsungHealthComparator.hasCompleteRawDistanceForCalibration(todaySnapshot)
                 currentScale = SamsungHealthComparator.computeMultiDayCalibratedStrideScale(
                     yesterdayTracker = localYesterday,
                     yesterdaySamsung = yesterdaySnapshot,
                     todayTracker = localToday,
                     todaySamsung = todaySnapshot,
-                    currentStrideScale = currentScale
+                    currentStrideScale = currentScale,
+                    fallbackHeightScale = heightScale
                 )
                 repository.strideCalibrationScale = currentScale
-                val combinedSteps = yesterdaySnapshot.steps + todaySnapshot.steps
-                val combinedDist = yesterdaySnapshot.distanceMeters + todaySnapshot.distanceMeters
-                if (combinedSteps >= 200 && combinedDist >= 110.0) {
+                if (hasRawCalData) {
                     repository.hasSamsungStrideCalibration = true
+                } else if (!repository.hasSamsungStrideCalibration || currentScale == heightScale.coerceIn(
+                        SamsungHealthComparator.MIN_STRIDE_SCALE,
+                        SamsungHealthComparator.MAX_STRIDE_SCALE
+                    )
+                ) {
+                    repository.hasSamsungStrideCalibration = false
                 }
             }
 
@@ -564,19 +581,20 @@ class SamsungHealthSyncManager(
         var jogRunSec = mergedRunMs.sumOf { (s, e) -> (e - s) / 1000.0 }
         var walkSec = mergedWalkMs.sumOf { (s, e) -> (e - s) / 1000.0 }
 
+        val nowEpochMs = System.currentTimeMillis()
         for (stepRec in scopedSteps) {
-            val sMs = max(stepRec.startTime.toEpochMilli(), windowStart.toEpochMilli())
-            val eMs = min(stepRec.endTime.toEpochMilli(), windowEnd.toEpochMilli())
+            val rawStartMs = stepRec.startTime.toEpochMilli()
+            val rawEndMs = stepRec.endTime.toEpochMilli()
+            val sMs = max(rawStartMs, windowStart.toEpochMilli())
+            val eMs = min(rawEndMs, windowEnd.toEpochMilli())
             if (eMs <= sMs || stepRec.count < 6L) continue
 
-            val bucketDurSec = Duration.between(
-                Instant.ofEpochMilli(sMs),
-                Instant.ofEpochMilli(eMs)
-            ).toMillis() / 1000.0
+            val effEndMs = SamsungHealthComparator.effectiveRecordEndEpochMs(sMs, eMs, nowEpochMs)
+            val bucketDurSec = max(1L, effEndMs - sMs) / 1000.0
             if (bucketDurSec <= 0.5) continue
 
-            // Prorate step count if the record spans across midnight beyond [windowStart, windowEnd]
-            val fullRecDurMs = max(1L, stepRec.endTime.toEpochMilli() - stepRec.startTime.toEpochMilli()).toDouble()
+            // Prorate step count only if the record genuinely crossed midnight outside [windowStart, windowEnd]
+            val fullRecDurMs = max(1L, rawEndMs - rawStartMs).toDouble()
             val windowStepCount = stepRec.count.toDouble() * ((eMs - sMs).toDouble() / fullRecDurMs)
 
             if (overlapsAny(sMs, eMs, allSessionIntervals)) {
@@ -770,8 +788,9 @@ class SamsungHealthSyncManager(
 
         // 2. Pull 48-hour raw records for Yesterday + Today and build exact hourly buckets (00..23)
         val yestStart = yesterday.atStartOfDay(zone).toInstant()
+        val tomorrowStart = today.plusDays(1).atStartOfDay(zone).toInstant()
         val safeNow = if (nowInstant.isAfter(yestStart)) nowInstant else yestStart.plusSeconds(1)
-        val filter48h = TimeRangeFilter.between(yestStart, safeNow)
+        val filter48h = TimeRangeFilter.between(yestStart, maxOf(safeNow, tomorrowStart))
 
         val steps48h = runCatching {
             client.readRecords(ReadRecordsRequest(StepsRecord::class, timeRangeFilter = filter48h, dataOriginFilter = targetOrigins)).records
@@ -815,12 +834,17 @@ class SamsungHealthSyncManager(
                     continue
                 }
 
+                val safeNowMs = safeNow.toEpochMilli()
                 var hSteps = 0.0
                 var hWalkSec = 0.0
                 var hJogRunSec = 0.0
                 for (sr in steps48h) {
                     val rStart = sr.startTime.toEpochMilli()
-                    val rEnd = sr.endTime.toEpochMilli()
+                    val rEnd = SamsungHealthComparator.effectiveRecordEndEpochMs(
+                        rStart,
+                        sr.endTime.toEpochMilli(),
+                        safeNowMs
+                    )
                     val ovStart = max(rStart, hStartMs)
                     val ovEnd = min(rEnd, hEndMs)
                     if (ovEnd > ovStart) {
@@ -841,7 +865,11 @@ class SamsungHealthSyncManager(
                 var hDist = 0.0
                 for (dr in dist48h) {
                     val rStart = dr.startTime.toEpochMilli()
-                    val rEnd = dr.endTime.toEpochMilli()
+                    val rEnd = SamsungHealthComparator.effectiveRecordEndEpochMs(
+                        rStart,
+                        dr.endTime.toEpochMilli(),
+                        safeNowMs
+                    )
                     val ovStart = max(rStart, hStartMs)
                     val ovEnd = min(rEnd, hEndMs)
                     if (ovEnd > ovStart) {
@@ -850,7 +878,7 @@ class SamsungHealthSyncManager(
                     }
                 }
                 if (hDist < 1.0 && hSteps >= 5.0) {
-                    hDist = hSteps * 0.76
+                    hDist = hSteps * 0.76 * TsPoliceBenchmark.heightStrideScale(repository.runnerHeightCm)
                 }
 
                 // Override/augment active seconds from explicit running/walking ExerciseSessionRecords in this hour

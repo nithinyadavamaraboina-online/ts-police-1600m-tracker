@@ -243,7 +243,20 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         get() = prefs.getBoolean(KEY_HAS_SAMSUNG_CAL, false)
         set(value) = prefs.edit().putBoolean(KEY_HAS_SAMSUNG_CAL, value).apply()
 
+    private fun healLegacyCorruptedStrideScaleIfNeeded() {
+        val rawSaved = prefs.getFloat(KEY_STRIDE_SCALE, 1.0f).toDouble()
+        if (rawSaved < 0.85) {
+            val heightBase = TsPoliceBenchmark.heightStrideScale(runnerHeightCm)
+                .coerceIn(SamsungHealthComparator.MIN_STRIDE_SCALE, SamsungHealthComparator.MAX_STRIDE_SCALE)
+            prefs.edit()
+                .putFloat(KEY_STRIDE_SCALE, heightBase.toFloat())
+                .putBoolean(KEY_HAS_SAMSUNG_CAL, false)
+                .apply()
+        }
+    }
+
     fun effectiveStrideScale(): Double {
+        healLegacyCorruptedStrideScaleIfNeeded()
         return if (autoCalibrateFromSamsung && hasSamsungStrideCalibration) {
             strideCalibrationScale
         } else {
@@ -264,8 +277,11 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         set(value) = prefs.edit().putBoolean(KEY_ALL_DAY_AUTO, value).apply()
 
     var strideCalibrationScale: Double
-        get() = prefs.getFloat(KEY_STRIDE_SCALE, 1.0f).toDouble()
-            .coerceIn(SamsungHealthComparator.MIN_STRIDE_SCALE, SamsungHealthComparator.MAX_STRIDE_SCALE)
+        get() {
+            healLegacyCorruptedStrideScaleIfNeeded()
+            return prefs.getFloat(KEY_STRIDE_SCALE, 1.0f).toDouble()
+                .coerceIn(SamsungHealthComparator.MIN_STRIDE_SCALE, SamsungHealthComparator.MAX_STRIDE_SCALE)
+        }
         set(value) = prefs.edit().putFloat(
             KEY_STRIDE_SCALE,
             value.coerceIn(SamsungHealthComparator.MIN_STRIDE_SCALE, SamsungHealthComparator.MAX_STRIDE_SCALE).toFloat()

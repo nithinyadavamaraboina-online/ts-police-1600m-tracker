@@ -1,8 +1,8 @@
 {
-    "versionCode":  15,
-    "versionName":  "1.0.14",
+    "versionCode":  16,
+    "versionName":  "1.0.15",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "98b447e3727302300735346e478d5087273b63b76b5025d17c4e6fbdc462cb26",
-    "changelog":  "Add hands-free live remote telemetry pull (PULL_NOW) and automatic background cloud sync after workouts, app opens, and periodic intervals.",
-    "publishedAt":  "2026-10-31T03:03:06Z"
+    "sha256":  "65cc0fac36257eaae30bfa7338a272ddb76c9bc0099eb78b738da06b2c1157b4",
+    "changelog":  "Fix Android 16 Samsung Health full-day step pro-rating, auto-heal legacy 0.80x stride scale to runner height, and eliminate pocket Slow-Jog \u003c-\u003e Walk / Stopped flicker on pavement.",
+    "publishedAt":  "2026-10-31T03:34:45Z"
 }
