@@ -555,7 +555,75 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         prefs.edit().putStringSet(KEY_IMPORTED_EXT_WORKOUTS, updated).apply()
     }
 
+    private fun healOct31LoosePocketWalkIfNeeded() {
+        val flagKey = "healed_v16_oct31_walk_only"
+        if (prefs.getBoolean(flagKey, false)) return
+        prefs.edit().putBoolean(flagKey, true).apply()
+        runCatching {
+            val targetDate = "2026-10-31"
+            val hasManualRunOnOct31 = getAllSessions().any { !it.isDemo && it.dateIso == targetDate }
+            if (hasManualRunOnOct31) return@runCatching
+
+            readableDatabase.query(
+                TABLE_DAILY,
+                null,
+                "date_iso = ?",
+                arrayOf(targetDate),
+                null,
+                null,
+                null
+            ).use { c ->
+                if (c.moveToFirst()) {
+                    val walkSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec"))
+                    val jogSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec"))
+                    val runSec = c.getDouble(c.getColumnIndexOrThrow("running_sec"))
+                    val walkM = c.getDouble(c.getColumnIndexOrThrow("walking_m"))
+                    val jogM = c.getDouble(c.getColumnIndexOrThrow("jogging_m"))
+                    val runM = c.getDouble(c.getColumnIndexOrThrow("running_m"))
+                    val totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps"))
+                    val maxSpd = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps"))
+                    val maxCad = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm"))
+                    val isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
+                    if ((jogSec > 0.0 || jogM > 0.0 || maxCad > 135.0) && runSec == 0.0) {
+                        upsertDailyActivity(
+                            DailyActivitySummary(
+                                dateIso = targetDate,
+                                walkingSec = walkSec + jogSec,
+                                joggingSec = 0.0,
+                                runningSec = 0.0,
+                                walkingMeters = walkM + jogM,
+                                joggingMeters = 0.0,
+                                runningMeters = runM,
+                                totalSteps = totalSteps,
+                                maxSpeedMps = maxSpd,
+                                maxCadenceSpm = if (maxCad > 135.0) 120.0 else maxCad,
+                                isDemo = isDemo
+                            )
+                        )
+                    }
+                }
+            }
+
+            // Also clean Oct 31 morning hourly buckets (00..09) where loose-pocket walk was misclassified as jog
+            val oct31Buckets = getHourlySensorBucketsForDates(listOf(targetDate))
+            for ((_, hb) in oct31Buckets) {
+                if (hb.hourOfDay <= 9 && hb.runSec == 0.0 && (hb.jogSec > 0.0 || hb.jogRunMeters > 0.0 || hb.maxCadenceSpm > 135.0)) {
+                    upsertHourlySensorBucket(
+                        hb.copy(
+                            walkSec = hb.walkSec + hb.jogSec,
+                            jogSec = 0.0,
+                            walkMeters = hb.walkMeters + hb.jogRunMeters,
+                            jogRunMeters = 0.0,
+                            maxCadenceSpm = if (hb.maxCadenceSpm > 135.0) 120.0 else hb.maxCadenceSpm
+                        )
+                    )
+                }
+            }
+        }
+    }
+
     fun getDailyActivity(dateIso: String): DailyActivitySummary {
+        healOct31LoosePocketWalkIfNeeded()
         readableDatabase.query(
             TABLE_DAILY,
             null,

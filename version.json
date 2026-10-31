@@ -1,8 +1,8 @@
 {
-    "versionCode":  16,
-    "versionName":  "1.0.15",
+    "versionCode":  17,
+    "versionName":  "1.0.16",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "65cc0fac36257eaae30bfa7338a272ddb76c9bc0099eb78b738da06b2c1157b4",
-    "changelog":  "Fix Android 16 Samsung Health full-day step pro-rating, auto-heal legacy 0.80x stride scale to runner height, and eliminate pocket Slow-Jog \u003c-\u003e Walk / Stopped flicker on pavement.",
-    "publishedAt":  "2026-10-31T03:34:45Z"
+    "sha256":  "2e08f31209019ce6208d5f178cd04392cd32c73c9831bd7d4bbee9ec943b2ff2",
+    "changelog":  "Trust active hardware pedometer over loose-pocket thigh-slap double-bounces so pure walking never false-triggers Jogging or Stopped, reclassify Oct 31 false walk-jog to Walking, and fix Android 16 Samsung Health step pro-rating.",
+    "publishedAt":  "2026-10-31T03:46:09Z"
 }

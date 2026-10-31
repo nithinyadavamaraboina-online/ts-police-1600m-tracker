@@ -33,12 +33,12 @@ class GaitClassifier(
         //   - Slow-jog / smooth jog (+/-3.8..5.0 m/s^2 peak) -> bandpass RMS ~1.86..2.45 m/s^2 at 133..160 spm
         //   - Running / 7:15 pace (+/-6.2..9.0 m/s^2 peak) -> bandpass RMS ~3.04..4.40 m/s^2 at 162..190+ spm
         const val MIN_WALKING_CADENCE_SPM = 68.0
-        const val SLOW_JOG_CADENCE_SPM = 133.0
+        const val SLOW_JOG_CADENCE_SPM = 136.0
         const val SLOW_JOG_MIN_BOUNCE_RMS = 1.85
-        const val BOUNCY_SLOW_JOG_CADENCE_SPM = 125.0
+        const val BOUNCY_SLOW_JOG_CADENCE_SPM = 132.0
         const val BOUNCY_SLOW_JOG_RMS = 2.45
-        const val JOG_RETENTION_CADENCE_SPM = 122.0
-        const val JOG_RETENTION_BOUNCE_RMS = 1.60
+        const val JOG_RETENTION_CADENCE_SPM = 126.0
+        const val JOG_RETENTION_BOUNCE_RMS = 1.65
 
         // Temporal Hysteresis Debounce Windows (ms)
         const val STANDING_TO_WALK_DEBOUNCE_MS = 1700L
@@ -134,19 +134,15 @@ class GaitClassifier(
         val hasRhythmicSteps = cadenceSpm >= MIN_WALKING_CADENCE_SPM
         val impliedStepSpeed = estimateSpeedFromStepsMps(cadenceSpm, dynamicAccelRms)
 
-        // True aerial flight unloading + >2g footstrike impact (impossible during flat walking: minNorm ~5.7..7.5, p2t ~7..13).
-        // Protects Slow-Jogging from JOGGING -> WALKING ping-pong even if pocket step_detector half-counts single-leg strides (~95..118 spm)!
-        val hasAerialFlightSignature =
-            dynamicAccelRms >= 2.15 &&
-                minRawNorm != null && minRawNorm <= 4.65 &&
-                peakToTroughNorm != null && peakToTroughNorm >= 20.0
-
-        // Spring-mass aerial bounce signature (distinguishes Slow-Jogging at walking speed from brisk flat Walking!)
+        // Spring-mass bounce signature at walking ground speeds:
+        // IMPORTANT: Loose shorts/track-pants pocket pendulum slap during pure 100 spm walking routinely produces
+        // `rms = 2.5..3.5 m/s^2`, `minRawNorm = 1.2..3.9 m/s^2`, and `peakToTrough = 30..51 m/s^2`!
+        // Therefore, Slow-Jogging at walking speed MUST have genuine jogging step turnover (`>= 132..136 spm` from
+        // the hardware pedometer), NEVER acceleration spikes alone at 95..120 spm walking cadence!
         val hasSpringMassJogBounce =
             (cadenceSpm >= SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= SLOW_JOG_MIN_BOUNCE_RMS) ||
                 (cadenceSpm >= BOUNCY_SLOW_JOG_CADENCE_SPM && dynamicAccelRms >= BOUNCY_SLOW_JOG_RMS) ||
-                (alreadyJogOrRun && cadenceSpm >= JOG_RETENTION_CADENCE_SPM && dynamicAccelRms >= JOG_RETENTION_BOUNCE_RMS) ||
-                (hasRhythmicSteps && hasAerialFlightSignature)
+                (alreadyJogOrRun && cadenceSpm >= JOG_RETENTION_CADENCE_SPM && dynamicAccelRms >= JOG_RETENTION_BOUNCE_RMS)
 
         if (hasValidGps) {
             val gps = gpsSpeedMps!!
@@ -208,21 +204,21 @@ class GaitClassifier(
                     return when {
                         gps >= targetSpeedThresholdMps -> MotionState.TARGET_PACE
                         gps >= runningSpeedThresholdMps -> MotionState.RUNNING
-                        gps >= DEFAULT_JOGGING_SPEED_MPS || (alreadyJogOrRun && gps >= JOG_RETENTION_SPEED_MPS) || hasAerialFlightSignature ->
+                        gps >= DEFAULT_JOGGING_SPEED_MPS || (alreadyJogOrRun && gps >= JOG_RETENTION_SPEED_MPS) ->
                             MotionState.JOGGING
                         else -> MotionState.WALKING
                     }
                 }
                 // 2) In normal Open Mode, if already walking/jogging on foot and Samsung's non-wakeup step_detector
                 //    briefly pauses batching (<= 4.5s) while GPS + vertical body oscillation prove continuous foot motion,
-                //    bridge the gap cleanly instead of falsely dropping to STANDING ("Stopped")!
+                //    hold the current foot state cleanly (NEVER promoting WALKING to JOGGING and NEVER dropping to STANDING)!
                 if (allowOpenFootGpsBridge &&
                     gps in 0.80..2.08 &&
-                    dynamicAccelRms >= 0.95 &&
-                    minRawNorm != null && minRawNorm <= 7.75 &&
-                    peakToTroughNorm != null && peakToTroughNorm >= 6.0
+                    dynamicAccelRms >= 0.90 &&
+                    minRawNorm != null && minRawNorm <= 7.85 &&
+                    peakToTroughNorm != null && peakToTroughNorm >= 5.5
                 ) {
-                    return if (hasAerialFlightSignature || (alreadyJogOrRun && dynamicAccelRms >= 1.75)) {
+                    return if (alreadyJogOrRun && dynamicAccelRms >= 1.75) {
                         MotionState.JOGGING
                     } else {
                         MotionState.WALKING
@@ -584,6 +580,8 @@ class MotionSignalProcessor {
     var manualWorkoutActive: Boolean = false
 
     private var lastActualHardwareStepMs: Long = -100_000L
+    private var lastValidHwCadenceSpm: Double = 0.0
+    private var lastValidHwCadenceMs: Long = -100_000L
 
     // Orientation-invariant scalar baseline + dt-normalized 2-pole ~4.8 Hz gait-band filter
     private var baselineNorm = 9.81
@@ -616,6 +614,8 @@ class MotionSignalProcessor {
         accelSamples.clear()
         pendingSoftwareStepMs.clear()
         lastActualHardwareStepMs = -100_000L
+        lastValidHwCadenceSpm = 0.0
+        lastValidHwCadenceMs = -100_000L
         suppressStepsForVehicle = false
         manualWorkoutActive = false
         baselineNorm = 9.81
@@ -667,7 +667,8 @@ class MotionSignalProcessor {
         if (prev != null) {
             val gap = nowMs - prev
             if (gap < 285L) return
-            if (gap > 2200L) {
+            // Keep step history across 2-3s non-wakeup pocket sensor batching so walking never resets to 0.0 spm!
+            if (gap > 3800L) {
                 queue.clear()
             }
         }
@@ -825,28 +826,41 @@ class MotionSignalProcessor {
         val recentHf = getHighFreqVibrationRms(nowMs)
         val hwCad = computeCadenceFromQueue(stepTimestampsMs, nowMs, recentRms)
 
+        // When hardware TYPE_STEP_DETECTOR (e.g. Samsung/STMicro LSM6DSO 3-axis ML pedometer) is actively
+        // reporting cadence, ALWAYS trust `hwCad` over scalar `accelCad`! Loose-pocket thigh-slaps double-bounce
+        // on raw accelerometer (~145..160 spm) during pure ~102 spm walking, whereas hardware pedometer rejects them!
+        if (hwCad >= 65.0) {
+            lastValidHwCadenceSpm = hwCad
+            lastValidHwCadenceMs = nowMs
+            return hwCad
+        }
+
         val allowAccelContinuity = !suppressStepsForVehicle &&
             !isSeatedEngineBuzzDominant(nowMs, recentRms, recentHf) &&
             (
                 !verifiedHardwarePedometerActive ||
                     manualWorkoutActive ||
-                    ((nowMs - lastActualHardwareStepMs) in 0L..8_500L && recentRms >= 0.85)
+                    ((nowMs - lastActualHardwareStepMs) in 0L..8_500L && recentRms >= 0.75)
                 )
 
         if (!allowAccelContinuity) {
-            return hwCad
+            return 0.0
         }
 
         val accelCad = if (accelStepTimestampsMs.size >= 4) {
             computeCadenceFromQueue(accelStepTimestampsMs, nowMs, recentRms)
         } else 0.0
 
-        return when {
-            // Heal pocket single-leg step_detector half-counting (~95..118 spm) when gait-band accel sees true ~140..165 spm!
-            hwCad >= 65.0 && accelCad > hwCad * 1.12 && recentRms >= 1.55 -> accelCad
-            hwCad >= 65.0 -> hwCad
-            else -> accelCad
+        if (accelCad < 65.0) return 0.0
+
+        // In passive Open Mode on verified-HW-pedometer phones, cap short sensor-batch continuity to recent `hwCad`
+        // so loose-pocket fabric rebound during a 2s sensor batch pause stays at ~102..112 spm WALKING (never 150 spm JOGGING)!
+        if (verifiedHardwarePedometerActive && !manualWorkoutActive &&
+            lastValidHwCadenceSpm >= 65.0 && (nowMs - lastValidHwCadenceMs) in 0L..8_500L
+        ) {
+            return accelCad.coerceAtMost(lastValidHwCadenceSpm * 1.10)
         }
+        return accelCad
     }
 
     private fun computeCadenceFromQueue(
@@ -859,7 +873,7 @@ class MotionSignalProcessor {
 
         val lastMs = queue.last()
         val silenceMs = nowMs - lastMs
-        val maxSilenceMs = if (recentRms >= 1.00) 3400L else 2200L
+        val maxSilenceMs = if (recentRms >= 0.75) 3800L else 2200L
         if (silenceMs > maxSilenceMs || (silenceMs > 1600L && recentRms < 0.55)) {
             return 0.0
         }
@@ -871,19 +885,23 @@ class MotionSignalProcessor {
             rawIntervals[i] = (queue[startIdx + i + 1] - queue[startIdx + i]).toDouble()
         }
 
-        // Heal isolated 1-step or 2-step hardware sensor drops using lower-median reference period
-        // (prevents 1-2 short pocket-bounce intervals from halving normal 550ms walking intervals into 216 spm!)
+        // Heal isolated 1-step or 2-step hardware sensor drops:
+        //  - For jogging/running (`refPeriodMs <= 445ms` = >=135 spm), split 2x (~800ms) or 3x (~1200ms) dropped steps.
+        //  - For walking (`refPeriodMs > 445ms`), ONLY split genuine >980ms / >1450ms missed-step gaps so asymmetric
+        //    left/right pocket walking steps (e.g. 430ms, 740ms) are NEVER halved into fake 370ms (162 spm) jogging!
         val sortedRaw = rawIntervals.sortedArray()
         val refPeriodMs = sortedRaw[(sortedRaw.size - 1) / 2].coerceAtLeast(285.0)
         val healedIntervals = ArrayList<Double>(rawIntervals.size + 4)
         for (dt in rawIntervals) {
             val ratio = dt / refPeriodMs
+            val canSplit2x = ratio in 1.70..2.36 && (dt >= 980.0 || (refPeriodMs <= 445.0 && dt / 2.0 >= 335.0))
+            val canSplit3x = ratio in 2.70..3.36 && (dt >= 1450.0 || (refPeriodMs <= 445.0 && dt / 3.0 >= 335.0))
             when {
-                ratio in 1.66..2.38 && dt / 2.0 >= 320.0 -> {
+                canSplit2x -> {
                     healedIntervals.add(dt / 2.0)
                     healedIntervals.add(dt / 2.0)
                 }
-                ratio in 2.66..3.38 && dt / 3.0 >= 320.0 -> {
+                canSplit3x -> {
                     healedIntervals.add(dt / 3.0)
                     healedIntervals.add(dt / 3.0)
                     healedIntervals.add(dt / 3.0)

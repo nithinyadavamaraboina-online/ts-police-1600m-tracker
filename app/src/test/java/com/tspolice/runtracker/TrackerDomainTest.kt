@@ -1070,52 +1070,52 @@ class TrackerDomainTest {
     }
 
     @Test
-    fun `pavement slow jogging with pocket single leg half counted steps and sharp heel shock stays jogging without ping pong`() {
+    fun `loose pocket brisk walking with 38 mps2 thigh slap and fabric double bounce stays 100 percent walking and never jogging or stopped`() {
         val dsp = MotionSignalProcessor().apply {
             hardwareStepSensorAvailable = true
             verifiedHardwarePedometerActive = true
         }
         val classifier = GaitClassifier()
 
-        // Reproduce exact Oct 31 morning telemetry (07:28-08:03 on SM-S911B):
-        //  - User slow-jogs at ~1.12 m/s (148 spm = 405ms true step period) on pavement
-        //  - Sharp asphalt heel-strike spikes rawNorm up to ~38 m/s^2 while aerial flight unloads minRawNorm to ~2.8 m/s^2
-        //  - Pocket step_detector only catches same-side leg (~74..102 spm) AND pauses batching for 2.5s mid-bout!
-        val stepPeriodMs = 405L
-        var nextTrueStepMs = 405L
+        // Reproduce exact Oct 31 morning pure-walk telemetry (07:28-08:03 on SM-S911B):
+        //  - User walks briskly at ~1.14 m/s with true 102 spm footstep cadence (588ms hardware step period)
+        //  - Loose shorts/track-pants create pendulum free-fall (`minRawNorm ~ 2.4 m/s^2`), `38 m/s^2` thigh-slap,
+        //    AND a secondary fabric rebound bounce ~294ms after every step (trying to fake ~150..204 spm on raw accel!)
+        //  - Includes a 2.35s non-wakeup hardware step batching pause mid-walk (steps 12..15)!
+        val stepPeriodMs = 588L // 102.0 spm pure walking!
+        var nextHwStepMs = 588L
         var stepNum = 0
-        var jogCommitted = false
+        var walkCommitted = false
 
-        for (i in 0..550) {
+        for (i in 0..700) {
             val tMs = i * 20L
             val phaseInStep = (tMs % stepPeriodMs).toDouble() / stepPeriodMs
-            // Realistic pavement slow-jog waveform: aerial unloading (~2.6 m/s^2) + sharp 36 m/s^2 impact spike!
+            // Double-bounce loose-pocket thigh-slap waveform within each 588ms walking step!
             val ay = when {
-                phaseInStep < 0.12 -> 36.5f // sharp heel/midfoot asphalt strike!
-                phaseInStep < 0.45 -> 13.5f
-                phaseInStep < 0.80 -> 2.65f // aerial flight unloading!
-                else -> 8.5f
+                phaseInStep < 0.08 -> 38.0f  // primary footstrike + thigh slap!
+                phaseInStep < 0.28 -> 2.45f  // pendulum swing unloading!
+                phaseInStep in 0.48..0.56 -> 26.5f // secondary loose-pocket fabric rebound (~294ms later -> fakes 204/150 spm!)
+                phaseInStep in 0.65..0.82 -> 5.2f
+                else -> 9.4f
             }
             dsp.onAccelerationSample(nowMs = tMs, ax = 0f, ay = ay, az = 0f, includesGravity = true)
 
-            if (tMs >= nextTrueStepMs) {
+            if (tMs >= nextHwStepMs) {
                 stepNum++
-                // Simulate pocket single-leg half-counting (drops every odd step after step 6)
-                // PLUS a complete 2.4s hardware step batching pause at steps 18..23!
-                val inBatchPause = stepNum in 18..23
-                val halfCountDrop = stepNum > 6 && (stepNum % 2 == 1)
-                if (!inBatchPause && !halfCountDrop) {
+                // Simulate 2.35s Samsung non-wakeup step_detector batching pause at steps 12..15
+                val inPocketBatchPause = stepNum in 12..15
+                if (!inPocketBatchPause) {
                     dsp.onHardwareStepDetected(tMs, 1)
                 }
-                nextTrueStepMs += stepPeriodMs
+                nextHwStepMs += stepPeriodMs
             }
 
-            if (tMs >= 1600L && i % 10 == 0) {
+            if (tMs >= 1800L && i % 10 == 0) {
                 val cad = dsp.getCadenceSpm(tMs)
                 val rms = dsp.getDynamicAccelRms(tMs)
                 val state = classifier.update(
                     nowMs = tMs,
-                    gpsSpeedMps = 1.12,
+                    gpsSpeedMps = 1.14,
                     cadenceSpm = cad,
                     dynamicAccelRms = rms,
                     minRawNorm = dsp.getMinRawNorm(tMs),
@@ -1124,18 +1124,23 @@ class TrackerDomainTest {
                     hfVibrationRms = dsp.getHighFreqVibrationRms(tMs),
                     isManualWorkoutActive = false
                 )
-                if (state == MotionState.JOGGING) jogCommitted = true
-                if (jogCommitted) {
+                if (state == MotionState.WALKING) walkCommitted = true
+                assertNotEquals(
+                    "Loose-pocket 102 spm pure walk must NEVER false-trigger JOGGING at ${tMs}ms (cad=$cad, rms=$rms)!",
+                    MotionState.JOGGING,
+                    state
+                )
+                if (walkCommitted) {
                     assertEquals(
-                        "Pavement slow-jog must NEVER ping-pong to WALKING or STANDING at ${tMs}ms (cad=$cad, rms=$rms)",
-                        MotionState.JOGGING,
+                        "Loose-pocket 102 spm pure walk must stay WALKING (never STANDING/Stopped) at ${tMs}ms!",
+                        MotionState.WALKING,
                         state
                     )
                 }
-                assertTrue("Cadence must never spike to fake >205 spm, got $cad", cad <= 205.0)
+                assertTrue("Loose-pocket walking cadence must never spike into jogging range (>125 spm), got $cad", cad <= 125.0)
             }
         }
-        assertTrue("Slow-jogging should commit JOGGING cleanly", jogCommitted)
+        assertTrue("Brisk walk should commit WALKING cleanly", walkCommitted)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
