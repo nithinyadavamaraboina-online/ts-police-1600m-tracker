@@ -5,10 +5,12 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.tspolice.runtracker.domain.DailyActivitySummary
+import com.tspolice.runtracker.domain.ExamTimeBatch
 import com.tspolice.runtracker.domain.ExternalRunWorkout
 import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.HourlySensorBucket
 import com.tspolice.runtracker.domain.LapSplit
+import com.tspolice.runtracker.domain.LegFeelCheckIn
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.PocketAudioMode
 import com.tspolice.runtracker.domain.RunMode
@@ -62,6 +64,10 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_LAST_HANDLED_PULL_ID = "last_handled_pull_id"
         private const val KEY_CACHED_DEEP_SAMSUNG_48H_JSON = "cached_deep_samsung_48h_json"
         private const val KEY_VERIFIED_HW_PEDOMETER = "verified_hw_pedometer_active"
+        private const val KEY_RUNNER_WEIGHT_KG = "runner_weight_kg"
+        private const val KEY_EXPECTED_EXAM_BATCH = "expected_exam_batch"
+        private const val KEY_COACH_LEG_FEEL_DATE = "coach_leg_feel_date_iso"
+        private const val KEY_COACH_LEG_FEEL_VALUE = "coach_leg_feel_value"
 
         // Oct 31 evening jog exactly as the phone recorded it (v1.0.16 session row + 20:16 daily totals)
         private const val OCT31_RECORDED_JOG_SEC = 512.72
@@ -249,6 +255,31 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     var runnerHeightCm: Int
         get() = prefs.getInt(KEY_RUNNER_HEIGHT_CM, 172).coerceIn(145, 205)
         set(value) = prefs.edit().putInt(KEY_RUNNER_HEIGHT_CM, value.coerceIn(145, 205)).apply()
+
+    var runnerWeightKg: Int
+        get() = prefs.getInt(KEY_RUNNER_WEIGHT_KG, 68).coerceIn(42, 125)
+        set(value) = prefs.edit().putInt(KEY_RUNNER_WEIGHT_KG, value.coerceIn(42, 125)).apply()
+
+    var expectedExamBatch: ExamTimeBatch
+        get() {
+            val raw = prefs.getString(KEY_EXPECTED_EXAM_BATCH, null) ?: return ExamTimeBatch.MORNING_GROUND
+            return runCatching { ExamTimeBatch.valueOf(raw) }.getOrDefault(ExamTimeBatch.MORNING_GROUND)
+        }
+        set(value) = prefs.edit().putString(KEY_EXPECTED_EXAM_BATCH, value.name).apply()
+
+    fun getTodayLegFeel(todayIso: String = LocalDate.now().toString()): LegFeelCheckIn {
+        val savedDate = prefs.getString(KEY_COACH_LEG_FEEL_DATE, null)
+        if (savedDate != todayIso) return LegFeelCheckIn.AUTO
+        val savedVal = prefs.getString(KEY_COACH_LEG_FEEL_VALUE, null) ?: return LegFeelCheckIn.AUTO
+        return runCatching { LegFeelCheckIn.valueOf(savedVal) }.getOrDefault(LegFeelCheckIn.AUTO)
+    }
+
+    fun setTodayLegFeel(feel: LegFeelCheckIn, todayIso: String = LocalDate.now().toString()) {
+        prefs.edit()
+            .putString(KEY_COACH_LEG_FEEL_DATE, todayIso)
+            .putString(KEY_COACH_LEG_FEEL_VALUE, feel.name)
+            .apply()
+    }
 
     var hasSamsungStrideCalibration: Boolean
         get() = prefs.getBoolean(KEY_HAS_SAMSUNG_CAL, false)
@@ -1371,6 +1402,59 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             while (c.moveToNext()) {
                 val b = readHourlyRow(c)
                 out[b.bucketKey] = b
+            }
+        }
+        return out
+    }
+
+    fun getRecentDailyActivitiesMap(daysBack: Int = 14, todayIso: String = LocalDate.now().toString()): Map<String, DailyActivitySummary> {
+        val today = runCatching { LocalDate.parse(todayIso) }.getOrElse { LocalDate.now() }
+        val cutoffIso = today.minusDays(daysBack.toLong()).toString()
+        val out = LinkedHashMap<String, DailyActivitySummary>()
+        readableDatabase.query(
+            TABLE_DAILY,
+            null,
+            "date_iso >= ?",
+            arrayOf(cutoffIso),
+            null,
+            null,
+            "date_iso ASC"
+        ).use { c ->
+            while (c.moveToNext()) {
+                val iso = c.getString(c.getColumnIndexOrThrow("date_iso"))
+                out[iso] = DailyActivitySummary(
+                    dateIso = iso,
+                    walkingSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec")),
+                    joggingSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec")),
+                    runningSec = c.getDouble(c.getColumnIndexOrThrow("running_sec")),
+                    walkingMeters = c.getDouble(c.getColumnIndexOrThrow("walking_m")),
+                    joggingMeters = c.getDouble(c.getColumnIndexOrThrow("jogging_m")),
+                    runningMeters = c.getDouble(c.getColumnIndexOrThrow("running_m")),
+                    totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps")),
+                    maxSpeedMps = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps")),
+                    maxCadenceSpm = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm")),
+                    isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
+                )
+            }
+        }
+        return out
+    }
+
+    fun getRecentHourlyBuckets(daysBack: Int = 14, todayIso: String = LocalDate.now().toString()): List<HourlySensorBucket> {
+        val today = runCatching { LocalDate.parse(todayIso) }.getOrElse { LocalDate.now() }
+        val cutoffIso = today.minusDays(daysBack.toLong()).toString()
+        val out = mutableListOf<HourlySensorBucket>()
+        readableDatabase.query(
+            TABLE_HOURLY,
+            null,
+            "date_iso >= ?",
+            arrayOf(cutoffIso),
+            null,
+            null,
+            "date_iso ASC, hour_of_day ASC"
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(readHourlyRow(c))
             }
         }
         return out

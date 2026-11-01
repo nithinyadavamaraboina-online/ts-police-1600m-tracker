@@ -14,7 +14,10 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.tspolice.runtracker.data.RunRepository
+import com.tspolice.runtracker.domain.CoachBrainReport
 import com.tspolice.runtracker.domain.DailyActivitySummary
+import com.tspolice.runtracker.domain.ExamTimeBatch
+import com.tspolice.runtracker.domain.LegFeelCheckIn
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
@@ -635,6 +638,336 @@ object SessionDialogs {
                 ctx.startActivity(Intent.createChooser(share, "Share Fine-Tuning JSON"))
             }
             .setNegativeButton("Done", null)
+            .show()
+    }
+
+    /**
+     * Renders the Coach Brain's 1-vs-2 Sessions Verdict, Time-of-Day Pace & Consistency Table
+     * (Early Morning vs 5:00 PM vs 6:00 PM vs 7:00+ PM), Deep Sensor Insights, and Weight/Batch controls
+     * into any LinearLayout container (used both inline on Progress tab and in the full modal sheet).
+     */
+    fun populateCoachBrainIntelligenceSection(
+        ctx: Context,
+        host: LinearLayout,
+        report: CoachBrainReport,
+        repository: RunRepository,
+        onSettingsChanged: () -> Unit
+    ) {
+        host.removeAllViews()
+
+        // 1. 1 Session (Evening) vs Morning + Evening Verdict Box
+        val schedBox = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(ctx, 13f), dp(ctx, 11f), dp(ctx, 13f), dp(ctx, 11f))
+            background = AthleticTheme.solidPill(
+                ctx,
+                0x28000000,
+                AthleticColors.HERO_EMERALD_BORDER,
+                13f
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(ctx, 12f) }
+        }
+        val schedTop = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        schedTop.addView(TextView(ctx).apply {
+            text = "1 SESSION VS MORNING + EVENING"
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            letterSpacing = 0.06f
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        schedTop.addView(TextView(ctx).apply {
+            text = report.scheduleMode.shortBadge
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            setPadding(dp(ctx, 8f), dp(ctx, 3f), dp(ctx, 8f), dp(ctx, 3f))
+            background = AthleticTheme.solidPill(ctx, AthleticColors.EMERALD_BRIGHT, AthleticColors.EMERALD_BRIGHT, 9f, 0f)
+        })
+        schedBox.addView(schedTop)
+
+        schedBox.addView(TextView(ctx).apply {
+            text = report.scheduleHeadline
+            textSize = 14f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(ctx, 6f), 0, dp(ctx, 4f))
+        })
+        schedBox.addView(TextView(ctx).apply {
+            text = report.scheduleExplanation
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setLineSpacing(0f, 1.18f)
+        })
+        host.addView(schedBox)
+
+        // 2. Time-of-Day Performance & Consistency Breakdown (Early Morning | 5 PM | 6 PM | 7+ PM)
+        host.addView(
+            AthleticTheme.sectionLabel(
+                ctx,
+                "YOUR BEST RUNNING CLOCK TIME (5 PM VS 6 PM VS MORNING)",
+                AthleticColors.CYAN_BRIGHT
+            )
+        )
+        host.addView(TextView(ctx).apply {
+            text = report.timingVariationSummary
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setLineSpacing(0f, 1.16f)
+            setPadding(0, dp(ctx, 5f), 0, dp(ctx, 9f))
+        })
+
+        for (st in report.slotStats) {
+            val hasData = st.runCount > 0
+            val borderCol = when {
+                st.isBestSlot -> AthleticColors.EMERALD_BRIGHT
+                hasData -> AthleticColors.HERO_AMBER_BORDER
+                else -> AthleticColors.BORDER_SUBTLE
+            }
+            val bgCol = when {
+                st.isBestSlot -> 0x1FC6F432
+                hasData -> AthleticColors.SURFACE_RECESSED
+                else -> 0x16000000
+            }
+            val slotCard = LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(ctx, 12f), dp(ctx, 9f), dp(ctx, 12f), dp(ctx, 9f))
+                background = AthleticTheme.solidPill(ctx, bgCol, borderCol, 11f)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(ctx, 6f) }
+            }
+
+            val topLine = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            topLine.addView(TextView(ctx).apply {
+                text = "${st.slot.title}  (${st.slot.clockRange})"
+                textSize = 12.5f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setTextColor(if (st.isBestSlot) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_PRIMARY)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginEnd = dp(ctx, 6f)
+                }
+            })
+
+            val pillCol = when {
+                st.isBestSlot -> AthleticColors.EMERALD_BRIGHT
+                hasData -> AthleticColors.AMBER_BRIGHT
+                else -> AthleticColors.TEXT_MUTED
+            }
+            topLine.addView(TextView(ctx).apply {
+                text = st.badgeLabel
+                textSize = 9.5f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setTextColor(pillCol)
+                setPadding(dp(ctx, 7f), dp(ctx, 2.5f), dp(ctx, 7f), dp(ctx, 2.5f))
+                background = AthleticTheme.solidPill(
+                    ctx,
+                    (pillCol and 0x00FFFFFF) or 0x22000000,
+                    pillCol,
+                    8f
+                )
+            })
+            slotCard.addView(topLine)
+
+            slotCard.addView(TextView(ctx).apply {
+                text = st.plainSummary
+                textSize = 11.5f
+                setTextColor(if (hasData) AthleticColors.TEXT_PRIMARY else AthleticColors.TEXT_MUTED)
+                setLineSpacing(0f, 1.14f)
+                setPadding(0, dp(ctx, 4f), 0, 0)
+            })
+            host.addView(slotCard)
+        }
+
+        // 3. Deep Telemetry & Biomechanics Insights
+        val insightsBox = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(ctx, 12f), dp(ctx, 10f), dp(ctx, 12f), dp(ctx, 10f))
+            background = AthleticTheme.solidPill(ctx, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 12f)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(ctx, 8f)
+                bottomMargin = dp(ctx, 10f)
+            }
+        }
+        insightsBox.addView(
+            AthleticTheme.sectionLabel(ctx, "WHAT YOUR COACH BRAIN FOUND IN YOUR DATA", AthleticColors.AMBER_BRIGHT)
+        )
+        for (ins in report.personalInsights) {
+            insightsBox.addView(TextView(ctx).apply {
+                text = "•  $ins"
+                textSize = 12f
+                setTextColor(AthleticColors.TEXT_PRIMARY)
+                setLineSpacing(0f, 1.17f)
+                setPadding(0, dp(ctx, 6f), 0, dp(ctx, 2f))
+            })
+        }
+        host.addView(insightsBox)
+
+        // 4. Quick Brain Calibration: Body Weight (for Carbs/Protein/Calories) + Expected Exam Batch
+        val tuneBox = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(ctx, 12f), dp(ctx, 10f), dp(ctx, 12f), dp(ctx, 10f))
+            background = AthleticTheme.solidPill(ctx, 0x22000000, AthleticColors.BORDER_SUBTLE, 12f)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        tuneBox.addView(
+            AthleticTheme.sectionLabel(ctx, "BRAIN PROFILE (WEIGHT FOR FUEL & EXAM BATCH)", AthleticColors.TEXT_SECONDARY)
+        )
+
+        val weightRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(ctx, 8f), 0, dp(ctx, 8f))
+        }
+        weightRow.addView(TextView(ctx).apply {
+            text = "Body Weight (Carbs & Protein Math)"
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        val weightValTv = TextView(ctx).apply {
+            text = "${repository.runnerWeightKg} kg"
+            textSize = 13f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            setPadding(dp(ctx, 10f), 0, dp(ctx, 10f), 0)
+        }
+        fun mkWeightBtn(sym: String, delta: Int) = AthleticTheme.createButton(
+            ctx,
+            sym,
+            AthleticTheme.ButtonStyle.SECONDARY_SLATE,
+            32f
+        ).apply {
+            minWidth = dp(ctx, 34f)
+            setPadding(dp(ctx, 10f), dp(ctx, 3f), dp(ctx, 10f), dp(ctx, 3f))
+            setOnClickListener {
+                repository.runnerWeightKg = (repository.runnerWeightKg + delta).coerceIn(42, 125)
+                weightValTv.text = "${repository.runnerWeightKg} kg"
+                onSettingsChanged()
+            }
+        }
+        weightRow.addView(mkWeightBtn("−", -2))
+        weightRow.addView(weightValTv)
+        weightRow.addView(mkWeightBtn("+", +2))
+        tuneBox.addView(weightRow)
+
+        val batchRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        batchRow.addView(TextView(ctx).apply {
+            text = "Expected PET Ground Slot:"
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        val curBatch = repository.expectedExamBatch
+        val batchBtn = TextView(ctx).apply {
+            text = "${curBatch.shortLabel}  ↻"
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            setPadding(dp(ctx, 10f), dp(ctx, 5f), dp(ctx, 10f), dp(ctx, 5f))
+            background = AthleticTheme.solidPill(ctx, 0x229D6BFF, AthleticColors.HERO_CYAN_BORDER, 9f)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                repository.expectedExamBatch = if (repository.expectedExamBatch == ExamTimeBatch.MORNING_GROUND) {
+                    ExamTimeBatch.EVENING_OR_UNSURE
+                } else {
+                    ExamTimeBatch.MORNING_GROUND
+                }
+                onSettingsChanged()
+            }
+        }
+        batchRow.addView(batchBtn)
+        tuneBox.addView(batchRow)
+
+        tuneBox.addView(TextView(ctx).apply {
+            text = report.dataPointsSummary
+            textSize = 10.5f
+            setTextColor(AthleticColors.TEXT_MUTED)
+            setPadding(0, dp(ctx, 8f), 0, 0)
+        })
+        host.addView(tuneBox)
+    }
+
+    fun showCoachBrainDialog(
+        ctx: Context,
+        repository: RunRepository,
+        reportProvider: () -> CoachBrainReport,
+        onSettingsChanged: () -> Unit
+    ) {
+        val scroll = ScrollView(ctx)
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(ctx, 18f), dp(ctx, 16f), dp(ctx, 18f), dp(ctx, 10f))
+            setBackgroundColor(AthleticColors.SURFACE_TOP)
+        }
+
+        val header = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(ctx, 10f))
+        }
+        header.addView(TextView(ctx).apply {
+            text = "EXPERT RUNNING COACH BRAIN"
+            textSize = 12f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            letterSpacing = 0.06f
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        val confBadge = TextView(ctx).apply {
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            setPadding(dp(ctx, 8f), dp(ctx, 3f), dp(ctx, 8f), dp(ctx, 3f))
+            background = AthleticTheme.solidPill(ctx, 0x229D6BFF, AthleticColors.HERO_CYAN_BORDER, 9f)
+        }
+        header.addView(confBadge)
+        root.addView(header)
+
+        val dynamicBody = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        root.addView(dynamicBody)
+
+        fun rebuild() {
+            val latestReport = reportProvider()
+            confBadge.text = latestReport.confidenceLabel
+            populateCoachBrainIntelligenceSection(
+                ctx = ctx,
+                host = dynamicBody,
+                report = latestReport,
+                repository = repository
+            ) {
+                onSettingsChanged()
+                rebuild()
+            }
+        }
+        rebuild()
+
+        scroll.addView(root)
+        AlertDialog.Builder(ctx)
+            .setView(scroll)
+            .setPositiveButton("Got It", null)
             .show()
     }
 }

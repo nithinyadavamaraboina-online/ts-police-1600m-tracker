@@ -1,8 +1,8 @@
 {
-    "versionCode":  28,
-    "versionName":  "1.0.27",
+    "versionCode":  29,
+    "versionName":  "1.0.28",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "b819d6da6dd72c4455a9cbbaf2f05016a8ccc7a55933ea25a96fd71eedf599cf",
-    "changelog":  "Display clean whole-second mm:ss times (e.g. 8:47 instead of 8:47.2) across Today\u0027s 1.6 km Hero Spotlight, Past Run Logs, Share Run poster \u0026 caption, splits, and KPI tiles.",
-    "publishedAt":  "2026-11-01T15:06:18Z"
+    "sha256":  "7ed5c1d5db1a2cde04f534fe7c7c3ade4286e55528933f3b5ed6ca87f53e895a",
+    "changelog":  "Add Expert Running Coach Brain: plain-English What To Do \u0026 What NOT To Do, personalized Carbs/Protein/Calories fuel math, 1 vs 2 sessions planner, and 5 PM vs 6 PM vs Morning timing analyzer.",
+    "publishedAt":  "2026-11-01T15:41:21Z"
 }

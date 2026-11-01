@@ -1,10 +1,16 @@
 package com.tspolice.runtracker
 
+import com.tspolice.runtracker.domain.CoachBrainEngine
+import com.tspolice.runtracker.domain.CoachWorkoutKind
 import com.tspolice.runtracker.domain.DailyActivitySummary
+import com.tspolice.runtracker.domain.DailySessionScheduleMode
 import com.tspolice.runtracker.domain.DeadlineGoalCoach
+import com.tspolice.runtracker.domain.ExamTimeBatch
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.HourlySensorBucket
+import com.tspolice.runtracker.domain.LapSplit
+import com.tspolice.runtracker.domain.LegFeelCheckIn
 import com.tspolice.runtracker.domain.MotionSignalProcessor
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.MotionStateAudioCue
@@ -17,7 +23,10 @@ import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SamsungHealthComparator
+import com.tspolice.runtracker.domain.TimeOfDaySlot
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
+import java.time.ZoneId
+import java.time.ZonedDateTime
 import com.tspolice.runtracker.telemetry.TuningTelemetryManager
 import com.tspolice.runtracker.ui.RunShareHelper
 import com.tspolice.runtracker.update.VersionComparator
@@ -1354,6 +1363,167 @@ class TrackerDomainTest {
         assertFalse(caption.contains("8:47.2"))
         assertTrue(caption.contains("NEW PB"))
         assertTrue(caption.contains("Nov 30"))
+    }
+
+    @Test
+    fun `coach brain engine analyzes clock windows 1 vs 2 sessions splits cadence and plain language`() {
+        val ist = ZoneId.of("Asia/Kolkata")
+        fun istEpoch(year: Int, month: Int, day: Int, hour: Int, minute: Int): Long =
+            ZonedDateTime.of(year, month, day, hour, minute, 0, 0, ist).toInstant().toEpochMilli()
+
+        // Real runner progression:
+        // 1) Oct 29 at 7:49 PM (LATE_EVENING) — 18:44 stopped trial after 8,568 steps
+        val oct29LateEvening = RunSessionRecord(
+            startedAtEpochMs = istEpoch(2026, 10, 29, 19, 49),
+            dateIso = "2026-10-29",
+            mode = RunMode.TIMED_1600M,
+            distanceMeters = 1600.0,
+            activeDurationSec = 1124.0,
+            pausedDurationSec = 282.7,
+            first1600mSplitSec = 1124.0,
+            equiv1600mSec = 1124.0,
+            avgCadenceSpm = 141.0,
+            maxSpeedMps = 3.12,
+            lapSplits = listOf(
+                LapSplit(1, 400.0, 214.0, 214.0, MotionState.RUNNING),
+                LapSplit(2, 800.0, 231.0, 445.0, MotionState.JOGGING),
+                LapSplit(3, 1200.0, 281.0, 726.0, MotionState.JOGGING),
+                LapSplit(4, 1600.0, 398.0, 1124.0, MotionState.WALKING)
+            ),
+            runningSec = 282.7,
+            joggingSec = 750.8,
+            walkingSec = 90.5
+        )
+
+        // 2) Oct 31 at 6:14 PM (SIX_PM) — 790m continuous jog
+        val oct31SixPmJog = RunSessionRecord(
+            startedAtEpochMs = istEpoch(2026, 10, 31, 18, 14),
+            dateIso = "2026-10-31",
+            mode = RunMode.OPEN_PRACTICE,
+            distanceMeters = 790.0,
+            activeDurationSec = 513.0,
+            pausedDurationSec = 0.0,
+            first1600mSplitSec = null,
+            equiv1600mSec = 1083.8,
+            avgCadenceSpm = 129.1,
+            maxSpeedMps = 2.04,
+            runningSec = 0.0,
+            joggingSec = 513.0,
+            walkingSec = 0.0
+        )
+
+        // 3) Nov 1 at 6:30 PM (SIX_PM) — 8:47 (527.2s) nonstop PB with 2:23 -> 2:05 -> 2:10 -> 2:10 splits at 153 spm!
+        val nov1SixPmPb = RunSessionRecord(
+            startedAtEpochMs = istEpoch(2026, 11, 1, 18, 30),
+            dateIso = "2026-11-01",
+            mode = RunMode.TIMED_1600M,
+            distanceMeters = 1600.0,
+            activeDurationSec = 527.2,
+            pausedDurationSec = 2.6,
+            first1600mSplitSec = 527.2,
+            equiv1600mSec = 527.2,
+            avgCadenceSpm = 153.2,
+            maxSpeedMps = 3.68,
+            lapSplits = listOf(
+                LapSplit(1, 400.0, 143.0, 143.0, MotionState.JOGGING),
+                LapSplit(2, 800.0, 125.0, 268.0, MotionState.RUNNING),
+                LapSplit(3, 1200.0, 129.6, 397.6, MotionState.RUNNING),
+                LapSplit(4, 1600.0, 129.6, 527.2, MotionState.RUNNING)
+            ),
+            runningSec = 310.0,
+            joggingSec = 214.6,
+            walkingSec = 0.0
+        )
+
+        val dailyMap = mapOf(
+            "2026-10-29" to DailyActivitySummary(dateIso = "2026-10-29", totalSteps = 8568, walkingMeters = 4910.0, runningMeters = 1600.0, runningSec = 282.7),
+            "2026-10-31" to DailyActivitySummary(dateIso = "2026-10-31", totalSteps = 10891, joggingMeters = 790.0, joggingSec = 513.0),
+            "2026-11-01" to DailyActivitySummary(dateIso = "2026-11-01", totalSteps = 4481, joggingMeters = 620.0, runningMeters = 1010.0, runningSec = 310.0, joggingSec = 214.6)
+        )
+        val hourlyWake8Am = listOf(
+            HourlySensorBucket(bucketKey = "2026-10-31_08", dateIso = "2026-10-31", hourOfDay = 8, hwSteps = 210, walkMeters = 150.0),
+            HourlySensorBucket(bucketKey = "2026-11-01_08", dateIso = "2026-11-01", hourOfDay = 8, hwSteps = 180, walkMeters = 125.0)
+        )
+
+        // A. Check Nov 1 evening (after running 8:47): Done today, zero jargon, 6:00 PM best slot!
+        val nov1Report = CoachBrainEngine.analyze(
+            sessions = listOf(oct29LateEvening, oct31SixPmJog, nov1SixPmPb),
+            dailyMap = dailyMap,
+            hourlyBuckets = hourlyWake8Am,
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-01",
+            zoneId = ist,
+            runnerHeightCm = 174,
+            runnerWeightKg = 68,
+            legFeel = LegFeelCheckIn.AUTO,
+            expectedExamBatch = ExamTimeBatch.MORNING_GROUND
+        )
+
+        assertEquals(CoachWorkoutKind.TODAY_DONE_RECOVER_TONIGHT, nov1Report.workoutKind)
+        assertEquals(DailySessionScheduleMode.TODAY_RUN_COMPLETED, nov1Report.scheduleMode)
+        assertEquals(TimeOfDaySlot.SIX_PM, nov1Report.bestTimeSlot)
+        assertEquals(3, nov1Report.whatToDo.size)
+        assertEquals(3, nov1Report.whatNotToDo.size)
+
+        val allNov1Text = (listOf(nov1Report.simpleHeadline, nov1Report.plainWhyExplanation, nov1Report.fuelAndHydrationTip) +
+            nov1Report.whatToDo + nov1Report.whatNotToDo).joinToString(" ")
+        assertFalse("Must never contain '4–5/10' jargon", allNov1Text.contains("4–5/10"))
+        assertFalse("Must never contain 'aerobic effort' jargon", allNov1Text.lowercase().contains("aerobic effort"))
+        assertTrue("Fuel tip must explain carbs & protein", nov1Report.fuelAndHydrationTip.contains("carbs") && nov1Report.fuelAndHydrationTip.contains("protein"))
+        assertTrue("Personal insights must catch 153 -> 168 steps/min unlock", nov1Report.personalInsights.any { it.contains("153") && it.contains("168") })
+        assertTrue("Personal insights must catch smart split pacing", nov1Report.personalInsights.any { it.contains("Smart Pacing Discipline") })
+        assertTrue("Personal insights must catch daytime walking fatigue", nov1Report.personalInsights.any { it.contains("Daytime Walking Fatigue") })
+
+        // B. Check Nov 2 (day after hard 8:47 PB): Prescribes 1 Evening Slow Talk-Test Jog (NOT morning+evening doubles!)
+        val nov2Report = CoachBrainEngine.analyze(
+            sessions = listOf(oct29LateEvening, oct31SixPmJog, nov1SixPmPb),
+            dailyMap = dailyMap + ("2026-11-02" to DailyActivitySummary(dateIso = "2026-11-02", totalSteps = 1200)),
+            hourlyBuckets = hourlyWake8Am,
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-02",
+            zoneId = ist
+        )
+        assertEquals(CoachWorkoutKind.EASY_TALK_PACE_JOG, nov2Report.workoutKind)
+        assertEquals(DailySessionScheduleMode.ONE_EVENING_SESSION, nov2Report.scheduleMode)
+        assertTrue(nov2Report.whatToDo.any { it.contains("Talk Test") })
+
+        // C. Check 5:00 PM vs 6:00 PM head-to-head comparison when runner logs a faster 8:20 at 5:10 PM!
+        val nov4FivePmFaster = nov1SixPmPb.copy(
+            startedAtEpochMs = istEpoch(2026, 11, 4, 17, 10),
+            dateIso = "2026-11-04",
+            activeDurationSec = 500.0,
+            first1600mSplitSec = 500.0,
+            equiv1600mSec = 500.0
+        )
+        val fiveVsSixReport = CoachBrainEngine.analyze(
+            sessions = listOf(oct29LateEvening, nov1SixPmPb, nov4FivePmFaster),
+            dailyMap = dailyMap,
+            todayIso = "2026-11-05",
+            zoneId = ist
+        )
+        assertEquals(TimeOfDaySlot.FIVE_PM, fiveVsSixReport.bestTimeSlot)
+        assertTrue(fiveVsSixReport.timingVariationSummary.contains("5:00 PM beats 6:00 PM"))
+
+        // D. Sore Shins check-in immediately overrides to 0 Runs Leg Protection Day
+        val shinGuardReport = CoachBrainEngine.analyze(
+            sessions = listOf(nov1SixPmPb),
+            todayIso = "2026-11-03",
+            zoneId = ist,
+            legFeel = LegFeelCheckIn.SORE_SHINS
+        )
+        assertEquals(CoachWorkoutKind.REST_AND_REPAIR, shinGuardReport.workoutKind)
+        assertEquals(DailySessionScheduleMode.ZERO_RUNS_RECOVERY, shinGuardReport.scheduleMode)
+
+        // E. Sunday with Morning Exam Batch & 0 morning runs in 14d -> 1 Morning Exam Dress Rehearsal (Nov 8, 2026 is Sunday)
+        val sundayMorningRehearsal = CoachBrainEngine.analyze(
+            sessions = listOf(oct29LateEvening, nov1SixPmPb),
+            todayIso = "2026-11-08",
+            zoneId = ist,
+            expectedExamBatch = ExamTimeBatch.MORNING_GROUND
+        )
+        assertEquals(DailySessionScheduleMode.ONE_MORNING_EXAM_REHEARSAL, sundayMorningRehearsal.scheduleMode)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

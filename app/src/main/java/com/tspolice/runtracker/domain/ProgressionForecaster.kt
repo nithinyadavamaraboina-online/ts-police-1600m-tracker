@@ -489,9 +489,9 @@ object DeadlineGoalCoach {
         }
 
         val weeklyStructureHint =
-            "Weekly Mix (5 days on / 2 rest): 2× 400m Speed Reps (8.5/10)  •  1× Nonstop 1.6K Trial (9/10)  •  2× Easy 2.4km Stamina Jog (5/10)."
+            "Smart Weekly Plan (1 evening run/day • 2 rest days): 2× Fast 400m Laps  •  1× Nonstop 1.6 km Time Check  •  2× Slow Talk-Pace Jogs."
 
-        // Decide TODAY'S exact Push RPE & Workout Action
+        // Decide TODAY'S exact Push & Workout Action
         return when {
             qualified -> DeadlineGoalPlan(
                 deadlineIso = deadlineIso,
@@ -506,16 +506,16 @@ object DeadlineGoalCoach {
                 requiredCutPerWeekSec = 0.0,
                 recommendedIntervalLapSec = targetLapSec - 2.0,
                 readinessPercent = 100,
-                pushBadgeLabel = "PUSH 7/10 • MAINTAIN",
+                pushBadgeLabel = "QUALIFIED • STAY SHARP",
                 pushRpeScore = 7.0,
                 pushAccentKind = PushAccentKind.LIME_GO,
                 headlineTitle = headline,
                 statusSummary = statusSummary,
-                todayPushDirective = "You already beat $targetFmt! Maintain sharpness without injury: 1 crisp 400m session + 1 controlled 1.6K run per week, keeping easy jogs relaxed.",
+                todayPushDirective = "You already beat $targetFmt! Keep your legs sharp without injury: 1 fast 400m lap session + 1 controlled 1.6 km run per week, keeping other jogs slow and relaxed.",
                 weeklyStructureHint = weeklyStructureHint,
                 checkpoints = checkpoints,
                 recommendedAction = RecommendedWorkoutAction.START_400M_INTERVALS,
-                recommendedActionLabel = "Run Sharpener 4 × 400m Reps  →"
+                recommendedActionLabel = "Run Sharpener 4 × 400m Laps  →"
             )
 
             daysRemaining == 0 -> DeadlineGoalPlan(
@@ -531,12 +531,12 @@ object DeadlineGoalCoach {
                 requiredCutPerWeekSec = requiredCutPerWeek,
                 recommendedIntervalLapSec = targetLapSec,
                 readinessPercent = readinessPct,
-                pushBadgeLabel = "10/10 • EXAM DAY",
+                pushBadgeLabel = "EXAM DAY • GO!",
                 pushRpeScore = 10.0,
                 pushAccentKind = PushAccentKind.LIME_GO,
                 headlineTitle = headline,
                 statusSummary = statusSummary,
-                todayPushDirective = "Push 10/10 smartly: run Lap 1 controlled at 1:49 (don't sprint the first 200m!), lock ≥170 spm cadence on Laps 2–3, and sprint all-out the final 250m!",
+                todayPushDirective = "Exam Day Game Plan: Start Lap 1 controlled at 1:49 (do NOT sprint the first 200m!), keep quick 170+ steps/min on Laps 2–3, and sprint all-out in the final 250m!",
                 weeklyStructureHint = weeklyStructureHint,
                 checkpoints = checkpoints,
                 recommendedAction = RecommendedWorkoutAction.ARM_1600M_TRIAL,
@@ -556,12 +556,12 @@ object DeadlineGoalCoach {
                 requiredCutPerWeekSec = requiredCutPerWeek,
                 recommendedIntervalLapSec = targetLapSec,
                 readinessPercent = readinessPct,
-                pushBadgeLabel = "PUSH 3/10 • TAPER",
+                pushBadgeLabel = "FRESHEN LEGS",
                 pushRpeScore = 3.0,
                 pushAccentKind = PushAccentKind.PURPLE_RECOVERY,
                 headlineTitle = headline,
                 statusSummary = statusSummary,
-                todayPushDirective = "Only $daysRemaining day${if (daysRemaining == 1) "" else "s"} to $deadlineLabel! Do NOT tire your legs with a hard test today — 8 min light jog + 3 × 80m crisp strides so you have 100% snap on test day.",
+                todayPushDirective = "Only $daysRemaining day${if (daysRemaining == 1) "" else "s"} to $deadlineLabel! Do NOT tire your legs with a hard test today — just an 8-min slow jog + 2 short smooth strides so your legs feel 100% bouncy on exam day.",
                 weeklyStructureHint = weeklyStructureHint,
                 checkpoints = checkpoints,
                 recommendedAction = RecommendedWorkoutAction.EASY_AEROBIC_JOG,
@@ -581,12 +581,12 @@ object DeadlineGoalCoach {
                 requiredCutPerWeekSec = requiredCutPerWeek,
                 recommendedIntervalLapSec = recommendedIntervalLapSec,
                 readinessPercent = readinessPct,
-                pushBadgeLabel = "✓ TODAY DONE • RECOVER",
+                pushBadgeLabel = "DONE TODAY ✓",
                 pushRpeScore = 4.0,
                 pushAccentKind = PushAccentKind.LIME_GO,
                 headlineTitle = headline,
                 statusSummary = statusSummary,
-                todayPushDirective = "Great work — today's run is banked (${formatShortDist(todaySummary.jogRunCombinedMeters)} jog/run)! Hydrate, stretch calves & shins tonight, and keep tomorrow at an easy 4–5/10 aerobic effort.",
+                todayPushDirective = "Great work — today's run is done (${formatShortDist(todaySummary.jogRunCombinedMeters)})! Drink water, stretch calves & shins tonight, and tomorrow do ONLY a slow, comfortable 18-min jog (talk-test pace — NO sprinting!).",
                 weeklyStructureHint = weeklyStructureHint,
                 checkpoints = checkpoints,
                 recommendedAction = RecommendedWorkoutAction.DONE_FOR_TODAY,
@@ -606,16 +606,16 @@ object DeadlineGoalCoach {
                 requiredCutPerWeekSec = requiredCutPerWeek,
                 recommendedIntervalLapSec = recommendedIntervalLapSec,
                 readinessPercent = readinessPct,
-                pushBadgeLabel = "PUSH 4.5/10 • AEROBIC",
+                pushBadgeLabel = "EASY SLOW JOG",
                 pushRpeScore = 4.5,
                 pushAccentKind = PushAccentKind.PURPLE_RECOVERY,
                 headlineTitle = headline,
                 statusSummary = statusSummary,
-                todayPushDirective = "Yesterday was a hard session — pushing 9/10 two days in a row risks shin splints! Today push 4.5/10: 18–22 min easy continuous jog (145–155 spm, conversational breathing) so you can attack tomorrow's speed session hard.",
+                todayPushDirective = "Yesterday was a hard run — sprinting two days in a row causes shin pain! Today do 1 slow 18–20 min jog where you can talk in full sentences without gasping, so your legs are fresh for tomorrow's speed session.",
                 weeklyStructureHint = weeklyStructureHint,
                 checkpoints = checkpoints,
                 recommendedAction = RecommendedWorkoutAction.EASY_AEROBIC_JOG,
-                recommendedActionLabel = "Easy 20-Min Continuous Jog Today"
+                recommendedActionLabel = "Easy 20-Min Slow Jog Today"
             )
 
             !hasCleanNonstop1600m -> DeadlineGoalPlan(
@@ -631,12 +631,12 @@ object DeadlineGoalCoach {
                 requiredCutPerWeekSec = requiredCutPerWeek,
                 recommendedIntervalLapSec = recommendedIntervalLapSec,
                 readinessPercent = readinessPct,
-                pushBadgeLabel = "PUSH 8/10 • ZERO-STOP",
+                pushBadgeLabel = "NONSTOP 1.6K TEST",
                 pushRpeScore = 8.0,
                 pushAccentKind = PushAccentKind.ORANGE_HARD,
                 headlineTitle = headline,
                 statusSummary = statusSummary,
-                todayPushDirective = "Push 8/10 today: run a full 1.6 km PT Trial with ZERO walking/standing stops! Start controlled (~158–165 spm) on Laps 1–3 so you don't gas out, then push Lap 4 hard to lock your true nonstop baseline (< ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)}).",
+                todayPushDirective = "Today's goal: finish a full 1.6 km PT Trial with ZERO walking or standing stops! Start steady on Laps 1–3 so you don't run out of breath, then push Lap 4 hard (< ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)}).",
                 weeklyStructureHint = weeklyStructureHint,
                 checkpoints = checkpoints,
                 recommendedAction = RecommendedWorkoutAction.ARM_1600M_TRIAL,
@@ -658,16 +658,16 @@ object DeadlineGoalCoach {
                     requiredCutPerWeekSec = requiredCutPerWeek,
                     recommendedIntervalLapSec = recommendedIntervalLapSec,
                     readinessPercent = readinessPct,
-                    pushBadgeLabel = "PUSH 8.5/10 • SPEED REPS",
+                    pushBadgeLabel = "FAST 400M LAPS",
                     pushRpeScore = 8.5,
                     pushAccentKind = PushAccentKind.ORANGE_HARD,
                     headlineTitle = headline,
                     statusSummary = statusSummary,
-                    todayPushDirective = "Fresh legs today — push 8.5/10 on speed! Run 6 × 400m intervals targeting ~$lapFmt per lap (≥168 spm quick light steps) with 90s walk recovery to pull your 1.6K pace toward ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)}.",
+                    todayPushDirective = "Fresh legs today — build speed! Run 6 × 400m fast laps aiming for ~$lapFmt per lap (quick, light 168+ steps/min) with 90s slow walk rest between laps.",
                     weeklyStructureHint = weeklyStructureHint,
                     checkpoints = checkpoints,
                     recommendedAction = RecommendedWorkoutAction.START_400M_INTERVALS,
-                    recommendedActionLabel = "Launch 6 × 400m Speed Reps (~$lapFmt)  →"
+                    recommendedActionLabel = "Launch 6 × 400m Speed Laps (~$lapFmt)  →"
                 )
             }
         }

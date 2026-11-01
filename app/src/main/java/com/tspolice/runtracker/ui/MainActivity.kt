@@ -38,6 +38,8 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import com.tspolice.runtracker.data.RunRepository
+import com.tspolice.runtracker.domain.CoachBrainEngine
+import com.tspolice.runtracker.domain.CoachBrainReport
 import com.tspolice.runtracker.domain.ComparisonDayScope
 import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.DeadlineGoalCoach
@@ -45,6 +47,7 @@ import com.tspolice.runtracker.domain.DeadlineGoalPlan
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.HealthSyncStatus
 import com.tspolice.runtracker.domain.IntervalPhase
+import com.tspolice.runtracker.domain.LegFeelCheckIn
 import com.tspolice.runtracker.domain.LiveTelemetry
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.PocketAudioMode
@@ -153,9 +156,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var goalPushBadge: TextView
     private lateinit var goalReadinessBar: NeonUpdateProgressBarView
     private lateinit var goalStatusText: TextView
+    private val goalLegFeelBtns = mutableListOf<Pair<LegFeelCheckIn, TextView>>()
+    private lateinit var goalSchedulePillText: TextView
+    private lateinit var goalHeadlineSimpleText: TextView
     private lateinit var goalDirectiveText: TextView
+    private lateinit var goalWhatToDoBox: LinearLayout
+    private lateinit var goalWhatToDoText: TextView
+    private lateinit var goalWhatNotToDoBox: LinearLayout
+    private lateinit var goalWhatNotToDoText: TextView
+    private lateinit var goalFuelTipText: TextView
     private lateinit var goalMiniMilestonesLayout: LinearLayout
     private lateinit var goalActionBtn: TextView
+    private lateinit var goalOpenBrainBtn: TextView
     private lateinit var dailyMaxPaceVal: TextView
     private lateinit var dailyMaxPaceSub: TextView
     private lateinit var dailyMaxCadenceVal: TextView
@@ -246,6 +258,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var progressGoalReadinessPill: TextView
     private lateinit var progressGoalWeeklyMixText: TextView
     private lateinit var progressMilestonesLayout: LinearLayout
+    private lateinit var progressBrainConfidenceBadge: TextView
+    private lateinit var progressCoachBrainBody: LinearLayout
     private lateinit var kpiPbVal: TextView
     private lateinit var kpiGapVal: TextView
     private lateinit var kpiRateVal: TextView
@@ -1190,7 +1204,7 @@ class MainActivity : AppCompatActivity() {
         }
         goalHeaderLabel = AthleticTheme.sectionLabel(
             this,
-            "NOV 30 GOAL  •  29D LEFT  ✎",
+            "COACH BRAIN  •  NOV 30  ✎",
             AthleticColors.AMBER_BRIGHT
         ).apply {
             isClickable = true
@@ -1202,7 +1216,7 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { showGoalDeadlinePicker() }
         }
         goalPushBadge = TextView(this).apply {
-            text = "PUSH 8/10"
+            text = "EASY SLOW JOG"
             textSize = 10.5f
             typeface = AthleticTheme.FONT_SANS_BOLD
             setPadding(dp(9), dp(4), dp(9), dp(4))
@@ -1232,33 +1246,155 @@ class MainActivity : AppCompatActivity() {
 
         goalStatusText = TextView(this).apply {
             text = "Loading Nov 30 goal readiness..."
-            textSize = 12f
+            textSize = 11.5f
             setTextColor(AthleticColors.TEXT_SECONDARY)
             setLineSpacing(0f, 1.15f)
         }
         goalCoachCard.addView(goalStatusText)
 
-        goalDirectiveText = TextView(this).apply {
-            text = ""
-            textSize = 12.5f
-            typeface = AthleticTheme.FONT_SANS_MEDIUM
-            setTextColor(AthleticColors.TEXT_PRIMARY)
-            setLineSpacing(0f, 1.18f)
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = AthleticTheme.solidPill(
-                this@MainActivity,
-                0x33000000,
-                AthleticColors.BORDER_STRONG,
-                12f
-            )
+        // 1-Tap Leg Feel Check-In Strip (Auto | Fresh | Tired | Sore Shins)
+        val feelWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(10)
+            ).apply { topMargin = dp(10) }
+        }
+        feelWrap.addView(TextView(this).apply {
+            text = "HOW DO YOUR LEGS FEEL TODAY? (1-TAP ADAPTS PLAN)"
+            textSize = 9.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            letterSpacing = 0.05f
+            setTextColor(AthleticColors.TEXT_MUTED)
+            setPadding(0, 0, 0, dp(5))
+        })
+        val feelRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 10f)
+        }
+        goalLegFeelBtns.clear()
+        for (feel in LegFeelCheckIn.values()) {
+            val tv = TextView(this).apply {
+                text = feel.chipLabel
+                gravity = Gravity.CENTER
+                textSize = 11f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setPadding(dp(4), dp(6), dp(4), dp(6))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    repository.setTodayLegFeel(feel)
+                    lastGoalCoachKey = ""
+                    renderGoalCoachCard(force = true)
+                    refreshProgressDashboard()
+                }
             }
+            goalLegFeelBtns.add(feel to tv)
+            feelRow.addView(tv)
+        }
+        feelWrap.addView(feelRow)
+        goalCoachCard.addView(feelWrap)
+
+        // Schedule & Best Running Clock Window Pill
+        goalSchedulePillText = TextView(this).apply {
+            text = "1 Evening Run Only  •  Best Slot: 6:00–6:40 PM"
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            setPadding(dp(11), dp(7), dp(11), dp(7))
+            background = AthleticTheme.solidPill(this@MainActivity, 0x249D6BFF, AthleticColors.HERO_CYAN_BORDER, 10f)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(10) }
+        }
+        goalCoachCard.addView(goalSchedulePillText)
+
+        // Simple Plain-English Headline + "Why" Explanation
+        goalHeadlineSimpleText = TextView(this).apply {
+            text = ""
+            textSize = 15.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(10), 0, dp(3))
+        }
+        goalCoachCard.addView(goalHeadlineSimpleText)
+
+        goalDirectiveText = TextView(this).apply {
+            text = ""
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setLineSpacing(0f, 1.17f)
         }
         goalCoachCard.addView(goalDirectiveText)
+
+        // WHAT TO DO Box (Plain Everyday Words)
+        goalWhatToDoBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = AthleticTheme.solidPill(this@MainActivity, 0x24000000, AthleticColors.HERO_EMERALD_BORDER, 12f)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(10) }
+        }
+        goalWhatToDoBox.addView(TextView(this).apply {
+            text = "✓  WHAT TO DO (SIMPLE STEPS)"
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            letterSpacing = 0.05f
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            setPadding(0, 0, 0, dp(4))
+        })
+        goalWhatToDoText = TextView(this).apply {
+            textSize = 12.2f
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setLineSpacing(0f, 1.22f)
+        }
+        goalWhatToDoBox.addView(goalWhatToDoText)
+        goalCoachCard.addView(goalWhatToDoBox)
+
+        // WHAT NOT TO DO Box (Mistakes to Avoid)
+        goalWhatNotToDoBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = AthleticTheme.solidPill(this@MainActivity, 0x24000000, AthleticColors.HERO_AMBER_BORDER, 12f)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        }
+        goalWhatNotToDoBox.addView(TextView(this).apply {
+            text = "✕  WHAT NOT TO DO"
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            letterSpacing = 0.05f
+            setTextColor(AthleticColors.AMBER_BRIGHT)
+            setPadding(0, 0, 0, dp(4))
+        })
+        goalWhatNotToDoText = TextView(this).apply {
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setLineSpacing(0f, 1.2f)
+        }
+        goalWhatNotToDoBox.addView(goalWhatNotToDoText)
+        goalCoachCard.addView(goalWhatNotToDoBox)
+
+        // Fuel, Carbs, Protein & Hydration Box
+        goalFuelTipText = TextView(this).apply {
+            textSize = 11.5f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setLineSpacing(0f, 1.16f)
+            setPadding(dp(11), dp(8), dp(11), dp(8))
+            background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 10f)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        }
+        goalCoachCard.addView(goalFuelTipText)
 
         goalMiniMilestonesLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1285,6 +1421,21 @@ class MainActivity : AppCompatActivity() {
             )
         }
         goalCoachCard.addView(goalActionBtn)
+
+        goalOpenBrainBtn = AthleticTheme.createButton(
+            this,
+            "Timing (5 PM vs 6 PM vs Morning) & 1 vs 2 Runs  ↗",
+            AthleticTheme.ButtonStyle.SUBTLE_OUTLINE,
+            40f
+        ).apply {
+            textSize = 11.5f
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+            setOnClickListener { openFullCoachBrainModal() }
+        }
+        goalCoachCard.addView(goalOpenBrainBtn)
 
         return goalCoachCard
     }
@@ -1729,7 +1880,7 @@ class MainActivity : AppCompatActivity() {
                 .apply { bottomMargin = dp(8) }
         }
         intervalRepPresetBtns.clear()
-        for (reps in listOf(4, 6, 8)) {
+        for (reps in listOf(4, 5, 6, 8)) {
             val tv = TextView(this).apply {
                 text = "$reps × 400m"
                 gravity = Gravity.CENTER
@@ -1974,6 +2125,47 @@ class MainActivity : AppCompatActivity() {
         goalRoadmapCard.addView(progressMilestonesLayout)
         col.addView(goalRoadmapCard)
 
+        // Expert Coach Brain: 1 vs 2 Sessions + Time-of-Day Pace Variation (Early Morning | 5 PM | 6 PM | 7+ PM)
+        val brainTimingCard = cardContainer(
+            topColor = AthleticColors.SURFACE_TOP,
+            bottomColor = AthleticColors.SURFACE_BOTTOM,
+            borderColor = AthleticColors.BORDER_STRONG
+        )
+        val brainTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(10))
+        }
+        brainTopRow.addView(
+            AthleticTheme.sectionLabel(
+                this,
+                "COACH BRAIN  •  TIMING & SCHEDULE",
+                AthleticColors.EMERALD_BRIGHT
+            ).apply {
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginEnd = dp(6)
+                }
+            }
+        )
+        progressBrainConfidenceBadge = TextView(this).apply {
+            text = "ACTIVE"
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            setPadding(dp(8), dp(3f), dp(8), dp(3f))
+            background = AthleticTheme.solidPill(this@MainActivity, 0x249D6BFF, AthleticColors.HERO_CYAN_BORDER, 9f)
+        }
+        brainTopRow.addView(progressBrainConfidenceBadge)
+        brainTimingCard.addView(brainTopRow)
+
+        progressCoachBrainBody = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        brainTimingCard.addView(progressCoachBrainBody)
+        col.addView(brainTimingCard)
+
         // 2x2 KPI Bento Grid
         val kpiRow1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2112,6 +2304,39 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(28))
         }
+
+        // 0. Expert Running Coach Brain Card (Top of Coach & Lab Tab)
+        val coachBrainHubCard = cardContainer(
+            topColor = AthleticColors.HERO_EMERALD_TOP,
+            bottomColor = AthleticColors.HERO_EMERALD_BOTTOM,
+            borderColor = AthleticColors.HERO_EMERALD_BORDER
+        )
+        coachBrainHubCard.addView(
+            AthleticTheme.sectionLabel(
+                this,
+                "EXPERT RUNNING COACH BRAIN  •  PERSONALIZED",
+                AthleticColors.EMERALD_BRIGHT
+            )
+        )
+        coachBrainHubCard.addView(TextView(this).apply {
+            text = "Plain-English What To Do & What NOT To Do, personalized Carbs / Protein / Calorie math, 1 Evening vs 2 Sessions schedule planner, and 5 PM vs 6 PM vs Morning timing analysis."
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setLineSpacing(0f, 1.25f)
+            setPadding(0, dp(6), 0, dp(10))
+        })
+        coachBrainHubCard.addView(
+            AthleticTheme.createButton(
+                this,
+                "Open Full Coach Brain Report & Settings  →",
+                AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
+                44f
+            ).apply {
+                textSize = 12.5f
+                setOnClickListener { openFullCoachBrainModal() }
+            }
+        )
+        col.addView(coachBrainHubCard)
 
         // 1. Samsung / Android Background Protection Card
         val batCard = cardContainer()
@@ -3765,8 +3990,10 @@ class MainActivity : AppCompatActivity() {
         demoToggleBtn.text = if (repository.hasDemoSessions()) "Clear Sample" else "Sample Data"
 
         val goalPlan = buildCurrentGoalPlan(sessions = sessions)
-        applyGoalPlanToTodayCard(goalPlan)
+        val brainReport = buildCurrentCoachBrainReport(sessions = sessions)
+        applyGoalPlanToTodayCard(goalPlan, brainReport)
         renderProgressGoalRoadmap(goalPlan)
+        renderProgressCoachBrainCard(brainReport)
 
         val todayIso = LocalDate.now().toString()
         val todaySessions = sessions.filter { it.dateIso == todayIso }
@@ -4959,7 +5186,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // NOV 30 GOAL DEADLINE & DYNAMIC DAILY PUSH COACH
+    // NOV 30 GOAL DEADLINE & EXPERT RUNNING COACH BRAIN
     // =========================================================================
     private fun buildCurrentGoalPlan(
         sessions: List<RunSessionRecord>? = null,
@@ -4985,29 +5212,97 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private fun buildCurrentCoachBrainReport(
+        sessions: List<RunSessionRecord>? = null,
+        dailyOverride: DailyActivitySummary? = null
+    ): CoachBrainReport {
+        val todayIso = LocalDate.now().toString()
+        val yesterdayIso = LocalDate.now().minusDays(1).toString()
+        val allSessions = sessions ?: repository.getAllSessions()
+
+        val dailyMap = LinkedHashMap(repository.getRecentDailyActivitiesMap(14, todayIso))
+        val liveToday = dailyOverride
+            ?: latestDailySummaryForCompare.takeIf { it.dateIso == todayIso }
+            ?: dailyMap[todayIso]
+            ?: repository.getDailyActivity(todayIso)
+        dailyMap[todayIso] = liveToday
+
+        val samsungMap = LinkedHashMap(repository.getAllCachedSamsungSnapshots())
+        latestSamsungSnapshot?.let { samsungMap[todayIso] = it }
+        yesterdaySamsungSnapshot?.let { samsungMap[yesterdayIso] = it }
+
+        val hourlyBuckets = repository.getRecentHourlyBuckets(14, todayIso)
+
+        return CoachBrainEngine.analyze(
+            sessions = allSessions,
+            dailyMap = dailyMap,
+            samsungMap = samsungMap,
+            hourlyBuckets = hourlyBuckets,
+            targetTimeSec = repository.targetTimeSec,
+            deadlineIso = repository.goalDeadlineIso,
+            todayIso = todayIso,
+            runnerHeightCm = repository.runnerHeightCm,
+            runnerWeightKg = repository.runnerWeightKg,
+            legFeel = repository.getTodayLegFeel(todayIso),
+            expectedExamBatch = repository.expectedExamBatch
+        )
+    }
+
+    private fun openFullCoachBrainModal() {
+        SessionDialogs.showCoachBrainDialog(
+            ctx = this,
+            repository = repository,
+            reportProvider = { buildCurrentCoachBrainReport() },
+            onSettingsChanged = {
+                lastGoalCoachKey = ""
+                renderGoalCoachCard(force = true)
+                refreshProgressDashboard()
+            }
+        )
+    }
+
+    private fun renderProgressCoachBrainCard(report: CoachBrainReport) {
+        if (!::progressCoachBrainBody.isInitialized) return
+        progressBrainConfidenceBadge.text = report.confidenceLabel
+        SessionDialogs.populateCoachBrainIntelligenceSection(
+            ctx = this,
+            host = progressCoachBrainBody,
+            report = report,
+            repository = repository
+        ) {
+            lastGoalCoachKey = ""
+            renderGoalCoachCard(force = true)
+            refreshProgressDashboard()
+        }
+    }
+
     private fun renderGoalCoachCard(
         dailyOverride: DailyActivitySummary? = null,
         force: Boolean = false
     ) {
         if (!::goalCoachCard.isInitialized) return
         val nowMs = SystemClock.elapsedRealtime()
+        val todayIso = LocalDate.now().toString()
         val todaySum = dailyOverride ?: latestDailySummaryForCompare
-        val key = "${LocalDate.now()}:${repository.targetTimeSec.toInt()}:${repository.goalDeadlineIso}:" +
-            "${(todaySum.jogRunCombinedMeters / 100.0).toInt()}"
+        val key = "$todayIso:${repository.targetTimeSec.toInt()}:${repository.goalDeadlineIso}:" +
+            "${(todaySum.jogRunCombinedMeters / 100.0).toInt()}:${(todaySum.totalSteps / 250)}:" +
+            "${repository.getTodayLegFeel(todayIso)}:${repository.runnerWeightKg}:${repository.expectedExamBatch}"
         if (!force && key == lastGoalCoachKey && (nowMs - lastGoalCoachRenderMs) < 12_000L) {
             return
         }
         lastGoalCoachKey = key
         lastGoalCoachRenderMs = nowMs
 
-        val plan = buildCurrentGoalPlan(dailyOverride = dailyOverride)
-        applyGoalPlanToTodayCard(plan)
+        val allSessions = repository.getAllSessions()
+        val plan = buildCurrentGoalPlan(sessions = allSessions, dailyOverride = dailyOverride)
+        val brain = buildCurrentCoachBrainReport(sessions = allSessions, dailyOverride = dailyOverride)
+        applyGoalPlanToTodayCard(plan, brain)
     }
 
-    private fun applyGoalPlanToTodayCard(plan: DeadlineGoalPlan) {
+    private fun applyGoalPlanToTodayCard(plan: DeadlineGoalPlan, brain: CoachBrainReport) {
         if (!::goalCoachCard.isInitialized) return
 
-        val (topGrad, botGrad, borderCol, accentCol, btnStyle) = when (plan.pushAccentKind) {
+        val (topGrad, botGrad, borderCol, accentCol, btnStyle) = when (brain.accentKind) {
             PushAccentKind.ORANGE_HARD -> quintuple(
                 AthleticColors.HERO_AMBER_TOP,
                 AthleticColors.HERO_AMBER_BOTTOM,
@@ -5034,14 +5329,14 @@ class MainActivity : AppCompatActivity() {
         goalCoachCard.background = AthleticTheme.gradientCard(this, topGrad, botGrad, borderCol, 18f)
 
         val daysTxt = if (plan.daysRemaining == 0) {
-            "EXAM DAY (${plan.deadlineLabel.uppercase()})"
+            "COACH BRAIN  •  EXAM DAY (${plan.deadlineLabel.uppercase()})"
         } else {
-            "${plan.deadlineLabel.uppercase()} GOAL  •  ${plan.daysRemaining}D LEFT  ✎"
+            "COACH BRAIN  •  ${plan.deadlineLabel.uppercase()} (${plan.daysRemaining}D)  ✎"
         }
         goalHeaderLabel.text = daysTxt
         goalHeaderLabel.setTextColor(accentCol)
 
-        goalPushBadge.text = plan.pushBadgeLabel
+        goalPushBadge.text = brain.effortBadgePlain
         goalPushBadge.setTextColor(accentCol)
         goalPushBadge.background = AthleticTheme.solidPill(
             this,
@@ -5052,13 +5347,35 @@ class MainActivity : AppCompatActivity() {
 
         goalReadinessBar.setProgressPercent(plan.readinessPercent, animate = true)
         goalStatusText.text = plan.statusSummary
-        goalDirectiveText.text = plan.todayPushDirective
-        goalDirectiveText.background = AthleticTheme.solidPill(
-            this,
-            0x36000000,
-            borderCol,
-            12f
-        )
+
+        // Highlight active 1-Tap Leg Feel chip
+        val activeFeel = repository.getTodayLegFeel()
+        for ((feel, tv) in goalLegFeelBtns) {
+            val selected = feel == activeFeel
+            if (selected) {
+                val chipCol = when (feel) {
+                    LegFeelCheckIn.SORE_SHINS -> AthleticColors.AMBER_BRIGHT
+                    LegFeelCheckIn.TIRED -> AthleticColors.CYAN_BRIGHT
+                    LegFeelCheckIn.FRESH -> AthleticColors.EMERALD_BRIGHT
+                    LegFeelCheckIn.AUTO -> accentCol
+                }
+                tv.background = AthleticTheme.solidPill(this, chipCol, chipCol, 8f, 0f)
+                tv.setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            } else {
+                tv.background = null
+                tv.setTextColor(AthleticColors.TEXT_SECONDARY)
+            }
+        }
+
+        val bestSlotShort = brain.bestTimeSlot?.title ?: "5:30–6:30 PM"
+        goalSchedulePillText.text = "Schedule: ${brain.scheduleMode.shortBadge}  •  Best Time: $bestSlotShort"
+
+        goalHeadlineSimpleText.text = brain.simpleHeadline
+        goalDirectiveText.text = brain.plainWhyExplanation
+
+        goalWhatToDoText.text = brain.whatToDo.joinToString("\n\n") { "•  $it" }
+        goalWhatNotToDoText.text = brain.whatNotToDo.joinToString("\n\n") { "•  $it" }
+        goalFuelTipText.text = brain.fuelAndHydrationTip
 
         // Compact 4-stage milestone strip inside Today Goal Card
         goalMiniMilestonesLayout.removeAllViews()
@@ -5102,10 +5419,10 @@ class MainActivity : AppCompatActivity() {
             goalMiniMilestonesLayout.addView(chip)
         }
 
-        goalActionBtn.text = plan.recommendedActionLabel
+        goalActionBtn.text = brain.recommendedActionLabel
         AthleticTheme.applyButtonStyle(this, goalActionBtn, btnStyle)
         goalActionBtn.setOnClickListener {
-            when (plan.recommendedAction) {
+            when (brain.recommendedAction) {
                 RecommendedWorkoutAction.ARM_1600M_TRIAL -> {
                     selectTrackerSubTab(1, animate = true)
                     if (lastRenderedPtPhase == PtTrialPhase.IDLE) {
@@ -5114,7 +5431,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 RecommendedWorkoutAction.START_400M_INTERVALS -> {
-                    selectedIntervalReps = 6
+                    selectedIntervalReps = brain.recommendedIntervalReps.coerceIn(4, 8)
                     refreshIntervalRepPresets()
                     selectTrackerSubTab(2, animate = true)
                 }
@@ -5125,7 +5442,7 @@ class MainActivity : AppCompatActivity() {
                     requestNeededPermissionsIfMissing(silentCheckOnly = false)
                     Toast.makeText(
                         this,
-                        "Push ~4.5/10 easy continuous jog (145–155 spm) — Today auto-records every step!",
+                        "Jog slowly for 18–20 mins at an easy talk-test pace — Today tab tracks every step automatically!",
                         Toast.LENGTH_LONG
                     ).show()
                 }
