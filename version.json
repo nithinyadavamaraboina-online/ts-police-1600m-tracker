@@ -1,8 +1,8 @@
 {
-    "versionCode":  27,
-    "versionName":  "1.0.26",
+    "versionCode":  28,
+    "versionName":  "1.0.27",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "7ef95b3755cda27569fdfeb742b9c6f9a7d9911d4e89aa12ef222d26b2526743",
-    "changelog":  "Add 1-tap Share Run option with HD 1080x1350 AMOLED 1.6 km Run Poster card, 4x400m split bars, Nov 30 readiness meter, and Copy Text support.",
-    "publishedAt":  "2026-11-01T14:06:39Z"
+    "sha256":  "b819d6da6dd72c4455a9cbbaf2f05016a8ccc7a55933ea25a96fd71eedf599cf",
+    "changelog":  "Display clean whole-second mm:ss times (e.g. 8:47 instead of 8:47.2) across Today\u0027s 1.6 km Hero Spotlight, Past Run Logs, Share Run poster \u0026 caption, splits, and KPI tiles.",
+    "publishedAt":  "2026-11-01T15:06:18Z"
 }

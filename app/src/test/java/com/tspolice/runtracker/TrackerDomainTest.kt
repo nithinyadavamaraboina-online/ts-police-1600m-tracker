@@ -1342,7 +1342,7 @@ class TrackerDomainTest {
         )
         assertEquals(42.0, btForecast.improvementSecPerWeek ?: 0.0, 0.01)
 
-        // 6. Share caption formats Today's 1.6 km PB, splits, and Nov 30 countdown cleanly
+        // 6. Share caption formats Today's 1.6 km PB, splits, and Nov 30 countdown cleanly without .X tenths
         val caption = RunShareHelper.buildShareCaption(
             session = breakthroughTrial,
             targetSec = 435.0,
@@ -1350,7 +1350,8 @@ class TrackerDomainTest {
             isPersonalBest = true,
             todayIso = "2026-11-01"
         )
-        assertTrue(caption.contains("8:47.2"))
+        assertTrue(caption.contains("8:47"))
+        assertFalse(caption.contains("8:47.2"))
         assertTrue(caption.contains("NEW PB"))
         assertTrue(caption.contains("Nov 30"))
     }

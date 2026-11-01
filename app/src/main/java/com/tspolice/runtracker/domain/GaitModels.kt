@@ -349,13 +349,13 @@ object TsPoliceBenchmark {
 
     fun formatSignedDelta(deltaSec: Double): String {
         val sign = if (deltaSec <= 0.0) "-" else "+"
-        val absVal = abs(deltaSec)
-        val mins = (absVal.toInt()) / 60
-        val secs = (absVal.roundToInt()) % 60
+        val absRounded = abs(deltaSec).roundToInt()
+        val mins = absRounded / 60
+        val secs = absRounded % 60
         return if (mins > 0) {
             String.format("%s%d:%02d", sign, mins, secs)
         } else {
-            String.format("%s%.1fs", sign, absVal)
+            String.format("%s%ds", sign, absRounded)
         }
     }
 

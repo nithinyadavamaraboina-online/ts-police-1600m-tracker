@@ -329,7 +329,7 @@ class PaceArcGaugeView(context: Context) : View(context) {
         canvas.drawText(badgeStr, cx, pillTop + dp(15.5f), badgeTextPaint)
 
         // Official continuous stopwatch
-        val timeText = TsPoliceBenchmark.formatDuration(activeSec, includeTenths = true)
+        val timeText = TsPoliceBenchmark.formatDuration(activeSec)
         canvas.drawText(timeText, cx, cy + dp(6f), timerPaint)
 
         // Distance subtitle
@@ -352,7 +352,7 @@ class PaceArcGaugeView(context: Context) : View(context) {
                 bottomText = "${TsPoliceBenchmark.formatSignedDelta(delta)} BEHIND $targetLabel CUTOFF"
             }
         } else {
-            val lapTarget = TsPoliceBenchmark.formatDuration(TsPoliceBenchmark.targetLap400mSec(targetTimeSec), true)
+            val lapTarget = TsPoliceBenchmark.formatDuration(TsPoliceBenchmark.targetLap400mSec(targetTimeSec))
             deltaPaint.color = AthleticColors.TEXT_SECONDARY
             bottomText = "Target < $targetLabel ($lapTarget / 400m • Unpaused RFID Rules)"
         }
@@ -438,7 +438,7 @@ class IntervalDialView(context: Context) : View(context) {
                 canvas.drawText("SPEED ENDURANCE COACH", cx, cy - dp(38f), badgePaint)
                 canvas.drawText("6 × 400m", cx, cy + dp(6f), mainPaint)
                 canvas.drawText(
-                    "Target ${TsPoliceBenchmark.formatDuration(state.targetRepSec, true)} / 400m  •  90s Rest",
+                    "Target ${TsPoliceBenchmark.formatDuration(state.targetRepSec)} / 400m  •  90s Rest",
                     cx,
                     cy + dp(32f),
                     subPaint
@@ -450,7 +450,7 @@ class IntervalDialView(context: Context) : View(context) {
                 canvas.drawArc(rect, -90f, 360f * ratio, false, arcPaint)
                 badgePaint.color = AthleticColors.EMERALD_BRIGHT
                 canvas.drawText("REP ${state.currentRep} OF ${state.totalReps} • SPRINT", cx, cy - dp(38f), badgePaint)
-                canvas.drawText(TsPoliceBenchmark.formatDuration(state.repDurationSec, true), cx, cy + dp(6f), mainPaint)
+                canvas.drawText(TsPoliceBenchmark.formatDuration(state.repDurationSec), cx, cy + dp(6f), mainPaint)
                 canvas.drawText("${state.repDistanceMeters.toInt()} m / 400 m", cx, cy + dp(32f), subPaint)
             }
             IntervalPhase.REST_COUNTDOWN -> {

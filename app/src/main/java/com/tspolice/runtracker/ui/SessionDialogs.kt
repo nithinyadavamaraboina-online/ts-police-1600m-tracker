@@ -68,7 +68,7 @@ object SessionDialogs {
         root.addView(TextView(ctx).apply {
             val isExact = abs(session.distanceMeters - 1600.0) <= 50.0
             val suffix = if (isExact) "Official 1.6K" else "1.6K Equiv"
-            text = "${TsPoliceBenchmark.formatDuration(session.equiv1600mSec, true)}  ($suffix)"
+            text = "${TsPoliceBenchmark.formatDuration(session.equiv1600mSec)}  ($suffix)"
             textSize = 26f
             typeface = AthleticTheme.FONT_TABULAR_BOLD
             setTextColor(if (merit.qualified) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_PRIMARY)
@@ -104,7 +104,7 @@ object SessionDialogs {
         val avgSpd = if (session.activeDurationSec > 1.0) session.distanceMeters / session.activeDurationSec else 0.0
         val statLines = buildList {
             add("Distance" to String.format("%.2f km (%d m)", session.distanceMeters / 1000.0, session.distanceMeters.toInt()))
-            add("Elapsed Clock" to TsPoliceBenchmark.formatDuration(session.activeDurationSec, true))
+            add("Elapsed Clock" to TsPoliceBenchmark.formatDuration(session.activeDurationSec))
             add("Average Pace" to TsPoliceBenchmark.formatPacePerKm(avgSpd))
             add("Peak Speed" to String.format("%.1f km/h (%s)", session.maxSpeedMps * 3.6, TsPoliceBenchmark.formatPacePerKm(session.maxSpeedMps)))
             add("Avg Cadence" to "${session.avgCadenceSpm.toInt()} spm")
@@ -169,7 +169,7 @@ object SessionDialogs {
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.1f)
                 })
                 row.addView(TextView(ctx).apply {
-                    text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec, true)
+                    text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec)
                     textSize = 13f
                     typeface = AthleticTheme.FONT_TABULAR_BOLD
                     setTextColor(if (fast) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
@@ -215,7 +215,7 @@ object SessionDialogs {
         AlertDialog.Builder(ctx)
             .setTitle("Delete Run Session?")
             .setMessage(
-                "Remove ${session.dateIso} (${String.format("%.2f km", session.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(session.activeDurationSec, true)}) from your training log?"
+                "Remove ${session.dateIso} (${String.format("%.2f km", session.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(session.activeDurationSec)}) from your training log?"
             )
             .setPositiveButton("Delete") { _, _ -> onDeleteConfirmed() }
             .setNegativeButton("Keep Run", null)

@@ -51,7 +51,7 @@ object RunShareHelper {
         todayIso: String = LocalDate.now().toString()
     ): String {
         val isExact1600 = abs(session.distanceMeters - 1600.0) <= 60.0
-        val timeFmt = TsPoliceBenchmark.formatDuration(session.equiv1600mSec, includeTenths = true)
+        val timeFmt = TsPoliceBenchmark.formatDuration(session.equiv1600mSec)
         val targetFmt = TsPoliceBenchmark.formatDuration(targetSec)
         val merit = TsPoliceBenchmark.evaluateMerit1600m(session.equiv1600mSec, targetSec)
         val badge = when {
@@ -60,7 +60,7 @@ object RunShareHelper {
             else -> sessionModeTitle(session)
         }
         val datePretty = formatPrettyDate(session.dateIso)
-        val avgLapFmt = TsPoliceBenchmark.formatDuration(session.equiv1600mSec / 4.0, includeTenths = true)
+        val avgLapFmt = TsPoliceBenchmark.formatDuration(session.equiv1600mSec / 4.0)
         val avgSpd = if (session.activeDurationSec > 1.0) session.distanceMeters / session.activeDurationSec else 0.0
         val paceFmt = TsPoliceBenchmark.formatPacePerKm(avgSpd)
 
@@ -70,9 +70,9 @@ object RunShareHelper {
         val deadlinePretty = formatShortMonthDay(deadlineDate)
         val gapSec = session.equiv1600mSec - targetSec
         val goalLine = if (gapSec <= 0.0) {
-            "Goal (< $targetFmt): Beat cutoff by ${String.format("%.1fs", abs(gapSec))}!"
+            "Goal (< $targetFmt): Beat cutoff by ${String.format("%.0fs", abs(gapSec))}!"
         } else {
-            "Goal (< $targetFmt by $deadlinePretty): ${String.format("%.1fs", gapSec)} to shave (${daysLeft}d left)"
+            "Goal (< $targetFmt by $deadlinePretty): ${String.format("%.0fs", gapSec)} to shave (${daysLeft}d left)"
         }
 
         return buildString {
@@ -86,7 +86,7 @@ object RunShareHelper {
             appendLine("$datePretty  •  Avg 400m: $avgLapFmt  •  Pace: $paceFmt")
             if (session.lapSplits.isNotEmpty()) {
                 val splitsSummary = session.lapSplits.take(6).joinToString(" | ") { sp ->
-                    "L${sp.lapNumber} ${TsPoliceBenchmark.formatDuration(sp.lapDurationSec, true)}"
+                    "L${sp.lapNumber} ${TsPoliceBenchmark.formatDuration(sp.lapDurationSec)}"
                 }
                 appendLine("Splits: $splitsSummary")
             }
@@ -428,7 +428,7 @@ object RunShareHelper {
         })
         c.drawText(statusText, badgeRect.left + 26f, 235f, badgeTextPaint)
 
-        val heroTimeStr = TsPoliceBenchmark.formatDuration(session.equiv1600mSec, includeTenths = true)
+        val heroTimeStr = TsPoliceBenchmark.formatDuration(session.equiv1600mSec)
         val heroTimePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             typeface = boldSans
             textSize = 188f
@@ -456,18 +456,18 @@ object RunShareHelper {
         val gap = 20f
         val colW = (w - 152f - gap * 2f) / 3f
 
-        val avgLapStr = TsPoliceBenchmark.formatDuration(session.equiv1600mSec / 4.0, true)
+        val avgLapStr = TsPoliceBenchmark.formatDuration(session.equiv1600mSec / 4.0)
         val avgSpd = if (session.activeDurationSec > 1.0) session.distanceMeters / session.activeDurationSec else 0.0
         val avgPaceStr = TsPoliceBenchmark.formatPacePerKm(avgSpd)
         val diffSec = session.equiv1600mSec - targetSec
         val diffStr = if (diffSec <= 0.0) {
-            "-${String.format("%.1fs", abs(diffSec))}"
+            "-${String.format("%.0fs", abs(diffSec))}"
         } else {
-            "+${String.format("%.1fs", diffSec)}"
+            "+${String.format("%.0fs", diffSec)}"
         }
 
         val tiles = listOf(
-            Triple("AVG 400M LAP", avgLapStr, "Target ≤ ${TsPoliceBenchmark.formatDuration(targetSec / 4.0, true)}"),
+            Triple("AVG 400M LAP", avgLapStr, "Target ≤ ${TsPoliceBenchmark.formatDuration(targetSec / 4.0)}"),
             Triple("AVG PACE", avgPaceStr, String.format("%.1f km/h avg", avgSpd * 3.6)),
             Triple("VS $targetFmt GOAL", diffStr, if (diffSec <= 0.0) "Target Met ✓" else "Seconds to shave")
         )
@@ -517,7 +517,7 @@ object RunShareHelper {
                 color = AthleticColors.CYAN_BRIGHT
                 letterSpacing = 0.07f
             })
-            val rightHint = "TARGET ≤ ${TsPoliceBenchmark.formatDuration(targetLapSec, true)} /LAP"
+            val rightHint = "TARGET ≤ ${TsPoliceBenchmark.formatDuration(targetLapSec)} /LAP"
             val rhPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 typeface = boldSans
                 textSize = 18f
@@ -562,7 +562,7 @@ object RunShareHelper {
                     color = 0xFF9898A6.toInt()
                 })
 
-                val splitStr = TsPoliceBenchmark.formatDuration(sp.lapDurationSec, true)
+                val splitStr = TsPoliceBenchmark.formatDuration(sp.lapDurationSec)
                 val spPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     typeface = boldSans
                     textSize = 29f
@@ -579,7 +579,7 @@ object RunShareHelper {
             })
             val rows = listOf(
                 "Total Distance" to String.format("%.2f km (%d m)", session.distanceMeters / 1000.0, session.distanceMeters.toInt()),
-                "Active Duration" to TsPoliceBenchmark.formatDuration(session.activeDurationSec, true),
+                "Active Duration" to TsPoliceBenchmark.formatDuration(session.activeDurationSec),
                 "Average Cadence" to "${session.avgCadenceSpm.roundToInt()} spm",
                 "Peak Speed" to String.format("%.1f km/h (%s)", session.maxSpeedMps * 3.6, TsPoliceBenchmark.formatPacePerKm(session.maxSpeedMps))
             )

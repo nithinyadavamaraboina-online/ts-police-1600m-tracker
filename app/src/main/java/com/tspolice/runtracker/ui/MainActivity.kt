@@ -2429,12 +2429,12 @@ class MainActivity : AppCompatActivity() {
         val tableCard = cardContainer()
         tableCard.addView(AthleticTheme.sectionLabel(this, "EVEN-SPLIT CHECKPOINTS FOR 7:15 (435s)"))
         val splitRows = listOf(
-            Triple("200 m (Half Lap)", "0:54.4", "13.24 km/h"),
-            Triple("400 m (Lap 1)", "1:48.8", "4:31.9 /km"),
-            Triple("800 m (Lap 2 • Half)", "3:37.5", "Controlled rhythm"),
-            Triple("1,200 m (Lap 3)", "5:26.3", "Hold ≥168 spm"),
-            Triple("1,400 m (Kick Bell)", "6:20.6", "All-out 200m sprint!"),
-            Triple("1,600 m (Finish)", "7:15.0", "QUALIFIED (40+ pts)")
+            Triple("200 m (Half Lap)", "0:54", "13.2 km/h"),
+            Triple("400 m (Lap 1)", "1:49", "4:32 /km"),
+            Triple("800 m (Lap 2 • Half)", "3:38", "Controlled rhythm"),
+            Triple("1,200 m (Lap 3)", "5:26", "Hold ≥168 spm"),
+            Triple("1,400 m (Kick Bell)", "6:21", "All-out 200m sprint!"),
+            Triple("1,600 m (Finish)", "7:15", "QUALIFIED (40+ pts)")
         )
         val tableWrap = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -3125,7 +3125,7 @@ class MainActivity : AppCompatActivity() {
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.1f)
                 })
                 row.addView(TextView(this).apply {
-                    text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec, true)
+                    text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec)
                     textSize = 13f
                     typeface = AthleticTheme.FONT_TABULAR_BOLD
                     setTextColor(if (fast) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
@@ -3184,7 +3184,7 @@ class MainActivity : AppCompatActivity() {
         intervalSplitsLayout.removeAllViews()
         if (iv.completedRepSplitsSec.isEmpty()) {
             intervalSplitsLayout.addView(TextView(this).apply {
-                text = "Completed 400m rep times appear here (target ${TsPoliceBenchmark.formatDuration(iv.targetRepSec, true)} / 400m)."
+                text = "Completed 400m rep times appear here (target ${TsPoliceBenchmark.formatDuration(iv.targetRepSec)} / 400m)."
                 textSize = 12f
                 setTextColor(AthleticColors.TEXT_MUTED)
             })
@@ -3205,7 +3205,7 @@ class MainActivity : AppCompatActivity() {
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 })
                 r.addView(TextView(this).apply {
-                    text = TsPoliceBenchmark.formatDuration(sec, true)
+                    text = TsPoliceBenchmark.formatDuration(sec)
                     textSize = 13f
                     typeface = AthleticTheme.FONT_TABULAR_BOLD
                     setTextColor(if (fast) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
@@ -3750,15 +3750,15 @@ class MainActivity : AppCompatActivity() {
         } ?: "")
         coachPrescriptionText.text = "Coach Plan: ${forecast.workoutPrescription}"
 
-        kpiPbVal.text = forecast.personalBestSec?.let { TsPoliceBenchmark.formatDuration(it, true) } ?: "--:--"
+        kpiPbVal.text = forecast.personalBestSec?.let { TsPoliceBenchmark.formatDuration(it) } ?: "--:--"
         kpiGapVal.text = forecast.gapToTargetSec?.let {
-            if (it <= 0.0) "0.0s (Met!)" else String.format("-%.1fs", it)
+            if (it <= 0.0) "0s (Met!)" else String.format("-%.0fs", it)
         } ?: "--"
         kpiRateVal.text = forecast.improvementSecPerWeek?.let {
-            if (it >= 0.0) String.format("-%.1fs /wk", it) else String.format("+%.1fs /wk", -it)
+            if (it >= 0.0) String.format("-%.0fs /wk", it) else String.format("+%.0fs /wk", -it)
         } ?: "--"
         kpiImprovedVal.text = forecast.totalImprovementSec?.let {
-            if (it >= 0.0) String.format("%.1fs faster", it) else String.format("%.1fs", it)
+            if (it >= 0.0) String.format("%.0fs faster", it) else String.format("%.0fs", it)
         } ?: "--"
 
         trendChartView.setForecast(forecast)
@@ -3796,8 +3796,8 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 val pbHint = forecast.personalBestSec?.let {
-                    "Current PB: ${TsPoliceBenchmark.formatDuration(it, true)}  •  Target: $targetFmt"
-                } ?: "Target Cutoff: $targetFmt (1:48.8 /400m lap)"
+                    "Current PB: ${TsPoliceBenchmark.formatDuration(it)}  •  Target: $targetFmt"
+                } ?: "Target Cutoff: $targetFmt (${TsPoliceBenchmark.formatDuration(TsPoliceBenchmark.targetLap400mSec(targetSec))} /400m lap)"
                 todaySessionsListLayout.addView(TextView(this).apply {
                     text = "No 1.6 km run recorded yet today. $pbHint"
                     textSize = 12.5f
@@ -4018,7 +4018,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         leftTimeCol.addView(TextView(this).apply {
-            text = TsPoliceBenchmark.formatDuration(s.equiv1600mSec, includeTenths = true)
+            text = TsPoliceBenchmark.formatDuration(s.equiv1600mSec)
             textSize = if (compact) 36f else 42f
             typeface = AthleticTheme.FONT_TABULAR_BOLD
             setTextColor(heroTimeColor)
@@ -4054,9 +4054,9 @@ class MainActivity : AppCompatActivity() {
         val targetFmt = TsPoliceBenchmark.formatDuration(targetSec)
         val gapCol = if (gapSec <= 0.0) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
         val gapTxt = if (gapSec <= 0.0) {
-            "-${String.format("%.1fs", abs(gapSec))} < $targetFmt ✓"
+            "-${String.format("%.0fs", abs(gapSec))} < $targetFmt ✓"
         } else {
-            "+${String.format("%.1fs", gapSec)} to $targetFmt"
+            "+${String.format("%.0fs", gapSec)} to $targetFmt"
         }
         rightMetaCol.addView(TextView(this).apply {
             text = gapTxt
@@ -4073,7 +4073,7 @@ class MainActivity : AppCompatActivity() {
             maxLines = 1
         })
         rightMetaCol.addView(TextView(this).apply {
-            text = "${TsPoliceBenchmark.formatDuration(s.equiv1600mSec / 4.0, true)} /400m avg"
+            text = "${TsPoliceBenchmark.formatDuration(s.equiv1600mSec / 4.0)} /400m avg"
             textSize = 12f
             typeface = AthleticTheme.FONT_TABULAR_BOLD
             setTextColor(AthleticColors.TEXT_PRIMARY)
@@ -4128,7 +4128,7 @@ class MainActivity : AppCompatActivity() {
                     maxLines = 1
                 })
                 tile.addView(TextView(this).apply {
-                    text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec, true)
+                    text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec)
                     textSize = 13f
                     typeface = AthleticTheme.FONT_TABULAR_BOLD
                     setTextColor(if (hitTarget) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_PRIMARY)
@@ -4289,7 +4289,7 @@ class MainActivity : AppCompatActivity() {
             )
         }
         rightTimeCol.addView(TextView(this).apply {
-            text = TsPoliceBenchmark.formatDuration(s.equiv1600mSec, true)
+            text = TsPoliceBenchmark.formatDuration(s.equiv1600mSec)
             textSize = 22.5f
             typeface = AthleticTheme.FONT_TABULAR_BOLD
             includeFontPadding = false

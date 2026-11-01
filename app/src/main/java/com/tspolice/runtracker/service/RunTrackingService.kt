@@ -911,7 +911,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                     joggingSec = 0.0,
                     walkingSec = 0.0,
                     lapSplits = splits,
-                    notes = "${repsDone}x400m Intervals (Avg ${TsPoliceBenchmark.formatDuration(avgRepSec, true)}/rep)",
+                    notes = "${repsDone}x400m Intervals (Avg ${TsPoliceBenchmark.formatDuration(avgRepSec)}/rep)",
                     isDemo = false
                 )
             )
@@ -2026,7 +2026,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             ptTrialPhase == PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN ->
                 "Walking ignored • Stopwatch launches automatically on Jog/Run"
             intervalPhase != IntervalPhase.IDLE ->
-                "Pace ${TsPoliceBenchmark.formatPacePerKm(speedMps)} • Target ${TsPoliceBenchmark.formatDuration(intervalTargetRepSec, true)}/400m"
+                "Pace ${TsPoliceBenchmark.formatPacePerKm(speedMps)} • Target ${TsPoliceBenchmark.formatDuration(intervalTargetRepSec)}/400m"
             isLowPowerStandby ->
                 "${String.format("%.2f km", daily.totalDistanceMeters / 1000.0)} • ${daily.totalSteps} steps • Battery Saver Standby"
             else ->

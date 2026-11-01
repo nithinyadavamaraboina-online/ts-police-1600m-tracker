@@ -159,7 +159,7 @@ object ProgressionForecaster {
                 projectedTargetDateIso = dailyPoints.first { it.bestEquiv1600mSec <= targetTimeSec }.dateIso,
                 practiceDaysPerWeek = observedFreqPerWeek,
                 qualifiedRunCount = qualifiedRuns,
-                coachSummary = "QUALIFIED! Personal best ${TsPoliceBenchmark.formatDuration(pbSec, true)} beats the 7:15 cutoff by ${String.format("%.1fs", margin)} ($qualifiedRuns qualifying session${if (qualifiedRuns == 1) "" else "s"}).",
+                coachSummary = "QUALIFIED! Personal best ${TsPoliceBenchmark.formatDuration(pbSec)} beats the 7:15 cutoff by ${String.format("%.0fs", margin)} ($qualifiedRuns qualifying session${if (qualifiedRuns == 1) "" else "s"}).",
                 workoutPrescription = "Lock in consistency: practice negative splits (Lap 1-2 at 1:49, Lap 3-4 at 1:45) so race-day heat or wind never threatens your 7:15 margin."
             )
         }
@@ -189,7 +189,7 @@ object ProgressionForecaster {
                 practiceDaysPerWeek = observedFreqPerWeek,
                 qualifiedRunCount = 0,
                 coachSummary = "Baseline recorded: ${TsPoliceBenchmark.formatDuration(pbSec)} (${String.format("%.0fs", gapSec)} above 7:15). Log 1 more practice day to calculate your personal improvement speed & target date!",
-                workoutPrescription = "Shaving ${String.format("%.1fs", neededPerWeek4w)}/week hits 7:15 in 4 weeks. Next workout: 5 × 400m intervals at 1:48 with 90s walk recovery."
+                workoutPrescription = "Shaving ${String.format("%.0fs", neededPerWeek4w)}/week hits 7:15 in 4 weeks. Next workout: 5 × 400m intervals at 1:48 with 90s walk recovery."
             )
         }
 
@@ -217,7 +217,7 @@ object ProgressionForecaster {
                 projectedTargetDateIso = null,
                 practiceDaysPerWeek = observedFreqPerWeek,
                 qualifiedRunCount = 0,
-                coachSummary = "Recent pace trend is flat (${String.format("%+.1fs/wk", -rateSecPerWeek)}); ${String.format("%.0fs", gapSec)} left to reach 7:15 from your ${TsPoliceBenchmark.formatDuration(currentCapabilitySec)} capability.",
+                coachSummary = "Recent pace trend is flat (${String.format("%+.0fs/wk", -rateSecPerWeek)}); ${String.format("%.0fs", gapSec)} left to reach 7:15 from your ${TsPoliceBenchmark.formatDuration(currentCapabilitySec)} capability.",
                 workoutPrescription = "Plateau breaker: alternate 1 interval day (6 × 400m @ 1:46) with 1 easy 3 km aerobic jog (keep Running share >75% on trial days)."
             )
         }
@@ -259,8 +259,8 @@ object ProgressionForecaster {
             projectedTargetDateIso = targetDateIso,
             practiceDaysPerWeek = observedFreqPerWeek,
             qualifiedRunCount = 0,
-            coachSummary = "Improving by ${String.format("%.1fs/week", effectiveRatePerWeek)} (${String.format("%.1fs", gapSec)} left). At this practice pace, you'll break 7:15 in ~$realisticDays days ($optimisticDays–$conservativeDays days, ~$estSessions sessions) around $targetDateIso.",
-            workoutPrescription = "Current 400m lap avg is ${TsPoliceBenchmark.formatDuration(currentLap, true)} vs ${TsPoliceBenchmark.formatDuration(targetLap, true)} target. Focus next track session on holding 1:48/lap through 1,200m."
+            coachSummary = "Improving by ${String.format("%.0fs/week", effectiveRatePerWeek)} (${String.format("%.0fs", gapSec)} left). At this practice pace, you'll break 7:15 in ~$realisticDays days ($optimisticDays–$conservativeDays days, ~$estSessions sessions) around $targetDateIso.",
+            workoutPrescription = "Current 400m lap avg is ${TsPoliceBenchmark.formatDuration(currentLap)} vs ${TsPoliceBenchmark.formatDuration(targetLap)} target. Focus next track session on holding 1:48/lap through 1,200m."
         )
     }
 
@@ -470,7 +470,7 @@ object DeadlineGoalCoach {
 
         val statusSummary = when {
             qualified -> {
-                "QUALIFIED! Personal best ${TsPoliceBenchmark.formatDuration(officialBestSec!!, true)} is already faster than $targetFmt."
+                "QUALIFIED! Personal best ${TsPoliceBenchmark.formatDuration(officialBestSec!!)} is already faster than $targetFmt."
             }
             bestTrial != null && stoppedPenaltySec >= 30.0 && !hasCleanNonstop1600m -> {
                 "PB ${TsPoliceBenchmark.formatDuration(officialBestSec ?: bestTrial.equiv1600mSec)} " +
@@ -481,10 +481,10 @@ object DeadlineGoalCoach {
             movingCapSec != null -> {
                 "Current capability ${TsPoliceBenchmark.formatDuration(movingCapSec)}  •  " +
                     "This week's target: ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)}  •  " +
-                    "$deadlineLabel goal: $targetFmt (${TsPoliceBenchmark.formatDuration(targetLapSec, true)}/lap)."
+                    "$deadlineLabel goal: $targetFmt (${TsPoliceBenchmark.formatDuration(targetLapSec)}/lap)."
             }
             else -> {
-                "No 1.6 km baseline yet  •  $daysRemaining days left to build to $targetFmt (${TsPoliceBenchmark.formatDuration(targetLapSec, true)}/400m lap)."
+                "No 1.6 km baseline yet  •  $daysRemaining days left to build to $targetFmt (${TsPoliceBenchmark.formatDuration(targetLapSec)}/400m lap)."
             }
         }
 
