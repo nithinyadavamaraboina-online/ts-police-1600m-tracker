@@ -3991,7 +3991,13 @@ class MainActivity : AppCompatActivity() {
                 bottomMargin = if (compact) dp(4) else dp(6)
             }
             setOnClickListener {
-                SessionDialogs.showSessionDetailDialog(this@MainActivity, s, targetSec) {
+                SessionDialogs.showSessionDetailDialog(
+                    ctx = this@MainActivity,
+                    session = s,
+                    targetSec = targetSec,
+                    deadlineIso = repository.goalDeadlineIso,
+                    isPersonalBest = isAllTimePb
+                ) {
                     repository.deleteSession(s.id)
                     refreshCachedDailyHistory(forceRender = true)
                     refreshProgressDashboard()
@@ -4134,13 +4140,65 @@ class MainActivity : AppCompatActivity() {
             container.addView(splitsRow)
         }
 
-        container.addView(TextView(this).apply {
+        val actionFooter = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(11)
+            }
+        }
+        actionFooter.addView(TextView(this).apply {
             val extraSplitsTxt = if (s.lapSplits.size > 4) " (${s.lapSplits.size} splits)" else ""
-            text = "Tap for full split breakdown$extraSplitsTxt & options  →"
+            text = "Tap card for details$extraSplitsTxt  →"
             textSize = 11f
             setTextColor(AthleticColors.TEXT_MUTED)
-            setPadding(0, dp(8), 0, 0)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
         })
+
+        val sharePill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            isFocusable = true
+            setPadding(dp(12), dp(7), dp(13), dp(7))
+            background = AthleticTheme.rippleSurface(
+                this@MainActivity,
+                0x26C6F432,
+                0x3EC6F432,
+                AthleticColors.EMERALD_BRIGHT,
+                20f
+            )
+            setOnClickListener {
+                RunShareHelper.showShareRunDialog(
+                    ctx = this@MainActivity,
+                    session = s,
+                    targetSec = targetSec,
+                    deadlineIso = repository.goalDeadlineIso,
+                    isPersonalBest = isAllTimePb
+                )
+            }
+        }
+        sharePill.addView(
+            VectorIconView(this, IconKind.SHARE, AthleticColors.EMERALD_BRIGHT, 14f).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(14), dp(14)).apply { marginEnd = dp(6) }
+            }
+        )
+        sharePill.addView(TextView(this).apply {
+            text = "Share Run"
+            textSize = 12f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            maxLines = 1
+        })
+        actionFooter.addView(sharePill)
+        container.addView(actionFooter)
 
         return container
     }
@@ -4177,7 +4235,15 @@ class MainActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = dp(8) }
             setOnClickListener {
-                SessionDialogs.showSessionDetailDialog(this@MainActivity, s, targetSec) {
+                val isPb = repository.getAllSessions().minOfOrNull { it.equiv1600mSec }
+                    ?.let { abs(s.equiv1600mSec - it) < 0.05 } == true
+                SessionDialogs.showSessionDetailDialog(
+                    ctx = this@MainActivity,
+                    session = s,
+                    targetSec = targetSec,
+                    deadlineIso = repository.goalDeadlineIso,
+                    isPersonalBest = isPb
+                ) {
                     repository.deleteSession(s.id)
                     refreshCachedDailyHistory(forceRender = true)
                     refreshProgressDashboard()

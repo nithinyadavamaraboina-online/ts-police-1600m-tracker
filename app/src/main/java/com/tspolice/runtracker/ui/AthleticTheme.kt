@@ -89,6 +89,7 @@ enum class IconKind {
     AUDIO_SMART,
     AUDIO_ALL,
     AUDIO_MUTED,
+    SHARE,
     TRASH
 }
 
@@ -471,6 +472,25 @@ class VectorIconView(
                         canvas.drawArc(rect, -48f, 96f, false, strokePaint)
                     }
                 }
+            }
+
+            IconKind.SHARE -> {
+                // Upward share arrow + rounded bottom tray
+                canvas.drawLine(x(0.50f), y(0.60f), x(0.50f), y(0.16f), strokePaint)
+                path.reset()
+                path.moveTo(x(0.33f), y(0.33f))
+                path.lineTo(x(0.50f), y(0.16f))
+                path.lineTo(x(0.67f), y(0.33f))
+                canvas.drawPath(path, strokePaint)
+
+                path.reset()
+                path.moveTo(x(0.22f), y(0.54f))
+                path.lineTo(x(0.22f), y(0.76f))
+                path.quadTo(x(0.22f), y(0.84f), x(0.30f), y(0.84f))
+                path.lineTo(x(0.70f), y(0.84f))
+                path.quadTo(x(0.78f), y(0.84f), x(0.78f), y(0.76f))
+                path.lineTo(x(0.78f), y(0.54f))
+                canvas.drawPath(path, strokePaint)
             }
 
             IconKind.TRASH -> {

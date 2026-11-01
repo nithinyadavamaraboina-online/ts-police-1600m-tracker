@@ -3,4 +3,7 @@
     <cache-path
         name="ota_updates"
         path="updates/" />
+    <cache-path
+        name="shared_runs"
+        path="shares/" />
 </paths>

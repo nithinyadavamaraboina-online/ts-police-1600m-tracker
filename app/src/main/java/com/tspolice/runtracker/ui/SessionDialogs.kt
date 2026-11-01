@@ -38,6 +38,8 @@ object SessionDialogs {
         ctx: Context,
         session: RunSessionRecord,
         targetSec: Double,
+        deadlineIso: String = "2026-11-30",
+        isPersonalBest: Boolean = false,
         onDeleteConfirmed: () -> Unit
     ) {
         val scroll = ScrollView(ctx)
@@ -189,6 +191,15 @@ object SessionDialogs {
         val dlg = AlertDialog.Builder(ctx)
             .setView(scroll)
             .setPositiveButton("Close", null)
+            .setNegativeButton("Share Run ↗") { _, _ ->
+                RunShareHelper.showShareRunDialog(
+                    ctx = ctx,
+                    session = session,
+                    targetSec = targetSec,
+                    deadlineIso = deadlineIso,
+                    isPersonalBest = isPersonalBest
+                )
+            }
             .setNeutralButton("Delete Run") { _, _ ->
                 confirmDeleteSession(ctx, session, onDeleteConfirmed)
             }

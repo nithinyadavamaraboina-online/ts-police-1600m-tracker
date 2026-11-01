@@ -19,6 +19,7 @@ import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import com.tspolice.runtracker.telemetry.TuningTelemetryManager
+import com.tspolice.runtracker.ui.RunShareHelper
 import com.tspolice.runtracker.update.VersionComparator
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -1340,6 +1341,18 @@ class TrackerDomainTest {
             todayIso = "2026-11-01"
         )
         assertEquals(42.0, btForecast.improvementSecPerWeek ?: 0.0, 0.01)
+
+        // 6. Share caption formats Today's 1.6 km PB, splits, and Nov 30 countdown cleanly
+        val caption = RunShareHelper.buildShareCaption(
+            session = breakthroughTrial,
+            targetSec = 435.0,
+            deadlineIso = "2026-11-30",
+            isPersonalBest = true,
+            todayIso = "2026-11-01"
+        )
+        assertTrue(caption.contains("8:47.2"))
+        assertTrue(caption.contains("NEW PB"))
+        assertTrue(caption.contains("Nov 30"))
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {
