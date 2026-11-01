@@ -146,6 +146,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var dailyWalkDistSub: TextView
     private lateinit var allDayGaitPill: TextView
     private lateinit var launchPtFromOpenBtn: TextView
+    private lateinit var openTodayRunCard: LinearLayout
     private lateinit var openTodaySummaryContainer: LinearLayout
     private lateinit var goalCoachCard: LinearLayout
     private lateinit var goalHeaderLabel: TextView
@@ -233,9 +234,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var intervalSplitsLayout: LinearLayout
 
     // Tab 2: Progress, Merit Score & ETA views
+    private lateinit var progressTodayLogsCard: LinearLayout
     private lateinit var progressTodayHeaderLabel: TextView
     private lateinit var progressTodayCountBadge: TextView
-    private lateinit var progressTodayDailyStripLayout: LinearLayout
     private lateinit var todaySessionsListLayout: LinearLayout
     private lateinit var etaHeadlineText: TextView
     private lateinit var meritBadgeText: TextView
@@ -252,6 +253,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var trendChartView: ProgressTrendChartView
     private lateinit var demoToggleBtn: TextView
     private lateinit var pastSessionsHeaderLabel: TextView
+    private lateinit var pastSessionsCountBadge: TextView
     private lateinit var sessionsListLayout: LinearLayout
 
     // Tab 3: Settings, Profile & Lab views
@@ -1082,25 +1084,27 @@ class MainActivity : AppCompatActivity() {
         }
         box.addView(launchPtFromOpenBtn)
 
-        // 2A. Today's Activity Logs (Top Part — Instant access to Today's summary & recorded runs/splits)
-        val openTodayCard = cardContainer(
+        // 2A. Today's 1.6 km Run Spotlight (shown only when a run is logged today — zero duplicate walk clutter)
+        openTodayRunCard = cardContainer(
             topColor = AthleticColors.HERO_EMERALD_TOP,
-            bottomColor = AthleticColors.SURFACE_BOTTOM,
+            bottomColor = AthleticColors.HERO_EMERALD_BOTTOM,
             borderColor = AthleticColors.HERO_EMERALD_BORDER
-        )
-        openTodayCard.addView(
+        ).apply {
+            visibility = View.GONE
+        }
+        openTodayRunCard.addView(
             AthleticTheme.sectionLabel(
                 this,
-                "TODAY'S ACTIVITY LOGS  •  TAP FOR SPLITS",
+                "TODAY'S 1.6 KM RUN",
                 AthleticColors.EMERALD_BRIGHT
             )
         )
         openTodaySummaryContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(10), 0, 0)
+            setPadding(0, dp(8), 0, 0)
         }
-        openTodayCard.addView(openTodaySummaryContainer)
-        box.addView(openTodayCard)
+        openTodayRunCard.addView(openTodaySummaryContainer)
+        box.addView(openTodayRunCard)
 
         // 2B. Nov 30 Goal Countdown & Dynamic Daily Push Coach Card
         box.addView(buildTodayGoalCoachCard())
@@ -1813,10 +1817,10 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(28))
         }
 
-        // 1. TOP PART: Today's Activity Logs Card (Immediate zero-scroll access to today's runs & splits!)
-        val todayLogsCard = cardContainer(
+        // 1. TOP PART: Today's 1.6 km Run Hero Spotlight (ONLY 1.6 km / run performance — big bold time, zero walk clutter!)
+        progressTodayLogsCard = cardContainer(
             topColor = AthleticColors.HERO_EMERALD_TOP,
-            bottomColor = AthleticColors.SURFACE_BOTTOM,
+            bottomColor = AthleticColors.HERO_EMERALD_BOTTOM,
             borderColor = AthleticColors.HERO_EMERALD_BORDER
         )
         val todayTopRow = LinearLayout(this).apply {
@@ -1825,7 +1829,7 @@ class MainActivity : AppCompatActivity() {
         }
         progressTodayHeaderLabel = AthleticTheme.sectionLabel(
             this,
-            "TODAY'S ACTIVITY LOGS  •  TAP FOR SPLITS",
+            "TODAY'S 1.6 KM RUN",
             AthleticColors.EMERALD_BRIGHT
         ).apply {
             maxLines = 1
@@ -1835,8 +1839,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
         progressTodayCountBadge = TextView(this).apply {
-            text = "TODAY"
-            textSize = 10f
+            text = "READY"
+            textSize = 10.5f
             typeface = AthleticTheme.FONT_SANS_BOLD
             setPadding(dp(9), dp(3.5f), dp(9), dp(3.5f))
             background = AthleticTheme.solidPill(
@@ -1849,32 +1853,26 @@ class MainActivity : AppCompatActivity() {
         }
         todayTopRow.addView(progressTodayHeaderLabel)
         todayTopRow.addView(progressTodayCountBadge)
-        todayLogsCard.addView(todayTopRow)
-
-        progressTodayDailyStripLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(10), 0, 0)
-        }
-        todayLogsCard.addView(progressTodayDailyStripLayout)
+        progressTodayLogsCard.addView(todayTopRow)
 
         todaySessionsListLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(2), 0, 0)
+            setPadding(0, dp(8), 0, 0)
         }
-        todayLogsCard.addView(todaySessionsListLayout)
-        col.addView(todayLogsCard)
+        progressTodayLogsCard.addView(todaySessionsListLayout)
+        col.addView(progressTodayLogsCard)
 
         // 2. Hero Forecast & Merit Card
         val heroCard = cardContainer(
-            topColor = AthleticColors.HERO_EMERALD_TOP,
-            bottomColor = AthleticColors.HERO_EMERALD_BOTTOM,
-            borderColor = AthleticColors.HERO_EMERALD_BORDER
+            topColor = AthleticColors.SURFACE_TOP,
+            bottomColor = AthleticColors.SURFACE_BOTTOM,
+            borderColor = AthleticColors.BORDER_STRONG
         )
         val topRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        topRow.addView(AthleticTheme.sectionLabel(this, "TARGET ETA & TSLPRB MERIT", AthleticColors.EMERALD_BRIGHT).apply {
+        topRow.addView(AthleticTheme.sectionLabel(this, "TARGET ETA & MERIT", AthleticColors.EMERALD_BRIGHT).apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         meritBadgeText = TextView(this).apply {
@@ -2068,11 +2066,32 @@ class MainActivity : AppCompatActivity() {
 
         // BOTTOM PART: Past Recorded Sessions History Card (Tap any row for 4x400m Splits & Merit Score!)
         val historyCard = cardContainer()
+        val pastTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         pastSessionsHeaderLabel = AthleticTheme.sectionLabel(
             this,
-            "PAST ACTIVITY LOGS  •  TAP ANY RUN FOR SPLITS"
-        )
-        historyCard.addView(pastSessionsHeaderLabel)
+            "PAST RUN LOGS"
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        pastSessionsCountBadge = TextView(this).apply {
+            text = "0 RUNS"
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                AthleticColors.SURFACE_RECESSED,
+                AthleticColors.BORDER_SUBTLE,
+                9f
+            )
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+        }
+        pastTopRow.addView(pastSessionsHeaderLabel)
+        pastTopRow.addView(pastSessionsCountBadge)
+        historyCard.addView(pastTopRow)
         sessionsListLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(10), 0, 0)
@@ -2775,37 +2794,28 @@ class MainActivity : AppCompatActivity() {
         lastDailyHistoryKey = key
         lastDailyHistoryRenderMs = nowMs
 
-        // 1. TOP OF TODAY TAB: Today's whole-day movement card + Today's recorded run sessions
-        if (::openTodaySummaryContainer.isInitialized) {
-            openTodaySummaryContainer.removeAllViews()
-            openTodaySummaryContainer.addView(
-                buildDailySummaryCardView(
-                    day = todaySummary,
-                    isToday = true,
-                    isYesterday = false,
-                    samSnap = latestSamsungSnapshot
-                )
-            )
-            val todaySessions = repository.getAllSessions().filter { it.dateIso == todayIso }
-            val targetSec = repository.targetTimeSec
-            for (s in todaySessions) {
+        // 1. TOP OF TODAY TAB: Today's 1.6 km Run Spotlight (shown ONLY when a run was logged today — zero duplicate walk clutter!)
+        if (::openTodaySummaryContainer.isInitialized && ::openTodayRunCard.isInitialized) {
+            val allSessions = repository.getAllSessions()
+            val todaySessions = allSessions.filter { it.dateIso == todayIso }
+            if (todaySessions.isEmpty()) {
+                openTodayRunCard.visibility = View.GONE
+            } else {
+                openTodayRunCard.visibility = View.VISIBLE
+                openTodaySummaryContainer.removeAllViews()
+                val targetSec = repository.targetTimeSec
+                val allTimeBest = allSessions.minOfOrNull { it.equiv1600mSec }
+                val primary = pickPrimaryRunForSpotlight(todaySessions)
+                val isPb = allTimeBest != null && abs(primary.equiv1600mSec - allTimeBest) < 0.05
                 openTodaySummaryContainer.addView(
-                    buildSessionLogRow(s, targetSec, highlightToday = true)
+                    buildHero1600mSpotlightView(primary, targetSec, isAllTimePb = isPb, compact = true)
                 )
+                for (extra in todaySessions.filter { it.id != primary.id }) {
+                    openTodaySummaryContainer.addView(
+                        buildSessionLogRow(extra, targetSec, highlightToday = true)
+                    )
+                }
             }
-        }
-
-        // Keep Progress tab's top Today whole-day summary strip in sync as well
-        if (::progressTodayDailyStripLayout.isInitialized) {
-            progressTodayDailyStripLayout.removeAllViews()
-            progressTodayDailyStripLayout.addView(
-                buildDailySummaryCardView(
-                    day = todaySummary,
-                    isToday = true,
-                    isYesterday = false,
-                    samSnap = latestSamsungSnapshot
-                )
-            )
         }
 
         // 2. BOTTOM OF TODAY TAB: Past Days ONLY (Yesterday + Earlier)
@@ -3702,7 +3712,7 @@ class MainActivity : AppCompatActivity() {
         val targetFmt = TsPoliceBenchmark.formatDuration(targetSec)
         val bestMerit = forecast.personalBestSec?.let { TsPoliceBenchmark.evaluateMerit1600m(it, targetSec) }
         if (bestMerit != null) {
-            meritBadgeText.text = "${bestMerit.points} / 100 MERIT PTS"
+            meritBadgeText.text = "${bestMerit.points} / 100 PTS"
             val mCol = if (bestMerit.qualified) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
             meritBadgeText.setTextColor(mCol)
             meritBadgeText.background = AthleticTheme.solidPill(this, (mCol and 0x00FFFFFF) or 0x26000000, mCol, 10f)
@@ -3764,75 +3774,149 @@ class MainActivity : AppCompatActivity() {
         val todaySummary = latestDailySummaryForCompare.takeIf { it.dateIso == todayIso }
             ?: repository.getDailyActivity(todayIso)
 
-        // 1. TOP OF PROGRESS TAB: Today's Activity Logs (Whole-day summary + Today's recorded runs/splits)
+        // 1. TOP OF PROGRESS TAB: Today's 1.6 km Run Hero Spotlight (ONLY 1.6 km performance, giant time, zero walk clutter!)
         if (::progressTodayHeaderLabel.isInitialized) {
-            progressTodayHeaderLabel.text = "TODAY'S ACTIVITY LOGS  •  TAP FOR SPLITS"
-            if (todaySessions.isNotEmpty()) {
-                progressTodayCountBadge.text =
-                    "${todaySessions.size} RUN${if (todaySessions.size == 1) "" else "S"} TODAY"
-                progressTodayCountBadge.setTextColor(AthleticColors.EMERALD_BRIGHT)
-                progressTodayCountBadge.background = AthleticTheme.solidPill(
-                    this,
-                    0x2EC6F432,
-                    AthleticColors.EMERALD_BRIGHT,
-                    10f
-                )
-            } else {
-                progressTodayCountBadge.text = "LIVE TODAY"
-                progressTodayCountBadge.setTextColor(AthleticColors.CYAN_BRIGHT)
-                progressTodayCountBadge.background = AthleticTheme.solidPill(
-                    this,
-                    0x269D6BFF,
-                    AthleticColors.CYAN_BRIGHT,
-                    10f
-                )
-            }
-
-            progressTodayDailyStripLayout.removeAllViews()
-            progressTodayDailyStripLayout.addView(
-                buildDailySummaryCardView(
-                    day = todaySummary,
-                    isToday = true,
-                    isYesterday = false,
-                    samSnap = latestSamsungSnapshot
-                )
-            )
-
             todaySessionsListLayout.removeAllViews()
             if (todaySessions.isEmpty()) {
+                progressTodayLogsCard.background = AthleticTheme.gradientCard(
+                    this,
+                    AthleticColors.SURFACE_TOP,
+                    AthleticColors.SURFACE_BOTTOM,
+                    AthleticColors.BORDER_STRONG,
+                    18f
+                )
+                progressTodayHeaderLabel.text = "TODAY'S 1.6 KM RUN"
+                progressTodayCountBadge.text = "NOT RUN YET"
+                progressTodayCountBadge.setTextColor(AthleticColors.TEXT_SECONDARY)
+                progressTodayCountBadge.background = AthleticTheme.solidPill(
+                    this,
+                    AthleticColors.SURFACE_RECESSED,
+                    AthleticColors.BORDER_SUBTLE,
+                    10f
+                )
+
+                val pbHint = forecast.personalBestSec?.let {
+                    "Current PB: ${TsPoliceBenchmark.formatDuration(it, true)}  •  Target: $targetFmt"
+                } ?: "Target Cutoff: $targetFmt (1:48.8 /400m lap)"
                 todaySessionsListLayout.addView(TextView(this).apply {
-                    text = "No timed or auto run logged yet today — start a 1.6K Trial, 400m Intervals, or tap '+ Log Time'."
-                    textSize = 11.5f
-                    setTextColor(AthleticColors.TEXT_MUTED)
-                    setPadding(dp(2), dp(2), dp(2), 0)
+                    text = "No 1.6 km run recorded yet today. $pbHint"
+                    textSize = 12.5f
+                    setTextColor(AthleticColors.TEXT_SECONDARY)
+                    setPadding(0, dp(2), 0, dp(10))
                 })
+
+                val quickRow = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                }
+                quickRow.addView(
+                    AthleticTheme.createButton(
+                        this,
+                        "Start 1.6K Trial  →",
+                        AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
+                        42f
+                    ).apply {
+                        textSize = 12.5f
+                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f).apply {
+                            marginEnd = dp(5)
+                        }
+                        setOnClickListener {
+                            selectTab(0, smooth = true)
+                            selectTrackerSubTab(1, animate = true)
+                        }
+                    }
+                )
+                quickRow.addView(
+                    AthleticTheme.createButton(
+                        this,
+                        "+ Log Time",
+                        AthleticTheme.ButtonStyle.SECONDARY_SLATE,
+                        42f
+                    ).apply {
+                        textSize = 12.5f
+                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f).apply {
+                            marginStart = dp(5)
+                        }
+                        setOnClickListener {
+                            SessionDialogs.showManualRunDialog(this@MainActivity, repository) {
+                                refreshProgressDashboard()
+                            }
+                        }
+                    }
+                )
+                todaySessionsListLayout.addView(quickRow)
             } else {
-                for (s in todaySessions) {
-                    todaySessionsListLayout.addView(buildSessionLogRow(s, targetSec, highlightToday = true))
+                val primary = pickPrimaryRunForSpotlight(todaySessions)
+                val primaryMerit = TsPoliceBenchmark.evaluateMerit1600m(primary.equiv1600mSec, targetSec)
+                val allTimeBest = forecast.personalBestSec
+                val isPb = allTimeBest != null && abs(primary.equiv1600mSec - allTimeBest) < 0.05
+
+                progressTodayLogsCard.background = AthleticTheme.gradientCard(
+                    this,
+                    AthleticColors.HERO_EMERALD_TOP,
+                    AthleticColors.HERO_EMERALD_BOTTOM,
+                    AthleticColors.HERO_EMERALD_BORDER,
+                    18f
+                )
+                progressTodayHeaderLabel.text = if (abs(primary.distanceMeters - 1600.0) <= 60.0) {
+                    "TODAY'S 1.6 KM RUN"
+                } else {
+                    "TODAY'S RUN (1.6K PACE)"
+                }
+
+                val badgeLabel = when {
+                    primaryMerit.qualified -> "QUALIFIED ✓"
+                    isPb -> "NEW PB ★"
+                    todaySessions.size > 1 -> "${todaySessions.size} RUNS TODAY"
+                    else -> sessionModeLabel(primary)
+                }
+                val badgeCol = if (primaryMerit.qualified || isPb) {
+                    AthleticColors.EMERALD_BRIGHT
+                } else {
+                    AthleticColors.CYAN_BRIGHT
+                }
+                progressTodayCountBadge.text = badgeLabel
+                progressTodayCountBadge.setTextColor(badgeCol)
+                progressTodayCountBadge.background = AthleticTheme.solidPill(
+                    this,
+                    (badgeCol and 0x00FFFFFF) or 0x28000000,
+                    badgeCol,
+                    10f
+                )
+
+                todaySessionsListLayout.addView(
+                    buildHero1600mSpotlightView(primary, targetSec, isAllTimePb = isPb, compact = false)
+                )
+
+                val extraRuns = todaySessions.filter { it.id != primary.id }
+                for (extra in extraRuns) {
+                    todaySessionsListLayout.addView(
+                        buildSessionLogRow(extra, targetSec, highlightToday = true)
+                    )
                 }
             }
         }
 
-        // Also keep Today tab's top activity container synchronized whenever sessions change
+        // Keep Today tab's top run spotlight synchronized whenever sessions change
         lastDailyHistoryKey = ""
         renderDailyHistoryCards(todaySummary)
 
-        // 2. BOTTOM OF PROGRESS TAB: Past Activity Logs (Previous Days Only)
-        if (::pastSessionsHeaderLabel.isInitialized) {
-            pastSessionsHeaderLabel.text = if (pastSessions.isNotEmpty()) {
-                "PAST ACTIVITY LOGS  •  ${pastSessions.size} RUN${if (pastSessions.size == 1) "" else "S"}  •  TAP FOR SPLITS"
-            } else {
-                "PAST ACTIVITY LOGS  •  PREVIOUS DAYS"
-            }
+        // 2. BOTTOM OF PROGRESS TAB: Past Run Logs (Previous Days Only, Big Bold Times)
+        if (::pastSessionsHeaderLabel.isInitialized && ::pastSessionsCountBadge.isInitialized) {
+            pastSessionsHeaderLabel.text = "PAST RUN LOGS"
+            pastSessionsCountBadge.text = "${pastSessions.size} RUN${if (pastSessions.size == 1) "" else "S"}"
         }
 
         sessionsListLayout.removeAllViews()
         if (pastSessions.isEmpty()) {
             sessionsListLayout.addView(TextView(this).apply {
                 text = if (sessions.isEmpty()) {
-                    "No past runs yet. Arm a 1.6 km PT Trial, run 400m Intervals, sync Samsung Health, or tap 'Sample Data'."
+                    "No past 1.6 km runs yet. Start a 1.6K Trial, log a stopwatch time, or tap 'Sample Data'."
                 } else {
-                    "No past run logs before today."
+                    "No earlier run logs before today."
                 }
                 textSize = 12.5f
                 setTextColor(AthleticColors.TEXT_MUTED)
@@ -3845,12 +3929,229 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun pickPrimaryRunForSpotlight(runs: List<RunSessionRecord>): RunSessionRecord {
+        val official1600 = runs.filter {
+            it.mode == RunMode.TIMED_1600M ||
+                it.mode == RunMode.MANUAL_LOG ||
+                abs(it.distanceMeters - 1600.0) <= 80.0
+        }
+        return (official1600.ifEmpty { runs }).minBy { it.equiv1600mSec }
+    }
+
+    private fun sessionModeLabel(s: RunSessionRecord): String = when (s.mode) {
+        RunMode.TIMED_1600M -> "1.6K TRIAL"
+        RunMode.INTERVAL_400M -> "400M REPS"
+        RunMode.MANUAL_LOG -> "STOPWATCH"
+        RunMode.OPEN_PRACTICE -> if (s.notes.startsWith("Synced")) "SAMSUNG RUN" else "OPEN RUN"
+    }
+
+    private fun formatShortRunDate(dateIso: String): String {
+        val parsed = runCatching { LocalDate.parse(dateIso) }.getOrNull() ?: return dateIso
+        val mon = parsed.month.name.take(3).lowercase().replaceFirstChar { it.uppercase() }
+        return if (parsed.year == LocalDate.now().year) {
+            "$mon ${parsed.dayOfMonth}"
+        } else {
+            "$mon ${parsed.dayOfMonth}, ${parsed.year}"
+        }
+    }
+
+    /**
+     * Giant, high-contrast 1.6 km time spotlight for Today's best run so the runner's finish time
+     * immediately commands visual attention with inline 4x400m split pills.
+     */
+    private fun buildHero1600mSpotlightView(
+        s: RunSessionRecord,
+        targetSec: Double,
+        isAllTimePb: Boolean,
+        compact: Boolean
+    ): LinearLayout {
+        val merit = TsPoliceBenchmark.evaluateMerit1600m(s.equiv1600mSec, targetSec)
+        val isExact1600 = abs(s.distanceMeters - 1600.0) <= 60.0
+        val heroTimeColor = when {
+            merit.qualified || isAllTimePb -> AthleticColors.EMERALD_BRIGHT
+            else -> AthleticColors.TEXT_PRIMARY
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            isClickable = true
+            isFocusable = true
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = AthleticTheme.rippleSurface(
+                this@MainActivity,
+                0x36000000,
+                0x4A000000,
+                if (merit.qualified || isAllTimePb) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.BORDER_STRONG,
+                14f
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = if (compact) dp(4) else dp(6)
+            }
+            setOnClickListener {
+                SessionDialogs.showSessionDetailDialog(this@MainActivity, s, targetSec) {
+                    repository.deleteSession(s.id)
+                    refreshCachedDailyHistory(forceRender = true)
+                    refreshProgressDashboard()
+                }
+            }
+        }
+
+        // Top Hero Row: Massive 42sp Time on Left + Gap Pill & Lap Avg on Right
+        val mainRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val leftTimeCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.15f).apply {
+                marginEnd = dp(8)
+            }
+        }
+        leftTimeCol.addView(TextView(this).apply {
+            text = TsPoliceBenchmark.formatDuration(s.equiv1600mSec, includeTenths = true)
+            textSize = if (compact) 36f else 42f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(heroTimeColor)
+            includeFontPadding = false
+            maxLines = 1
+        })
+        leftTimeCol.addView(TextView(this).apply {
+            val modeTxt = sessionModeLabel(s)
+            text = if (isExact1600) {
+                "1.60 KM TIME  •  $modeTxt"
+            } else {
+                "1.6K PACE (${String.format("%.2f km", s.distanceMeters / 1000.0)} $modeTxt)"
+            }
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            letterSpacing = 0.04f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(2), 0, 0)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        mainRow.addView(leftTimeCol)
+
+        val rightMetaCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        val gapSec = s.equiv1600mSec - targetSec
+        val targetFmt = TsPoliceBenchmark.formatDuration(targetSec)
+        val gapCol = if (gapSec <= 0.0) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
+        val gapTxt = if (gapSec <= 0.0) {
+            "-${String.format("%.1fs", abs(gapSec))} < $targetFmt ✓"
+        } else {
+            "+${String.format("%.1fs", gapSec)} to $targetFmt"
+        }
+        rightMetaCol.addView(TextView(this).apply {
+            text = gapTxt
+            textSize = 11f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(gapCol)
+            setPadding(dp(9), dp(3.5f), dp(9), dp(3.5f))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                (gapCol and 0x00FFFFFF) or 0x24000000,
+                gapCol,
+                9f
+            )
+            maxLines = 1
+        })
+        rightMetaCol.addView(TextView(this).apply {
+            text = "${TsPoliceBenchmark.formatDuration(s.equiv1600mSec / 4.0, true)} /400m avg"
+            textSize = 12f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(5), 0, dp(1))
+            maxLines = 1
+        })
+        if (s.avgCadenceSpm > 0.0) {
+            rightMetaCol.addView(TextView(this).apply {
+                text = "${s.avgCadenceSpm.roundToInt()} spm cadence"
+                textSize = 11f
+                setTextColor(AthleticColors.TEXT_MUTED)
+                maxLines = 1
+            })
+        }
+        mainRow.addView(rightMetaCol)
+        container.addView(mainRow)
+
+        // Inline 4x400m Lap Splits Bar (shown immediately without needing a tap!)
+        if (!compact && s.lapSplits.isNotEmpty()) {
+            val targetLap = TsPoliceBenchmark.targetLap400mSec(targetSec)
+            val splitsRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    topMargin = dp(11)
+                }
+            }
+            val shownSplits = s.lapSplits.take(4)
+            for ((idx, sp) in shownSplits.withIndex()) {
+                val hitTarget = sp.lapDurationSec <= targetLap
+                val tile = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    setPadding(dp(4), dp(6), dp(4), dp(6))
+                    background = AthleticTheme.solidPill(
+                        this@MainActivity,
+                        AthleticColors.SURFACE_RECESSED,
+                        if (hitTarget) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.BORDER_SUBTLE,
+                        9f
+                    )
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                        if (idx > 0) marginStart = dp(5)
+                    }
+                }
+                tile.addView(TextView(this).apply {
+                    text = "LAP ${sp.lapNumber}"
+                    textSize = 9.5f
+                    typeface = AthleticTheme.FONT_SANS_BOLD
+                    setTextColor(AthleticColors.TEXT_MUTED)
+                    maxLines = 1
+                })
+                tile.addView(TextView(this).apply {
+                    text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec, true)
+                    textSize = 13f
+                    typeface = AthleticTheme.FONT_TABULAR_BOLD
+                    setTextColor(if (hitTarget) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_PRIMARY)
+                    setPadding(0, dp(2), 0, 0)
+                    maxLines = 1
+                })
+                splitsRow.addView(tile)
+            }
+            container.addView(splitsRow)
+        }
+
+        container.addView(TextView(this).apply {
+            val extraSplitsTxt = if (s.lapSplits.size > 4) " (${s.lapSplits.size} splits)" else ""
+            text = "Tap for full split breakdown$extraSplitsTxt & options  →"
+            textSize = 11f
+            setTextColor(AthleticColors.TEXT_MUTED)
+            setPadding(0, dp(8), 0, 0)
+        })
+
+        return container
+    }
+
     private fun buildSessionLogRow(
         s: RunSessionRecord,
         targetSec: Double,
         highlightToday: Boolean
     ): LinearLayout {
         val merit = TsPoliceBenchmark.evaluateMerit1600m(s.equiv1600mSec, targetSec)
+        val isExact1600 = abs(s.distanceMeters - 1600.0) <= 60.0
         val borderColor = when {
             merit.qualified -> AthleticColors.HERO_EMERALD_BORDER
             highlightToday -> AthleticColors.HERO_CYAN_BORDER
@@ -3859,16 +4160,17 @@ class MainActivity : AppCompatActivity() {
         val bgColor = if (highlightToday) 0xFF141720.toInt() else AthleticColors.SURFACE_RECESSED
 
         val rowCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             isClickable = true
             isFocusable = true
-            setPadding(dp(13), dp(11), dp(13), dp(11))
+            setPadding(dp(14), dp(12), dp(10), dp(12))
             background = AthleticTheme.rippleSurface(
                 this@MainActivity,
                 bgColor,
                 bgColor,
                 borderColor,
-                12f
+                13f
             )
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -3883,50 +4185,70 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val topLine = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        val leftCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
         }
-        val modeBadge = when (s.mode) {
-            RunMode.TIMED_1600M -> "1.6K TRIAL"
-            RunMode.INTERVAL_400M -> "INTERVALS"
-            RunMode.MANUAL_LOG -> "STOPWATCH"
-            RunMode.OPEN_PRACTICE -> if (s.notes.startsWith("Synced")) "SAMSUNG" else "AUTO RUN"
-        }
-        topLine.addView(TextView(this).apply {
-            val demoTag = if (s.isDemo) " • SAMPLE" else ""
-            val datePrefix = if (highlightToday) "TODAY" else s.dateIso
+        val modeBadge = sessionModeLabel(s)
+        val demoTag = if (s.isDemo) " • SAMPLE" else ""
+        val datePrefix = if (highlightToday) "TODAY" else formatShortRunDate(s.dateIso)
+        leftCol.addView(TextView(this).apply {
             text = "$datePrefix  •  $modeBadge$demoTag"
             textSize = 12f
             typeface = AthleticTheme.FONT_SANS_BOLD
             setTextColor(if (highlightToday) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_PRIMARY)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
         })
-        topLine.addView(TextView(this).apply {
-            val suffix = if (abs(s.distanceMeters - 1600.0) <= 50.0) "1.6K" else "1.6K eq"
-            text = "${TsPoliceBenchmark.formatDuration(s.equiv1600mSec, true)} ($suffix)"
-            textSize = 13.5f
-            typeface = AthleticTheme.FONT_TABULAR_BOLD
-            setTextColor(if (merit.qualified) AthleticColors.EMERALD_BRIGHT else AthleticColors.CYAN_BRIGHT)
-        })
-        rowCard.addView(topLine)
-
-        val bottomLine = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(5), 0, 0)
-        }
-        val splitsHint = if (s.lapSplits.isNotEmpty()) "${s.lapSplits.size} splits • " else ""
-        bottomLine.addView(TextView(this).apply {
-            text = "${String.format("%.2f km", s.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(s.activeDurationSec)}  •  ${splitsHint}${merit.points} pts"
+        val splitsHint = if (s.lapSplits.isNotEmpty()) " • ${s.lapSplits.size} splits" else ""
+        leftCol.addView(TextView(this).apply {
+            text = "${String.format("%.2f km", s.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(s.activeDurationSec)}$splitsHint"
             textSize = 11.5f
             setTextColor(AthleticColors.TEXT_SECONDARY)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(0, dp(3), 0, 0)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
         })
+        rowCard.addView(leftCol)
 
-        // Safe Delete trash button (always asks confirmation!)
+        // Prominent 23sp Bold Time Column on Right so past times grab attention instantly!
+        val rightTimeCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        rightTimeCol.addView(TextView(this).apply {
+            text = TsPoliceBenchmark.formatDuration(s.equiv1600mSec, true)
+            textSize = 22.5f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            includeFontPadding = false
+            setTextColor(
+                when {
+                    merit.qualified -> AthleticColors.EMERALD_BRIGHT
+                    isExact1600 -> AthleticColors.TEXT_PRIMARY
+                    else -> AthleticColors.CYAN_BRIGHT
+                }
+            )
+            maxLines = 1
+        })
+        rightTimeCol.addView(TextView(this).apply {
+            text = if (isExact1600) "1.60 KM" else "1.6K EQ"
+            textSize = 9.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            letterSpacing = 0.05f
+            setTextColor(AthleticColors.TEXT_MUTED)
+            maxLines = 1
+        })
+        rowCard.addView(rightTimeCol)
+
+        // Subtle muted delete icon (never bright red, so eye stays on the run time!)
         val delHitbox = FrameLayout(this).apply {
-            setPadding(dp(8), dp(4), dp(2), dp(4))
+            setPadding(dp(8), dp(6), dp(4), dp(6))
             isClickable = true
             isFocusable = true
             setOnClickListener {
@@ -3937,13 +4259,13 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             addView(
-                VectorIconView(this@MainActivity, IconKind.TRASH, AthleticColors.CRIMSON, 15f).apply {
-                    layoutParams = FrameLayout.LayoutParams(dp(15), dp(15), Gravity.CENTER)
+                VectorIconView(this@MainActivity, IconKind.TRASH, 0xFF686876.toInt(), 14f).apply {
+                    layoutParams = FrameLayout.LayoutParams(dp(14), dp(14), Gravity.CENTER)
                 }
             )
         }
-        bottomLine.addView(delHitbox)
-        rowCard.addView(bottomLine)
+        rowCard.addView(delHitbox)
+
         return rowCard
     }
 

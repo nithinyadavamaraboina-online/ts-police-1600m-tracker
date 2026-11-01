@@ -1,8 +1,8 @@
 {
-    "versionCode":  25,
-    "versionName":  "1.0.24",
+    "versionCode":  26,
+    "versionName":  "1.0.25",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "341562f74950c7515e1e1009c43b2f3578d1e9045219168dd8ede5f51ade5ca4",
-    "changelog":  "Move Today\u0027s Activity Logs \u0026 run splits to the top of Progress and Today tabs while keeping Past Activity Logs cleanly at the bottom; cap extreme breakthrough weekly-gain spikes.",
-    "publishedAt":  "2026-11-01T13:31:13Z"
+    "sha256":  "b945291b0113c7bc164b853f8c16564966c697a44c95c4700960f76de9ec7db4",
+    "changelog":  "Progress tab redesign: remove daily walk/step clutter, spotlight Today\u0027s 1.6 km time in giant 42sp bold numerals with inline 4x400m split pills, and enlarge Past Run Log times.",
+    "publishedAt":  "2026-11-01T13:46:37Z"
 }
