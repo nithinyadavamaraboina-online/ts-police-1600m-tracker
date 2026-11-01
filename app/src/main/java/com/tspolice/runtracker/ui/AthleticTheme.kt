@@ -349,67 +349,67 @@ class VectorIconView(
 
         when (kind) {
             IconKind.TRACK_EMBLEM -> {
-                // Signature Sprinting Runner Emblem (matches launcher icon)
+                // Compact Sprinting Runner Emblem (generous inner margin)
                 fillPaint.color = 0x20C6F432
-                canvas.drawCircle(cx, cy, s * 0.48f, fillPaint)
+                canvas.drawCircle(cx, cy, s * 0.46f, fillPaint)
 
                 // Electric-purple sweeping stadium track arc
                 strokePaint.color = AthleticColors.CYAN
-                strokePaint.strokeWidth = s * 0.055f
-                rect.set(x(0.09f), y(0.09f), x(0.91f), y(0.91f))
+                strokePaint.strokeWidth = s * 0.048f
+                rect.set(x(0.14f), y(0.14f), x(0.86f), y(0.86f))
                 canvas.drawArc(rect, 140f, 245f, false, strokePaint)
 
-                // Speed trails behind sprinter
-                strokePaint.strokeWidth = s * 0.042f
+                // Compact speed trails behind sprinter
+                strokePaint.strokeWidth = s * 0.036f
                 strokePaint.color = AthleticColors.CYAN_BRIGHT
-                canvas.drawLine(x(0.15f), y(0.40f), x(0.28f), y(0.40f), strokePaint)
+                canvas.drawLine(x(0.24f), y(0.43f), x(0.35f), y(0.43f), strokePaint)
                 strokePaint.color = AthleticColors.EMERALD
-                canvas.drawLine(x(0.12f), y(0.49f), x(0.26f), y(0.49f), strokePaint)
+                canvas.drawLine(x(0.21f), y(0.50f), x(0.33f), y(0.50f), strokePaint)
 
-                // Forward-leaning sprinter head
+                // Compact forward-leaning sprinter head
                 fillPaint.color = AthleticColors.EMERALD_BRIGHT
-                canvas.drawCircle(x(0.63f), y(0.26f), s * 0.068f, fillPaint)
+                canvas.drawCircle(x(0.60f), y(0.32f), s * 0.052f, fillPaint)
 
-                // V-tapered forward-leaning torso
+                // Compact V-tapered forward-leaning torso
                 path.reset()
-                path.moveTo(x(0.51f), y(0.33f))
-                path.lineTo(x(0.59f), y(0.36f))
-                path.lineTo(x(0.47f), y(0.54f))
-                path.lineTo(x(0.40f), y(0.51f))
+                path.moveTo(x(0.50f), y(0.38f))
+                path.lineTo(x(0.57f), y(0.405f))
+                path.lineTo(x(0.48f), y(0.54f))
+                path.lineTo(x(0.425f), y(0.515f))
                 path.close()
                 canvas.drawPath(path, fillPaint)
 
                 // Rear counter-swing arm + front pumping lead arm
                 strokePaint.color = AthleticColors.EMERALD
-                strokePaint.strokeWidth = s * 0.060f
+                strokePaint.strokeWidth = s * 0.048f
                 path.reset()
-                path.moveTo(x(0.52f), y(0.35f))
-                path.lineTo(x(0.40f), y(0.36f))
-                path.lineTo(x(0.35f), y(0.45f))
+                path.moveTo(x(0.51f), y(0.395f))
+                path.lineTo(x(0.42f), y(0.40f))
+                path.lineTo(x(0.38f), y(0.47f))
                 canvas.drawPath(path, strokePaint)
 
                 strokePaint.color = AthleticColors.EMERALD_BRIGHT
                 path.reset()
-                path.moveTo(x(0.57f), y(0.37f))
-                path.lineTo(x(0.64f), y(0.45f))
-                path.lineTo(x(0.75f), y(0.38f))
+                path.moveTo(x(0.55f), y(0.41f))
+                path.lineTo(x(0.61f), y(0.47f))
+                path.lineTo(x(0.69f), y(0.42f))
                 canvas.drawPath(path, strokePaint)
 
                 // Rear push-off leg + front high-knee sprint leg
                 strokePaint.color = AthleticColors.EMERALD
-                strokePaint.strokeWidth = s * 0.066f
+                strokePaint.strokeWidth = s * 0.052f
                 path.reset()
-                path.moveTo(x(0.42f), y(0.52f))
-                path.lineTo(x(0.32f), y(0.65f))
-                path.lineTo(x(0.20f), y(0.70f))
+                path.moveTo(x(0.44f), y(0.525f))
+                path.lineTo(x(0.36f), y(0.625f))
+                path.lineTo(x(0.27f), y(0.665f))
                 canvas.drawPath(path, strokePaint)
 
                 strokePaint.color = AthleticColors.EMERALD_BRIGHT
                 path.reset()
-                path.moveTo(x(0.46f), y(0.53f))
-                path.lineTo(x(0.64f), y(0.56f))
-                path.lineTo(x(0.59f), y(0.75f))
-                path.lineTo(x(0.64f), y(0.76f))
+                path.moveTo(x(0.47f), y(0.53f))
+                path.lineTo(x(0.61f), y(0.555f))
+                path.lineTo(x(0.57f), y(0.70f))
+                path.lineTo(x(0.61f), y(0.71f))
                 canvas.drawPath(path, strokePaint)
             }
 

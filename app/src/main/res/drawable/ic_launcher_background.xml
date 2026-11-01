@@ -8,12 +8,12 @@
     <path
         android:fillColor="#000000"
         android:pathData="M0,0h108v108h-108z" />
-    <!-- Subtle deep ambient purple-charcoal halo inside adaptive safe zone -->
+    <!-- Subtle compact ambient purple-charcoal halo -->
     <path
-        android:fillColor="#0E0B18"
-        android:pathData="M54,18 A36,36 0 1,1 54,90 A36,36 0 1,1 54,18 Z" />
-    <!-- Subtle dark neon-lime core glow behind the sprinter -->
+        android:fillColor="#0D0A16"
+        android:pathData="M54,28 A26,26 0 1,1 54,80 A26,26 0 1,1 54,28 Z" />
+    <!-- Subtle compact dark neon-lime core glow behind the sprinter -->
     <path
-        android:fillColor="#161F06"
-        android:pathData="M54,24 A30,30 0 1,1 54,84 A30,30 0 1,1 54,24 Z" />
+        android:fillColor="#141D06"
+        android:pathData="M54,33 A21,21 0 1,1 54,75 A21,21 0 1,1 54,33 Z" />
 </vector>

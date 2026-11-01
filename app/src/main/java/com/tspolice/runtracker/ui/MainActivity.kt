@@ -2,6 +2,7 @@ package com.tspolice.runtracker.ui
 
 import android.Manifest
 import android.app.AlertDialog
+import android.app.DatePickerDialog
 import android.app.Dialog
 import android.content.ComponentName
 import android.content.Context
@@ -38,6 +39,8 @@ import androidx.viewpager2.widget.ViewPager2
 import com.tspolice.runtracker.data.RunRepository
 import com.tspolice.runtracker.domain.ComparisonDayScope
 import com.tspolice.runtracker.domain.DailyActivitySummary
+import com.tspolice.runtracker.domain.DeadlineGoalCoach
+import com.tspolice.runtracker.domain.DeadlineGoalPlan
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.HealthSyncStatus
 import com.tspolice.runtracker.domain.IntervalPhase
@@ -46,7 +49,10 @@ import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.PocketAudioMode
 import com.tspolice.runtracker.domain.ProgressionForecaster
 import com.tspolice.runtracker.domain.PtTrialPhase
+import com.tspolice.runtracker.domain.PushAccentKind
+import com.tspolice.runtracker.domain.RecommendedWorkoutAction
 import com.tspolice.runtracker.domain.RunMode
+import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
 import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
@@ -101,6 +107,8 @@ class MainActivity : AppCompatActivity() {
     private var cachedPastDailyLogs: List<DailyActivitySummary> = emptyList()
     private var lastDailyHistoryRenderMs = -60_000L
     private var lastDailyHistoryKey = ""
+    private var lastGoalCoachRenderMs = -60_000L
+    private var lastGoalCoachKey = ""
 
     // Header & Root Navigation views
     private lateinit var headerSubtitleText: TextView
@@ -137,6 +145,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var dailyWalkDistSub: TextView
     private lateinit var allDayGaitPill: TextView
     private lateinit var launchPtFromOpenBtn: TextView
+    private lateinit var goalCoachCard: LinearLayout
+    private lateinit var goalHeaderLabel: TextView
+    private lateinit var goalPushBadge: TextView
+    private lateinit var goalReadinessBar: NeonUpdateProgressBarView
+    private lateinit var goalStatusText: TextView
+    private lateinit var goalDirectiveText: TextView
+    private lateinit var goalMiniMilestonesLayout: LinearLayout
+    private lateinit var goalActionBtn: TextView
     private lateinit var dailyMaxPaceVal: TextView
     private lateinit var dailyMaxPaceSub: TextView
     private lateinit var dailyMaxCadenceVal: TextView
@@ -219,6 +235,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var meritBadgeText: TextView
     private lateinit var etaSubText: TextView
     private lateinit var coachPrescriptionText: TextView
+    private lateinit var progressGoalHeaderLabel: TextView
+    private lateinit var progressGoalReadinessPill: TextView
+    private lateinit var progressGoalWeeklyMixText: TextView
+    private lateinit var progressMilestonesLayout: LinearLayout
     private lateinit var kpiPbVal: TextView
     private lateinit var kpiGapVal: TextView
     private lateinit var kpiRateVal: TextView
@@ -230,6 +250,7 @@ class MainActivity : AppCompatActivity() {
     // Tab 3: Settings, Profile & Lab views
     private lateinit var batteryStatusBadge: TextView
     private lateinit var batteryStatusBtn: TextView
+    private lateinit var goalDeadlineBtn: TextView
     private lateinit var heightValText: TextView
     private lateinit var targetPresetButtons: List<Pair<Double, TextView>>
     private lateinit var thresholdPresetButtons: List<Pair<Double, TextView>>
@@ -318,6 +339,7 @@ class MainActivity : AppCompatActivity() {
         refreshTuningStatusLabels()
         refreshCachedDailyHistory(forceRender = true)
         renderSamsungComparisonCard(force = true)
+        renderGoalCoachCard(force = true)
         refreshProgressDashboard()
         updateBanners()
 
@@ -360,6 +382,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         updateBanners()
         refreshBatterySettingsState()
+        renderGoalCoachCard(force = true)
         if (appUpdater.resumePendingInstallIfPermitted()) {
             Toast.makeText(this, "Launching update installer...", Toast.LENGTH_SHORT).show()
             return
@@ -1047,6 +1070,9 @@ class MainActivity : AppCompatActivity() {
         }
         box.addView(launchPtFromOpenBtn)
 
+        // 2B. Nov 30 Goal Countdown & Dynamic Daily Push Coach Card
+        box.addView(buildTodayGoalCoachCard())
+
         // 3. Clean 2x2 Bento Grid (Peak Pace, Peak Cadence, Live Speed, Total Distance)
         val bentoRow1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1113,6 +1139,116 @@ class MainActivity : AppCompatActivity() {
         box.addView(dailyLogCard)
 
         return box
+    }
+
+    private fun buildTodayGoalCoachCard(): LinearLayout {
+        goalCoachCard = cardContainer(
+            topColor = AthleticColors.HERO_AMBER_TOP,
+            bottomColor = AthleticColors.HERO_AMBER_BOTTOM,
+            borderColor = AthleticColors.HERO_AMBER_BORDER
+        )
+
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        goalHeaderLabel = AthleticTheme.sectionLabel(
+            this,
+            "NOV 30 GOAL  •  29 DAYS LEFT  ✎",
+            AthleticColors.AMBER_BRIGHT
+        ).apply {
+            isClickable = true
+            isFocusable = true
+            setPadding(0, dp(2), dp(6), dp(2))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { showGoalDeadlinePicker() }
+        }
+        goalPushBadge = TextView(this).apply {
+            text = "PUSH 8/10"
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setPadding(dp(9), dp(4), dp(9), dp(4))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                0x2EFF9F1C,
+                AthleticColors.AMBER_BRIGHT,
+                10f
+            )
+            setTextColor(AthleticColors.AMBER_BRIGHT)
+        }
+        headerRow.addView(goalHeaderLabel)
+        headerRow.addView(goalPushBadge)
+        goalCoachCard.addView(headerRow)
+
+        goalReadinessBar = NeonUpdateProgressBarView(this).apply {
+            isIndeterminateMode = false
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(9)
+            ).apply {
+                topMargin = dp(10)
+                bottomMargin = dp(8)
+            }
+        }
+        goalCoachCard.addView(goalReadinessBar)
+
+        goalStatusText = TextView(this).apply {
+            text = "Loading Nov 30 goal readiness..."
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setLineSpacing(0f, 1.15f)
+        }
+        goalCoachCard.addView(goalStatusText)
+
+        goalDirectiveText = TextView(this).apply {
+            text = ""
+            textSize = 12.5f
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setLineSpacing(0f, 1.18f)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                0x33000000,
+                AthleticColors.BORDER_STRONG,
+                12f
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(10)
+            }
+        }
+        goalCoachCard.addView(goalDirectiveText)
+
+        goalMiniMilestonesLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(10)
+                bottomMargin = dp(10)
+            }
+        }
+        goalCoachCard.addView(goalMiniMilestonesLayout)
+
+        goalActionBtn = AthleticTheme.createButton(
+            this,
+            "Arm Zero-Stop 1.6 km Trial  →",
+            AthleticTheme.ButtonStyle.WARNING_AMBER,
+            46f
+        ).apply {
+            textSize = 12.5f
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        goalCoachCard.addView(goalActionBtn)
+
+        return goalCoachCard
     }
 
     private fun buildSamsungComparisonCard(): LinearLayout {
@@ -1694,6 +1830,63 @@ class MainActivity : AppCompatActivity() {
         heroCard.addView(coachPrescriptionText)
         col.addView(heroCard)
 
+        // Nov 30 Goal Countdown & 4-Week Milestone Ladder Card
+        val goalRoadmapCard = cardContainer(
+            topColor = AthleticColors.HERO_CYAN_TOP,
+            bottomColor = AthleticColors.HERO_CYAN_BOTTOM,
+            borderColor = AthleticColors.HERO_CYAN_BORDER
+        )
+        val roadmapTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        progressGoalHeaderLabel = AthleticTheme.sectionLabel(
+            this,
+            "EXAM COUNTDOWN  •  NOV 30  ✎",
+            AthleticColors.CYAN_BRIGHT
+        ).apply {
+            isClickable = true
+            isFocusable = true
+            setPadding(0, dp(2), dp(6), dp(2))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { showGoalDeadlinePicker() }
+        }
+        progressGoalReadinessPill = TextView(this).apply {
+            text = "0% READY"
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setPadding(dp(9), dp(3.5f), dp(9), dp(3.5f))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                0x269D6BFF,
+                AthleticColors.CYAN_BRIGHT,
+                10f
+            )
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+        }
+        roadmapTopRow.addView(progressGoalHeaderLabel)
+        roadmapTopRow.addView(progressGoalReadinessPill)
+        goalRoadmapCard.addView(roadmapTopRow)
+
+        progressGoalWeeklyMixText = TextView(this).apply {
+            text = ""
+            textSize = 11.5f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setLineSpacing(0f, 1.15f)
+            setPadding(0, dp(6), 0, dp(10))
+        }
+        goalRoadmapCard.addView(progressGoalWeeklyMixText)
+
+        progressMilestonesLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        goalRoadmapCard.addView(progressMilestonesLayout)
+        col.addView(goalRoadmapCard)
+
         // 2x2 KPI Bento Grid
         val kpiRow1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1885,6 +2078,44 @@ class MainActivity : AppCompatActivity() {
         }
         targetPresetButtons = tBtns
         profileCard.addView(targetPresetRow)
+
+        // Goal Exam / PET Deadline Date Row
+        val deadlineRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(2), 0, dp(10))
+        }
+        val deadlineLblCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
+        }
+        deadlineLblCol.addView(TextView(this).apply {
+            text = "PET Goal Deadline Date"
+            textSize = 13.5f
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+        })
+        deadlineLblCol.addView(TextView(this).apply {
+            text = "Tracks countdown & daily push intensity to exam day"
+            textSize = 11.5f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+        })
+        deadlineRow.addView(deadlineLblCol)
+
+        goalDeadlineBtn = AthleticTheme.createButton(
+            this,
+            "Nov 30, 2026  ✎",
+            AthleticTheme.ButtonStyle.SECONDARY_SLATE,
+            36f
+        ).apply {
+            textSize = 12f
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            setOnClickListener { showGoalDeadlinePicker() }
+        }
+        deadlineRow.addView(goalDeadlineBtn)
+        profileCard.addView(deadlineRow)
 
         // Runner Height Stepper Row (Biomechanical Stride Baseline)
         val heightRow = LinearLayout(this).apply {
@@ -2563,6 +2794,7 @@ class MainActivity : AppCompatActivity() {
         latestDailySummaryForCompare = daily
         renderSamsungComparisonCard(force = false)
         renderDailyHistoryCards(daily)
+        renderGoalCoachCard(dailyOverride = daily, force = false)
 
         // =====================================================================
         // B. RENDER 1.6 KM PT TRIAL COCKPIT (SUB-VIEW 1)
@@ -3370,6 +3602,10 @@ class MainActivity : AppCompatActivity() {
         trendChartView.setForecast(forecast)
         demoToggleBtn.text = if (repository.hasDemoSessions()) "Clear Sample" else "Sample Data"
 
+        val goalPlan = buildCurrentGoalPlan(sessions = sessions)
+        applyGoalPlanToTodayCard(goalPlan)
+        renderProgressGoalRoadmap(goalPlan)
+
         sessionsListLayout.removeAllViews()
         if (sessions.isEmpty()) {
             sessionsListLayout.addView(TextView(this).apply {
@@ -3512,7 +3748,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshSettingsHighlights() {
         val curTarget = repository.targetTimeSec
-        headerSubtitleText.text = "PET Coach  •  Cutoff < ${TsPoliceBenchmark.formatDuration(curTarget)}"
+        val deadlineDate = runCatching { LocalDate.parse(repository.goalDeadlineIso) }
+            .getOrElse { LocalDate.of(2026, 11, 30) }
+        val shortDeadline = "${deadlineDate.month.name.take(3).lowercase().replaceFirstChar { it.uppercase() }} ${deadlineDate.dayOfMonth}"
+        headerSubtitleText.text = "PET Coach  •  < ${TsPoliceBenchmark.formatDuration(curTarget)} by $shortDeadline"
+
+        if (::goalDeadlineBtn.isInitialized) {
+            val daysLeft = (deadlineDate.toEpochDay() - LocalDate.now().toEpochDay()).toInt().coerceAtLeast(0)
+            goalDeadlineBtn.text = "$shortDeadline, ${deadlineDate.year} (${daysLeft}d)  ✎"
+        }
 
         if (::targetPresetButtons.isInitialized) {
             for ((sec, btn) in targetPresetButtons) {
@@ -4081,6 +4325,291 @@ class MainActivity : AppCompatActivity() {
             runDownloadFlow()
         }
     }
+
+    // =========================================================================
+    // NOV 30 GOAL DEADLINE & DYNAMIC DAILY PUSH COACH
+    // =========================================================================
+    private fun buildCurrentGoalPlan(
+        sessions: List<RunSessionRecord>? = null,
+        dailyOverride: DailyActivitySummary? = null
+    ): DeadlineGoalPlan {
+        val todayNow = LocalDate.now()
+        val todayIso = todayNow.toString()
+        val yesterdayIso = todayNow.minusDays(1).toString()
+        val allSessions = sessions ?: repository.getAllSessions()
+        val todaySum = dailyOverride
+            ?: latestDailySummaryForCompare.takeIf { it.dateIso == todayIso }
+            ?: repository.getDailyActivity(todayIso)
+        val yesterdaySum = cachedPastDailyLogs.firstOrNull { it.dateIso == yesterdayIso }
+            ?: repository.getDailyActivity(yesterdayIso)
+
+        return DeadlineGoalCoach.buildPlan(
+            sessions = allSessions,
+            todaySummary = todaySum,
+            yesterdaySummary = yesterdaySum,
+            targetTimeSec = repository.targetTimeSec,
+            deadlineIso = repository.goalDeadlineIso,
+            todayIso = todayIso
+        )
+    }
+
+    private fun renderGoalCoachCard(
+        dailyOverride: DailyActivitySummary? = null,
+        force: Boolean = false
+    ) {
+        if (!::goalCoachCard.isInitialized) return
+        val nowMs = SystemClock.elapsedRealtime()
+        val todaySum = dailyOverride ?: latestDailySummaryForCompare
+        val key = "${LocalDate.now()}:${repository.targetTimeSec.toInt()}:${repository.goalDeadlineIso}:" +
+            "${(todaySum.jogRunCombinedMeters / 100.0).toInt()}"
+        if (!force && key == lastGoalCoachKey && (nowMs - lastGoalCoachRenderMs) < 12_000L) {
+            return
+        }
+        lastGoalCoachKey = key
+        lastGoalCoachRenderMs = nowMs
+
+        val plan = buildCurrentGoalPlan(dailyOverride = dailyOverride)
+        applyGoalPlanToTodayCard(plan)
+    }
+
+    private fun applyGoalPlanToTodayCard(plan: DeadlineGoalPlan) {
+        if (!::goalCoachCard.isInitialized) return
+
+        val (topGrad, botGrad, borderCol, accentCol, btnStyle) = when (plan.pushAccentKind) {
+            PushAccentKind.ORANGE_HARD -> quintuple(
+                AthleticColors.HERO_AMBER_TOP,
+                AthleticColors.HERO_AMBER_BOTTOM,
+                AthleticColors.HERO_AMBER_BORDER,
+                AthleticColors.AMBER_BRIGHT,
+                AthleticTheme.ButtonStyle.WARNING_AMBER
+            )
+            PushAccentKind.PURPLE_RECOVERY -> quintuple(
+                AthleticColors.HERO_CYAN_TOP,
+                AthleticColors.HERO_CYAN_BOTTOM,
+                AthleticColors.HERO_CYAN_BORDER,
+                AthleticColors.CYAN_BRIGHT,
+                AthleticTheme.ButtonStyle.PRIMARY_CYAN
+            )
+            PushAccentKind.LIME_GO -> quintuple(
+                AthleticColors.HERO_EMERALD_TOP,
+                AthleticColors.HERO_EMERALD_BOTTOM,
+                AthleticColors.HERO_EMERALD_BORDER,
+                AthleticColors.EMERALD_BRIGHT,
+                AthleticTheme.ButtonStyle.PRIMARY_EMERALD
+            )
+        }
+
+        goalCoachCard.background = AthleticTheme.gradientCard(this, topGrad, botGrad, borderCol, 18f)
+
+        val daysTxt = if (plan.daysRemaining == 0) {
+            "EXAM DAY (${plan.deadlineLabel.uppercase()})"
+        } else {
+            "${plan.deadlineLabel.uppercase()} GOAL  •  ${plan.daysRemaining}D LEFT  ✎"
+        }
+        goalHeaderLabel.text = daysTxt
+        goalHeaderLabel.setTextColor(accentCol)
+
+        goalPushBadge.text = plan.pushBadgeLabel
+        goalPushBadge.setTextColor(accentCol)
+        goalPushBadge.background = AthleticTheme.solidPill(
+            this,
+            (accentCol and 0x00FFFFFF) or 0x26000000,
+            accentCol,
+            10f
+        )
+
+        goalReadinessBar.setProgressPercent(plan.readinessPercent, animate = true)
+        goalStatusText.text = plan.statusSummary
+        goalDirectiveText.text = plan.todayPushDirective
+        goalDirectiveText.background = AthleticTheme.solidPill(
+            this,
+            0x36000000,
+            borderCol,
+            12f
+        )
+
+        // Compact 4-stage milestone strip inside Today Goal Card
+        goalMiniMilestonesLayout.removeAllViews()
+        for ((idx, cp) in plan.checkpoints.withIndex()) {
+            val isGoalDay = idx == plan.checkpoints.lastIndex
+            val chip = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(4), dp(7), dp(4), dp(7))
+                background = AthleticTheme.solidPill(
+                    this@MainActivity,
+                    if (isGoalDay) 0x22C6F432 else AthleticColors.SURFACE_RECESSED,
+                    if (isGoalDay) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.BORDER_SUBTLE,
+                    10f
+                )
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (idx > 0) marginStart = dp(4)
+                }
+            }
+            chip.addView(TextView(this).apply {
+                text = cp.label.uppercase()
+                textSize = 9.5f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setTextColor(if (isGoalDay) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_SECONDARY)
+                maxLines = 1
+            })
+            chip.addView(TextView(this).apply {
+                text = TsPoliceBenchmark.formatDuration(cp.targetTimeSec)
+                textSize = 13f
+                typeface = AthleticTheme.FONT_TABULAR_BOLD
+                setTextColor(if (isGoalDay) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_PRIMARY)
+                setPadding(0, dp(2), 0, dp(1))
+                maxLines = 1
+            })
+            chip.addView(TextView(this).apply {
+                text = cp.dateLabel
+                textSize = 10f
+                setTextColor(AthleticColors.TEXT_MUTED)
+                maxLines = 1
+            })
+            goalMiniMilestonesLayout.addView(chip)
+        }
+
+        goalActionBtn.text = plan.recommendedActionLabel
+        AthleticTheme.applyButtonStyle(this, goalActionBtn, btnStyle)
+        goalActionBtn.setOnClickListener {
+            when (plan.recommendedAction) {
+                RecommendedWorkoutAction.ARM_1600M_TRIAL -> {
+                    selectTrackerSubTab(1, animate = true)
+                    if (lastRenderedPtPhase == PtTrialPhase.IDLE) {
+                        requestNeededPermissionsIfMissing(silentCheckOnly = false)
+                        trackingService?.armPtTrial()
+                    }
+                }
+                RecommendedWorkoutAction.START_400M_INTERVALS -> {
+                    selectedIntervalReps = 6
+                    refreshIntervalRepPresets()
+                    selectTrackerSubTab(2, animate = true)
+                }
+                RecommendedWorkoutAction.DONE_FOR_TODAY -> {
+                    selectTab(1, smooth = true)
+                }
+                RecommendedWorkoutAction.EASY_AEROBIC_JOG -> {
+                    requestNeededPermissionsIfMissing(silentCheckOnly = false)
+                    Toast.makeText(
+                        this,
+                        "Push ~4.5/10 easy continuous jog (145–155 spm) — Today auto-records every step!",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun renderProgressGoalRoadmap(plan: DeadlineGoalPlan) {
+        if (!::progressMilestonesLayout.isInitialized) return
+
+        val targetFmt = TsPoliceBenchmark.formatDuration(plan.targetTimeSec)
+        progressGoalHeaderLabel.text = if (plan.daysRemaining == 0) {
+            "EXAM DAY (${plan.deadlineLabel.uppercase()})  •  <$targetFmt  ✎"
+        } else {
+            "${plan.deadlineLabel.uppercase()} ROADMAP  •  ${plan.daysRemaining} DAYS LEFT  ✎"
+        }
+
+        val qualified = plan.readinessPercent >= 100
+        progressGoalReadinessPill.text = if (qualified) "QUALIFIED ✓" else "${plan.readinessPercent}% READY"
+        val rCol = if (qualified) AthleticColors.EMERALD_BRIGHT else AthleticColors.CYAN_BRIGHT
+        progressGoalReadinessPill.setTextColor(rCol)
+        progressGoalReadinessPill.background = AthleticTheme.solidPill(
+            this,
+            (rCol and 0x00FFFFFF) or 0x26000000,
+            rCol,
+            10f
+        )
+
+        val cutHint = plan.requiredCutPerWeekSec?.let {
+            "Required pace gain: -${String.format("%.0f", it)}s/wk from moving capability. "
+        } ?: ""
+        progressGoalWeeklyMixText.text = cutHint + plan.weeklyStructureHint
+
+        progressMilestonesLayout.removeAllViews()
+        for ((idx, cp) in plan.checkpoints.withIndex()) {
+            val isFinal = idx == plan.checkpoints.lastIndex
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(5), dp(9), dp(5), dp(9))
+                background = AthleticTheme.solidPill(
+                    this@MainActivity,
+                    if (isFinal) 0x24C6F432 else AthleticColors.SURFACE_RECESSED,
+                    if (isFinal) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.BORDER_SUBTLE,
+                    11f
+                )
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (idx > 0) marginStart = dp(5)
+                }
+            }
+            card.addView(TextView(this).apply {
+                text = cp.label.uppercase()
+                textSize = 9.5f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setTextColor(if (isFinal) AthleticColors.EMERALD_BRIGHT else AthleticColors.CYAN_BRIGHT)
+                maxLines = 1
+            })
+            card.addView(TextView(this).apply {
+                text = cp.dateLabel
+                textSize = 10f
+                setTextColor(AthleticColors.TEXT_MUTED)
+                maxLines = 1
+            })
+            card.addView(TextView(this).apply {
+                text = TsPoliceBenchmark.formatDuration(cp.targetTimeSec)
+                textSize = 14f
+                typeface = AthleticTheme.FONT_TABULAR_BOLD
+                setTextColor(if (isFinal) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_PRIMARY)
+                setPadding(0, dp(3), 0, dp(2))
+                maxLines = 1
+            })
+            card.addView(TextView(this).apply {
+                text = "${TsPoliceBenchmark.formatDuration(cp.targetLap400mSec)}/lap"
+                textSize = 9.5f
+                setTextColor(AthleticColors.TEXT_SECONDARY)
+                maxLines = 1
+            })
+            progressMilestonesLayout.addView(card)
+        }
+    }
+
+    private fun showGoalDeadlinePicker() {
+        val current = runCatching { LocalDate.parse(repository.goalDeadlineIso) }
+            .getOrElse { LocalDate.of(2026, 11, 30) }
+        val picker = DatePickerDialog(
+            this,
+            { _, year, monthZeroBased, dayOfMonth ->
+                val picked = LocalDate.of(year, monthZeroBased + 1, dayOfMonth)
+                repository.goalDeadlineIso = picked.toString()
+                lastGoalCoachKey = ""
+                refreshSettingsHighlights()
+                refreshProgressDashboard()
+                val daysLeft = (picked.toEpochDay() - LocalDate.now().toEpochDay()).toInt().coerceAtLeast(0)
+                Toast.makeText(
+                    this,
+                    "Goal deadline set to $picked ($daysLeft days remaining)",
+                    Toast.LENGTH_SHORT
+                ).show()
+            },
+            current.year,
+            current.monthValue - 1,
+            current.dayOfMonth
+        )
+        picker.datePicker.minDate = System.currentTimeMillis() - 86_400_000L
+        picker.show()
+    }
+
+    private data class Quintuple<A, B, C, D, E>(
+        val first: A,
+        val second: B,
+        val third: C,
+        val fourth: D,
+        val fifth: E
+    )
+
+    private fun <A, B, C, D, E> quintuple(a: A, b: B, c: C, d: D, e: E) = Quintuple(a, b, c, d, e)
 
     // =========================================================================
     // REUSABLE CARD & BENTO TILE BUILDERS

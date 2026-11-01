@@ -161,6 +161,7 @@ class TuningTelemetryManager(
             "classifierConfig",
             JSONObject().apply {
                 put("targetTimeSec", repository.targetTimeSec)
+                put("goalDeadlineIso", repository.goalDeadlineIso)
                 put("runningThresholdMps", repository.runningThresholdMps)
                 put("runnerHeightCm", repository.runnerHeightCm)
                 put("rawSamsungStrideScale", repository.strideCalibrationScale)

@@ -317,3 +317,405 @@ object ProgressionForecaster {
         return -slopeSecPerDay
     }
 }
+
+enum class PushAccentKind {
+    LIME_GO,
+    ORANGE_HARD,
+    PURPLE_RECOVERY
+}
+
+enum class RecommendedWorkoutAction {
+    ARM_1600M_TRIAL,
+    START_400M_INTERVALS,
+    EASY_AEROBIC_JOG,
+    DONE_FOR_TODAY
+}
+
+data class WeeklyGoalCheckpoint(
+    val label: String,
+    val dateLabel: String,
+    val targetTimeSec: Double,
+    val targetLap400mSec: Double
+)
+
+data class DeadlineGoalPlan(
+    val deadlineIso: String,
+    val deadlineLabel: String,
+    val daysRemaining: Int,
+    val targetTimeSec: Double,
+    val officialBestSec: Double?,
+    val movingCapabilitySec: Double?,
+    val stoppedPenaltyInTrialSec: Double,
+    val hasCleanNonstop1600m: Boolean,
+    val thisWeekTargetSec: Double,
+    val requiredCutPerWeekSec: Double?,
+    val recommendedIntervalLapSec: Double,
+    val readinessPercent: Int,
+    val pushBadgeLabel: String,
+    val pushRpeScore: Double,
+    val pushAccentKind: PushAccentKind,
+    val headlineTitle: String,
+    val statusSummary: String,
+    val todayPushDirective: String,
+    val weeklyStructureHint: String,
+    val checkpoints: List<WeeklyGoalCheckpoint>,
+    val recommendedAction: RecommendedWorkoutAction,
+    val recommendedActionLabel: String
+)
+
+/**
+ * Periodized deadline coach for achieving the TSLPRB 1,600m target (7:15 / 435s) by a fixed exam date
+ * (default Nov 30). Balances hard VO2max/race-pace sessions with shin-safe aerobic recovery days.
+ */
+object DeadlineGoalCoach {
+
+    private fun formatShortDate(date: LocalDate): String {
+        val m = date.month.name.take(3).lowercase().replaceFirstChar { it.uppercase() }
+        return "$m ${date.dayOfMonth}"
+    }
+
+    fun buildPlan(
+        sessions: List<RunSessionRecord>,
+        todaySummary: DailyActivitySummary = DailyActivitySummary(),
+        yesterdaySummary: DailyActivitySummary? = null,
+        targetTimeSec: Double = TsPoliceBenchmark.DEFAULT_TARGET_TIME_SEC,
+        deadlineIso: String = "2026-11-30",
+        todayIso: String = LocalDate.now().toString()
+    ): DeadlineGoalPlan {
+        val todayDate = runCatching { LocalDate.parse(todayIso) }.getOrElse { LocalDate.now() }
+        val deadlineDate = runCatching { LocalDate.parse(deadlineIso) }.getOrElse { LocalDate.of(2026, 11, 30) }
+        val daysRemaining = (deadlineDate.toEpochDay() - todayDate.toEpochDay()).toInt().coerceAtLeast(0)
+        val deadlineLabel = formatShortDate(deadlineDate)
+        val targetFmt = TsPoliceBenchmark.formatDuration(targetTimeSec)
+        val targetLapSec = TsPoliceBenchmark.targetLap400mSec(targetTimeSec)
+
+        val validRuns = sessions.filter {
+            it.distanceMeters >= 500.0 &&
+                it.activeDurationSec >= 75.0 &&
+                it.equiv1600mSec in 180.0..1800.0
+        }
+
+        val officialBestSec = validRuns.minOfOrNull { it.equiv1600mSec }
+        val trials1600 = validRuns.filter {
+            it.mode == RunMode.TIMED_1600M || kotlin.math.abs(it.distanceMeters - 1600.0) <= 60.0
+        }
+        val bestTrial = trials1600.minByOrNull { it.equiv1600mSec }
+        val stoppedPenaltySec = bestTrial?.pausedDurationSec ?: 0.0
+        val hasCleanNonstop1600m = trials1600.any { it.pausedDurationSec < 15.0 && it.walkingSec < 30.0 }
+
+        val bestMovingEquivSec = validRuns.mapNotNull { s ->
+            val movSec = (s.activeDurationSec - s.pausedDurationSec).coerceAtLeast(s.activeDurationSec * 0.55)
+            val eq = TsPoliceBenchmark.computeEquiv1600mSec(s.distanceMeters, movSec, null)
+            eq.takeIf { it in 180.0..1800.0 }
+        }.minOrNull()
+
+        val movingCapSec = when {
+            officialBestSec != null && bestMovingEquivSec != null -> minOf(officialBestSec, bestMovingEquivSec)
+            else -> officialBestSec ?: bestMovingEquivSec
+        }
+
+        val anchorStartSec = (movingCapSec ?: 720.0).coerceIn(targetTimeSec, 840.0)
+        val weeksLeft = (daysRemaining / 7.0).coerceAtLeast(0.5)
+        val effectiveGapSec = ((movingCapSec ?: anchorStartSec) - targetTimeSec).coerceAtLeast(0.0)
+        val requiredCutPerWeek = if (movingCapSec != null && effectiveGapSec > 0.0 && daysRemaining > 0) {
+            effectiveGapSec / weeksLeft
+        } else {
+            null
+        }
+
+        // Convex milestone ladder: early nonstop + cadence gains shave bigger chunks in Weeks 1-2
+        val checkpoints = buildCheckpoints(todayDate, deadlineDate, anchorStartSec, targetTimeSec)
+        val thisWeekTargetSec = checkpoints.firstOrNull()?.targetTimeSec ?: targetTimeSec
+
+        val curLapEst = (movingCapSec ?: 660.0) / 4.0
+        val recommendedIntervalLapSec = when {
+            curLapEst <= targetLapSec + 4.0 -> (targetLapSec - 2.5).coerceAtLeast(92.0)
+            else -> (targetLapSec + (curLapEst - targetLapSec) * 0.32).coerceIn(targetLapSec, 138.0)
+        }
+
+        val readinessPct = when {
+            officialBestSec != null && officialBestSec <= targetTimeSec -> 100
+            movingCapSec == null -> 18
+            else -> {
+                val raw = ((1080.0 - movingCapSec) / (1080.0 - targetTimeSec) * 86.0 + 14.0).roundToInt()
+                val stopPenaltyPts = if (!hasCleanNonstop1600m) 8 else 0
+                (raw - stopPenaltyPts).coerceIn(15, 97)
+            }
+        }
+
+        // Inspect today's & yesterday's workload for smart Hard/Easy push modulation
+        val yesterdayIso = todayDate.minusDays(1).toString()
+        val todayRuns = sessions.filter { it.dateIso == todayIso && it.distanceMeters >= 300.0 }
+        val yesterdayRuns = sessions.filter { it.dateIso == yesterdayIso && it.distanceMeters >= 400.0 }
+
+        val todayQualityDone = todayRuns.any {
+            it.mode == RunMode.TIMED_1600M || it.mode == RunMode.INTERVAL_400M || it.distanceMeters >= 900.0
+        } || todaySummary.jogRunCombinedMeters >= 1100.0
+
+        val yesterdayWasHard = yesterdayRuns.any {
+            it.mode == RunMode.TIMED_1600M ||
+                it.mode == RunMode.INTERVAL_400M ||
+                it.runningSec >= 120.0 ||
+                it.distanceMeters >= 1500.0
+        } || (yesterdaySummary?.runningSec ?: 0.0) >= 150.0
+
+        val qualified = officialBestSec != null && officialBestSec <= targetTimeSec
+        val headline = if (daysRemaining == 0) {
+            "Goal Day ($deadlineLabel)  •  Sub-$targetFmt Test!"
+        } else {
+            "$daysRemaining Days to $deadlineLabel  •  $targetFmt Goal"
+        }
+
+        val statusSummary = when {
+            qualified -> {
+                "QUALIFIED! Personal best ${TsPoliceBenchmark.formatDuration(officialBestSec!!, true)} is already faster than $targetFmt."
+            }
+            bestTrial != null && stoppedPenaltySec >= 30.0 && !hasCleanNonstop1600m -> {
+                "PB ${TsPoliceBenchmark.formatDuration(officialBestSec ?: bestTrial.equiv1600mSec)} " +
+                    "(your 1.6K trial had ${TsPoliceBenchmark.formatDuration(stoppedPenaltySec)} stopped — " +
+                    "moving pace was ${TsPoliceBenchmark.formatDuration(movingCapSec ?: bestTrial.equiv1600mSec)}). " +
+                    "Week 1 target: ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)} nonstop."
+            }
+            movingCapSec != null -> {
+                "Current capability ${TsPoliceBenchmark.formatDuration(movingCapSec)}  •  " +
+                    "This week's target: ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)}  •  " +
+                    "$deadlineLabel goal: $targetFmt (${TsPoliceBenchmark.formatDuration(targetLapSec, true)}/lap)."
+            }
+            else -> {
+                "No 1.6 km baseline yet  •  $daysRemaining days left to build to $targetFmt (${TsPoliceBenchmark.formatDuration(targetLapSec, true)}/400m lap)."
+            }
+        }
+
+        val weeklyStructureHint =
+            "Weekly Mix (5 days on / 2 rest): 2× 400m Speed Reps (8.5/10)  •  1× Nonstop 1.6K Trial (9/10)  •  2× Easy 2.4km Stamina Jog (5/10)."
+
+        // Decide TODAY'S exact Push RPE & Workout Action
+        return when {
+            qualified -> DeadlineGoalPlan(
+                deadlineIso = deadlineIso,
+                deadlineLabel = deadlineLabel,
+                daysRemaining = daysRemaining,
+                targetTimeSec = targetTimeSec,
+                officialBestSec = officialBestSec,
+                movingCapabilitySec = movingCapSec,
+                stoppedPenaltyInTrialSec = stoppedPenaltySec,
+                hasCleanNonstop1600m = hasCleanNonstop1600m,
+                thisWeekTargetSec = targetTimeSec,
+                requiredCutPerWeekSec = 0.0,
+                recommendedIntervalLapSec = targetLapSec - 2.0,
+                readinessPercent = 100,
+                pushBadgeLabel = "PUSH 7/10 • MAINTAIN",
+                pushRpeScore = 7.0,
+                pushAccentKind = PushAccentKind.LIME_GO,
+                headlineTitle = headline,
+                statusSummary = statusSummary,
+                todayPushDirective = "You already beat $targetFmt! Maintain sharpness without injury: 1 crisp 400m session + 1 controlled 1.6K run per week, keeping easy jogs relaxed.",
+                weeklyStructureHint = weeklyStructureHint,
+                checkpoints = checkpoints,
+                recommendedAction = RecommendedWorkoutAction.START_400M_INTERVALS,
+                recommendedActionLabel = "Run Sharpener 4 × 400m Reps  →"
+            )
+
+            daysRemaining == 0 -> DeadlineGoalPlan(
+                deadlineIso = deadlineIso,
+                deadlineLabel = deadlineLabel,
+                daysRemaining = 0,
+                targetTimeSec = targetTimeSec,
+                officialBestSec = officialBestSec,
+                movingCapabilitySec = movingCapSec,
+                stoppedPenaltyInTrialSec = stoppedPenaltySec,
+                hasCleanNonstop1600m = hasCleanNonstop1600m,
+                thisWeekTargetSec = targetTimeSec,
+                requiredCutPerWeekSec = requiredCutPerWeek,
+                recommendedIntervalLapSec = targetLapSec,
+                readinessPercent = readinessPct,
+                pushBadgeLabel = "10/10 • EXAM DAY",
+                pushRpeScore = 10.0,
+                pushAccentKind = PushAccentKind.LIME_GO,
+                headlineTitle = headline,
+                statusSummary = statusSummary,
+                todayPushDirective = "Push 10/10 smartly: run Lap 1 controlled at 1:49 (don't sprint the first 200m!), lock ≥170 spm cadence on Laps 2–3, and sprint all-out the final 250m!",
+                weeklyStructureHint = weeklyStructureHint,
+                checkpoints = checkpoints,
+                recommendedAction = RecommendedWorkoutAction.ARM_1600M_TRIAL,
+                recommendedActionLabel = "Launch Official 1.6 km Trial  →"
+            )
+
+            daysRemaining in 1..2 -> DeadlineGoalPlan(
+                deadlineIso = deadlineIso,
+                deadlineLabel = deadlineLabel,
+                daysRemaining = daysRemaining,
+                targetTimeSec = targetTimeSec,
+                officialBestSec = officialBestSec,
+                movingCapabilitySec = movingCapSec,
+                stoppedPenaltyInTrialSec = stoppedPenaltySec,
+                hasCleanNonstop1600m = hasCleanNonstop1600m,
+                thisWeekTargetSec = targetTimeSec,
+                requiredCutPerWeekSec = requiredCutPerWeek,
+                recommendedIntervalLapSec = targetLapSec,
+                readinessPercent = readinessPct,
+                pushBadgeLabel = "PUSH 3/10 • TAPER",
+                pushRpeScore = 3.0,
+                pushAccentKind = PushAccentKind.PURPLE_RECOVERY,
+                headlineTitle = headline,
+                statusSummary = statusSummary,
+                todayPushDirective = "Only $daysRemaining day${if (daysRemaining == 1) "" else "s"} to $deadlineLabel! Do NOT tire your legs with a hard test today — 8 min light jog + 3 × 80m crisp strides so you have 100% snap on test day.",
+                weeklyStructureHint = weeklyStructureHint,
+                checkpoints = checkpoints,
+                recommendedAction = RecommendedWorkoutAction.EASY_AEROBIC_JOG,
+                recommendedActionLabel = "Keep Legs Fresh Today"
+            )
+
+            todayQualityDone -> DeadlineGoalPlan(
+                deadlineIso = deadlineIso,
+                deadlineLabel = deadlineLabel,
+                daysRemaining = daysRemaining,
+                targetTimeSec = targetTimeSec,
+                officialBestSec = officialBestSec,
+                movingCapabilitySec = movingCapSec,
+                stoppedPenaltyInTrialSec = stoppedPenaltySec,
+                hasCleanNonstop1600m = hasCleanNonstop1600m,
+                thisWeekTargetSec = thisWeekTargetSec,
+                requiredCutPerWeekSec = requiredCutPerWeek,
+                recommendedIntervalLapSec = recommendedIntervalLapSec,
+                readinessPercent = readinessPct,
+                pushBadgeLabel = "✓ TODAY DONE • RECOVER",
+                pushRpeScore = 4.0,
+                pushAccentKind = PushAccentKind.LIME_GO,
+                headlineTitle = headline,
+                statusSummary = statusSummary,
+                todayPushDirective = "Great work — today's run is banked (${formatShortDist(todaySummary.jogRunCombinedMeters)} jog/run)! Hydrate, stretch calves & shins tonight, and keep tomorrow at an easy 4–5/10 aerobic effort.",
+                weeklyStructureHint = weeklyStructureHint,
+                checkpoints = checkpoints,
+                recommendedAction = RecommendedWorkoutAction.DONE_FOR_TODAY,
+                recommendedActionLabel = "View Progress & Splits  →"
+            )
+
+            yesterdayWasHard -> DeadlineGoalPlan(
+                deadlineIso = deadlineIso,
+                deadlineLabel = deadlineLabel,
+                daysRemaining = daysRemaining,
+                targetTimeSec = targetTimeSec,
+                officialBestSec = officialBestSec,
+                movingCapabilitySec = movingCapSec,
+                stoppedPenaltyInTrialSec = stoppedPenaltySec,
+                hasCleanNonstop1600m = hasCleanNonstop1600m,
+                thisWeekTargetSec = thisWeekTargetSec,
+                requiredCutPerWeekSec = requiredCutPerWeek,
+                recommendedIntervalLapSec = recommendedIntervalLapSec,
+                readinessPercent = readinessPct,
+                pushBadgeLabel = "PUSH 4.5/10 • AEROBIC",
+                pushRpeScore = 4.5,
+                pushAccentKind = PushAccentKind.PURPLE_RECOVERY,
+                headlineTitle = headline,
+                statusSummary = statusSummary,
+                todayPushDirective = "Yesterday was a hard session — pushing 9/10 two days in a row risks shin splints! Today push 4.5/10: 18–22 min easy continuous jog (145–155 spm, conversational breathing) so you can attack tomorrow's speed session hard.",
+                weeklyStructureHint = weeklyStructureHint,
+                checkpoints = checkpoints,
+                recommendedAction = RecommendedWorkoutAction.EASY_AEROBIC_JOG,
+                recommendedActionLabel = "Easy 20-Min Continuous Jog Today"
+            )
+
+            !hasCleanNonstop1600m -> DeadlineGoalPlan(
+                deadlineIso = deadlineIso,
+                deadlineLabel = deadlineLabel,
+                daysRemaining = daysRemaining,
+                targetTimeSec = targetTimeSec,
+                officialBestSec = officialBestSec,
+                movingCapabilitySec = movingCapSec,
+                stoppedPenaltyInTrialSec = stoppedPenaltySec,
+                hasCleanNonstop1600m = false,
+                thisWeekTargetSec = thisWeekTargetSec,
+                requiredCutPerWeekSec = requiredCutPerWeek,
+                recommendedIntervalLapSec = recommendedIntervalLapSec,
+                readinessPercent = readinessPct,
+                pushBadgeLabel = "PUSH 8/10 • ZERO-STOP",
+                pushRpeScore = 8.0,
+                pushAccentKind = PushAccentKind.ORANGE_HARD,
+                headlineTitle = headline,
+                statusSummary = statusSummary,
+                todayPushDirective = "Push 8/10 today: run a full 1.6 km PT Trial with ZERO walking/standing stops! Start controlled (~158–165 spm) on Laps 1–3 so you don't gas out, then push Lap 4 hard to lock your true nonstop baseline (< ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)}).",
+                weeklyStructureHint = weeklyStructureHint,
+                checkpoints = checkpoints,
+                recommendedAction = RecommendedWorkoutAction.ARM_1600M_TRIAL,
+                recommendedActionLabel = "Arm Zero-Stop 1.6 km Trial  →"
+            )
+
+            else -> {
+                val lapFmt = TsPoliceBenchmark.formatDuration(recommendedIntervalLapSec, includeTenths = false)
+                DeadlineGoalPlan(
+                    deadlineIso = deadlineIso,
+                    deadlineLabel = deadlineLabel,
+                    daysRemaining = daysRemaining,
+                    targetTimeSec = targetTimeSec,
+                    officialBestSec = officialBestSec,
+                    movingCapabilitySec = movingCapSec,
+                    stoppedPenaltyInTrialSec = stoppedPenaltySec,
+                    hasCleanNonstop1600m = true,
+                    thisWeekTargetSec = thisWeekTargetSec,
+                    requiredCutPerWeekSec = requiredCutPerWeek,
+                    recommendedIntervalLapSec = recommendedIntervalLapSec,
+                    readinessPercent = readinessPct,
+                    pushBadgeLabel = "PUSH 8.5/10 • SPEED REPS",
+                    pushRpeScore = 8.5,
+                    pushAccentKind = PushAccentKind.ORANGE_HARD,
+                    headlineTitle = headline,
+                    statusSummary = statusSummary,
+                    todayPushDirective = "Fresh legs today — push 8.5/10 on speed! Run 6 × 400m intervals targeting ~$lapFmt per lap (≥168 spm quick light steps) with 90s walk recovery to pull your 1.6K pace toward ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)}.",
+                    weeklyStructureHint = weeklyStructureHint,
+                    checkpoints = checkpoints,
+                    recommendedAction = RecommendedWorkoutAction.START_400M_INTERVALS,
+                    recommendedActionLabel = "Launch 6 × 400m Speed Reps (~$lapFmt)  →"
+                )
+            }
+        }
+    }
+
+    private fun formatShortDist(m: Double): String =
+        if (m >= 1000.0) String.format("%.2f km", m / 1000.0) else "${m.toInt()} m"
+
+    private fun buildCheckpoints(
+        todayDate: LocalDate,
+        deadlineDate: LocalDate,
+        startSec: Double,
+        targetSec: Double
+    ): List<WeeklyGoalCheckpoint> {
+        val totalDays = (deadlineDate.toEpochDay() - todayDate.toEpochDay()).toInt()
+        if (totalDays <= 0) {
+            return listOf(
+                WeeklyGoalCheckpoint(
+                    label = "Exam Goal",
+                    dateLabel = formatShortDate(deadlineDate),
+                    targetTimeSec = targetSec,
+                    targetLap400mSec = targetSec / 4.0
+                )
+            )
+        }
+        val gap = (startSec - targetSec).coerceAtLeast(0.0)
+        // Build up to 4 milestone stages (Week 1, Week 2, Week 3, Exam Goal)
+        val stageCount = when {
+            totalDays >= 24 -> 4
+            totalDays >= 15 -> 3
+            totalDays >= 8 -> 2
+            else -> 1
+        }
+        val fractionsRemaining = when (stageCount) {
+            4 -> doubleArrayOf(0.62, 0.34, 0.14, 0.0)
+            3 -> doubleArrayOf(0.55, 0.22, 0.0)
+            2 -> doubleArrayOf(0.45, 0.0)
+            else -> doubleArrayOf(0.0)
+        }
+        return (0 until stageCount).map { idx ->
+            val isFinal = idx == stageCount - 1
+            val dayOffset = if (isFinal) totalDays else (((idx + 1).toDouble() / stageCount) * totalDays).roundToInt()
+            val cpDate = todayDate.plusDays(dayOffset.toLong())
+            val goalSec = targetSec + gap * fractionsRemaining[idx]
+            WeeklyGoalCheckpoint(
+                label = if (isFinal) "Goal Day" else "Week ${idx + 1}",
+                dateLabel = formatShortDate(cpDate),
+                targetTimeSec = goalSec,
+                targetLap400mSec = goalSec / 4.0
+            )
+        }
+    }
+}

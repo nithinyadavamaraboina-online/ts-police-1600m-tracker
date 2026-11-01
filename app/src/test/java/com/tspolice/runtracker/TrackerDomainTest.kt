@@ -1,6 +1,7 @@
 package com.tspolice.runtracker
 
 import com.tspolice.runtracker.domain.DailyActivitySummary
+import com.tspolice.runtracker.domain.DeadlineGoalCoach
 import com.tspolice.runtracker.domain.ForecastStatus
 import com.tspolice.runtracker.domain.GaitClassifier
 import com.tspolice.runtracker.domain.HourlySensorBucket
@@ -10,6 +11,8 @@ import com.tspolice.runtracker.domain.MotionStateAudioCue
 import com.tspolice.runtracker.domain.PocketAudioMode
 import com.tspolice.runtracker.domain.ProgressionForecaster
 import com.tspolice.runtracker.domain.PtTrialPhase
+import com.tspolice.runtracker.domain.PushAccentKind
+import com.tspolice.runtracker.domain.RecommendedWorkoutAction
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
@@ -1225,6 +1228,109 @@ class TrackerDomainTest {
             )
             assertEquals("Real slow-jog at $cad spm must detect as JOGGING even with p20=8.34", MotionState.JOGGING, st)
         }
+    }
+
+    @Test
+    fun `deadline goal coach tracks Nov 30 countdown and modulates daily push safely`() {
+        // 1. Reproduce real runner history: Oct 29 1.6K trial (18:44 total w/ 282.7s stopped -> 841.3s moving)
+        //    + Oct 31 789.7m continuous slow jog (512.7s) evaluated on Nov 1 -> 29 days to Nov 30!
+        val oct29StoppedTrial = RunSessionRecord(
+            startedAtEpochMs = 1_761_730_000_000L,
+            dateIso = "2026-10-29",
+            mode = RunMode.TIMED_1600M,
+            distanceMeters = 1600.0,
+            activeDurationSec = 1124.02,
+            pausedDurationSec = 282.72,
+            first1600mSplitSec = 1124.02,
+            equiv1600mSec = 1124.02,
+            avgCadenceSpm = 144.9,
+            maxSpeedMps = 2.35,
+            runningSec = 0.0,
+            joggingSec = 750.8,
+            walkingSec = 90.5
+        )
+        val oct31ContinuousJog = RunSessionRecord(
+            startedAtEpochMs = 1_761_905_000_000L,
+            dateIso = "2026-10-31",
+            mode = RunMode.OPEN_PRACTICE,
+            distanceMeters = 789.68,
+            activeDurationSec = 512.72,
+            pausedDurationSec = 0.0,
+            first1600mSplitSec = null,
+            equiv1600mSec = 1083.8,
+            avgCadenceSpm = 129.1,
+            maxSpeedMps = 2.04,
+            runningSec = 0.0,
+            joggingSec = 512.72,
+            walkingSec = 0.0
+        )
+
+        val nov1Plan = DeadlineGoalCoach.buildPlan(
+            sessions = listOf(oct29StoppedTrial, oct31ContinuousJog),
+            todaySummary = DailyActivitySummary(dateIso = "2026-11-01", totalSteps = 385, walkingMeters = 246.0),
+            yesterdaySummary = DailyActivitySummary(dateIso = "2026-10-31", totalSteps = 10640, joggingSec = 512.7, runningSec = 0.0),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-01"
+        )
+
+        assertEquals(29, nov1Plan.daysRemaining)
+        assertEquals("Nov 30", nov1Plan.deadlineLabel)
+        assertFalse(nov1Plan.hasCleanNonstop1600m)
+        assertEquals(282.72, nov1Plan.stoppedPenaltyInTrialSec, 0.1)
+        assertEquals(841.3, nov1Plan.movingCapabilitySec ?: 0.0, 1.0)
+        assertEquals(8.0, nov1Plan.pushRpeScore, 0.01)
+        assertEquals(PushAccentKind.ORANGE_HARD, nov1Plan.pushAccentKind)
+        assertEquals(RecommendedWorkoutAction.ARM_1600M_TRIAL, nov1Plan.recommendedAction)
+        assertEquals(4, nov1Plan.checkpoints.size)
+        assertEquals(435.0, nov1Plan.checkpoints.last().targetTimeSec, 0.01)
+
+        // 2. Once a clean zero-stop 1.6K baseline is recorded, fresh legs prescribe 8.5/10 400m Speed Reps
+        val cleanNonstopTrial = session("2026-11-02", 1600.0, 560.0, RunMode.TIMED_1600M)
+        val speedDayPlan = DeadlineGoalCoach.buildPlan(
+            sessions = listOf(oct29StoppedTrial, cleanNonstopTrial),
+            todaySummary = DailyActivitySummary(dateIso = "2026-11-04"),
+            yesterdaySummary = DailyActivitySummary(dateIso = "2026-11-03"),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-04"
+        )
+        assertTrue(speedDayPlan.hasCleanNonstop1600m)
+        assertEquals(8.5, speedDayPlan.pushRpeScore, 0.01)
+        assertEquals(RecommendedWorkoutAction.START_400M_INTERVALS, speedDayPlan.recommendedAction)
+
+        // 3. Day immediately after a hard 1.6K trial modulates to 4.5/10 shin-safe aerobic recovery
+        val recoveryPlan = DeadlineGoalCoach.buildPlan(
+            sessions = listOf(cleanNonstopTrial),
+            todaySummary = DailyActivitySummary(dateIso = "2026-11-03"),
+            yesterdaySummary = DailyActivitySummary(dateIso = "2026-11-02", runningSec = 420.0),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-03"
+        )
+        assertEquals(4.5, recoveryPlan.pushRpeScore, 0.01)
+        assertEquals(PushAccentKind.PURPLE_RECOVERY, recoveryPlan.pushAccentKind)
+        assertEquals(RecommendedWorkoutAction.EASY_AEROBIC_JOG, recoveryPlan.recommendedAction)
+
+        // 4. Taper 1 day before Nov 30 -> 3.0/10 Taper, and Exam Day Nov 30 -> 10.0/10 Exam Day!
+        val taperPlan = DeadlineGoalCoach.buildPlan(
+            sessions = listOf(cleanNonstopTrial),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-29"
+        )
+        assertEquals(1, taperPlan.daysRemaining)
+        assertEquals(3.0, taperPlan.pushRpeScore, 0.01)
+
+        val examDayPlan = DeadlineGoalCoach.buildPlan(
+            sessions = listOf(cleanNonstopTrial),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-30"
+        )
+        assertEquals(0, examDayPlan.daysRemaining)
+        assertEquals(10.0, examDayPlan.pushRpeScore, 0.01)
+        assertEquals(RecommendedWorkoutAction.ARM_1600M_TRIAL, examDayPlan.recommendedAction)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

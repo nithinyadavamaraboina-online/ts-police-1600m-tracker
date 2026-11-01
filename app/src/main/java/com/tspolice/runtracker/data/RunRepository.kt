@@ -38,6 +38,8 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val PREFS_NAME = "ts_police_prefs"
 
         private const val KEY_TARGET_SEC = "target_time_sec"
+        private const val KEY_GOAL_DEADLINE_ISO = "goal_deadline_iso"
+        const val DEFAULT_GOAL_DEADLINE_ISO = "2026-11-30"
         private const val KEY_RUN_SPEED_MPS = "run_threshold_mps"
         private const val KEY_VOICE_COACH = "voice_coach_enabled"
         private const val KEY_STATE_CHANGE_AUDIO = "state_change_audio_enabled"
@@ -209,6 +211,10 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     var targetTimeSec: Double
         get() = prefs.getFloat(KEY_TARGET_SEC, TsPoliceBenchmark.DEFAULT_TARGET_TIME_SEC.toFloat()).toDouble()
         set(value) = prefs.edit().putFloat(KEY_TARGET_SEC, value.toFloat()).apply()
+
+    var goalDeadlineIso: String
+        get() = prefs.getString(KEY_GOAL_DEADLINE_ISO, DEFAULT_GOAL_DEADLINE_ISO) ?: DEFAULT_GOAL_DEADLINE_ISO
+        set(value) = prefs.edit().putString(KEY_GOAL_DEADLINE_ISO, value.trim()).apply()
 
     var runningThresholdMps: Double
         get() = prefs.getFloat(KEY_RUN_SPEED_MPS, GaitClassifier.DEFAULT_RUNNING_SPEED_MPS.toFloat()).toDouble()

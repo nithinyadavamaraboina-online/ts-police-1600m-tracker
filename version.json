@@ -1,8 +1,8 @@
 {
-    "versionCode":  23,
-    "versionName":  "1.0.22",
+    "versionCode":  24,
+    "versionName":  "1.0.23",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "ade657532515f8dc21e5fe8e86195fd73456881cc01130473125c85ca286eed9",
-    "changelog":  "Redesign OTA update sheet, banner, and Software Update card to match the AMOLED + Neon Lime + Electric Purple UI; upgrade adaptive launcher icon and app emblem with a dynamic sprinting runner.",
-    "publishedAt":  "2026-11-01T07:21:02Z"
+    "sha256":  "3379094ca3648af16a0aa8da7f3ac51971784524f10a93c42b63cef5deb41cbf",
+    "changelog":  "Add Nov 30 (7:15) Goal Countdown, 4-week milestone ladder, and dynamic Daily Push Coach; scale down sprinting runner app icon for balanced proportions.",
+    "publishedAt":  "2026-11-01T12:52:05Z"
 }
