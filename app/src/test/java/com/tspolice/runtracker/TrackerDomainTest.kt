@@ -1331,6 +1331,15 @@ class TrackerDomainTest {
         assertEquals(0, examDayPlan.daysRemaining)
         assertEquals(10.0, examDayPlan.pushRpeScore, 0.01)
         assertEquals(RecommendedWorkoutAction.ARM_1600M_TRIAL, examDayPlan.recommendedAction)
+
+        // 5. Stopped-trial to nonstop-trial breakthrough (18:44 -> 8:47.2) caps displayed weekly gain sensibly
+        val breakthroughTrial = session("2026-11-01", 1600.0, 527.2, RunMode.TIMED_1600M)
+        val btForecast = ProgressionForecaster.analyze(
+            sessions = listOf(oct29StoppedTrial, oct31ContinuousJog, breakthroughTrial),
+            targetTimeSec = 435.0,
+            todayIso = "2026-11-01"
+        )
+        assertEquals(42.0, btForecast.improvementSecPerWeek ?: 0.0, 0.01)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

@@ -224,6 +224,8 @@ object ProgressionForecaster {
 
         // Cap extreme 2-day improvement spikes to physiological upper bound (~6.0 sec/day sustained)
         val effectiveRatePerDay = rateSecPerDay.coerceAtMost(6.0)
+        val effectiveRatePerWeek = effectiveRatePerDay * 7.0
+        val effectiveRatePerSession = effectiveRatePerWeek / observedFreqPerWeek
         val linearDays = gapSec / effectiveRatePerDay
         // Physiological taper multiplier: shaving the final seconds near 7:15 takes ~18% more time than linear extrapolation
         val taperMultiplier = if (currentCapabilitySec < 470.0) 1.22 else 1.15
@@ -247,9 +249,9 @@ object ProgressionForecaster {
             currentCapabilitySec = currentCapabilitySec,
             gapToTargetSec = gapSec,
             totalImprovementSec = totalImproved,
-            improvementSecPerDay = rateSecPerDay,
-            improvementSecPerWeek = rateSecPerWeek,
-            improvementSecPerSession = rateSecPerSession,
+            improvementSecPerDay = effectiveRatePerDay,
+            improvementSecPerWeek = effectiveRatePerWeek,
+            improvementSecPerSession = effectiveRatePerSession,
             estimatedDaysToTarget = realisticDays,
             optimisticDaysToTarget = optimisticDays,
             conservativeDaysToTarget = conservativeDays,
@@ -257,7 +259,7 @@ object ProgressionForecaster {
             projectedTargetDateIso = targetDateIso,
             practiceDaysPerWeek = observedFreqPerWeek,
             qualifiedRunCount = 0,
-            coachSummary = "Improving by ${String.format("%.1fs/week", rateSecPerWeek)} (${String.format("%.1fs", gapSec)} left). At this practice pace, you'll break 7:15 in ~$realisticDays days ($optimisticDays–$conservativeDays days, ~$estSessions sessions) around $targetDateIso.",
+            coachSummary = "Improving by ${String.format("%.1fs/week", effectiveRatePerWeek)} (${String.format("%.1fs", gapSec)} left). At this practice pace, you'll break 7:15 in ~$realisticDays days ($optimisticDays–$conservativeDays days, ~$estSessions sessions) around $targetDateIso.",
             workoutPrescription = "Current 400m lap avg is ${TsPoliceBenchmark.formatDuration(currentLap, true)} vs ${TsPoliceBenchmark.formatDuration(targetLap, true)} target. Focus next track session on holding 1:48/lap through 1,200m."
         )
     }

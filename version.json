@@ -1,8 +1,8 @@
 {
-    "versionCode":  24,
-    "versionName":  "1.0.23",
+    "versionCode":  25,
+    "versionName":  "1.0.24",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "3379094ca3648af16a0aa8da7f3ac51971784524f10a93c42b63cef5deb41cbf",
-    "changelog":  "Add Nov 30 (7:15) Goal Countdown, 4-week milestone ladder, and dynamic Daily Push Coach; scale down sprinting runner app icon for balanced proportions.",
-    "publishedAt":  "2026-11-01T12:52:05Z"
+    "sha256":  "341562f74950c7515e1e1009c43b2f3578d1e9045219168dd8ede5f51ade5ca4",
+    "changelog":  "Move Today\u0027s Activity Logs \u0026 run splits to the top of Progress and Today tabs while keeping Past Activity Logs cleanly at the bottom; cap extreme breakthrough weekly-gain spikes.",
+    "publishedAt":  "2026-11-01T13:31:13Z"
 }
