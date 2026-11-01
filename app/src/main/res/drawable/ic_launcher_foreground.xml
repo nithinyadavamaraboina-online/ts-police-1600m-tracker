@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Electric-purple stadium track outer speed arc (strictly inside 66dp safe zone) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#9D6BFF"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M 31.5,73.5 A 30,30 0 1,1 81.5,66.0" />
+
+    <!-- Secondary inner neon-lime finish arc accent -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#5A7A12"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:pathData="M 42.0,81.0 A 29.5,29.5 0 0,0 75.5,74.5" />
+
+    <!-- Aerodynamic speed trails behind sprinter -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#BB97FF"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round"
+        android:pathData="M 26.0,44.5 L 36.5,44.5" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#C6F432"
+        android:strokeAlpha="0.78"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round"
+        android:pathData="M 23.5,51.5 L 35.0,51.5" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#9D6BFF"
+        android:strokeAlpha="0.80"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:pathData="M 27.0,58.5 L 36.0,58.5" />
+
+    <!-- ================= SPRINTING RUNNER GUY (NEON LIME) ================= -->
+    <!-- Forward-leaning sprinter head -->
+    <path
+        android:fillColor="#DAFF5E"
+        android:pathData="M 64.0,26.6 A 4.9,4.9 0 1,1 64.0,36.4 A 4.9,4.9 0 1,1 64.0,26.6 Z" />
+
+    <!-- Athletic V-tapered forward-drive torso -->
+    <path
+        android:fillColor="#DAFF5E"
+        android:pathData="M 54.2,37.8 Q 58.8,37.2 60.5,40.5 L 51.8,55.2 Q 48.0,56.0 45.8,53.0 Z" />
+
+    <!-- Rear counter-swing arm -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#C6F432"
+        android:strokeWidth="4.1"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 55.2,39.2 L 45.4,39.5 L 41.2,46.6" />
+
+    <!-- Front pumping lead arm -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#DAFF5E"
+        android:strokeWidth="4.3"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 58.6,40.4 L 64.2,47.2 L 72.4,41.8" />
+
+    <!-- Rear powerful triple-extension push-off leg -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#C6F432"
+        android:strokeWidth="4.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 47.5,53.6 L 39.2,63.4 L 29.5,67.6" />
+
+    <!-- Front explosive high-knee drive leg + forefoot strike -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#DAFF5E"
+        android:strokeWidth="4.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 50.4,54.0 L 64.6,56.2 L 60.6,71.0 L 64.2,72.0" />
+</vector>

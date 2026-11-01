@@ -4,25 +4,84 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Dark tactical background -->
+
+    <!-- Pure AMOLED black base -->
     <path
         android:fillColor="#000000"
         android:pathData="M0,0h108v108h-108z" />
-    <!-- Shield outline -->
+
+    <!-- Subtle inner emblem disc -->
     <path
-        android:fillColor="#141417"
-        android:strokeColor="#C6F432"
-        android:strokeWidth="3.5"
-        android:pathData="M54,14 L86,26 L86,54 C86,75 72,89 54,96 C36,89 22,75 22,54 L22,26 Z" />
-    <!-- Inner speed track arc -->
+        android:fillColor="#141C05"
+        android:pathData="M54,14 A40,40 0 1,1 54,94 A40,40 0 1,1 54,14 Z" />
+
+    <!-- Electric-purple stadium speed arc -->
     <path
         android:fillColor="#00000000"
         android:strokeColor="#9D6BFF"
-        android:strokeWidth="4"
+        android:strokeWidth="3.6"
         android:strokeLineCap="round"
-        android:pathData="M35,60 A20,20 0 1,1 73,60" />
-    <!-- Lightning / Runner bolt -->
+        android:pathData="M 27.0,77.0 A 35,35 0 1,1 85.5,68.5" />
+
+    <!-- Speed trails -->
     <path
-        android:fillColor="#C6F432"
-        android:pathData="M57,33 L43,55 L53,55 L49,75 L66,50 L55,50 Z" />
+        android:fillColor="#00000000"
+        android:strokeColor="#BB97FF"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:pathData="M 23.0,44.0 L 35.5,44.0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#C6F432"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:pathData="M 20.0,51.5 L 34.0,51.5" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#9D6BFF"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round"
+        android:pathData="M 24.0,59.0 L 35.0,59.0" />
+
+    <!-- Sprinting Runner Head -->
+    <path
+        android:fillColor="#DAFF5E"
+        android:pathData="M 65.0,25.0 A 5.3,5.3 0 1,1 65.0,35.6 A 5.3,5.3 0 1,1 65.0,25.0 Z" />
+
+    <!-- Sprinting Runner Torso -->
+    <path
+        android:fillColor="#DAFF5E"
+        android:pathData="M 54.2,37.2 Q 59.2,36.5 61.2,40.2 L 51.8,56.0 Q 47.6,56.8 45.2,53.6 Z" />
+
+    <!-- Rear Arm + Front Pumping Arm -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#C6F432"
+        android:strokeWidth="4.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 55.2,38.8 L 44.6,39.2 L 40.0,46.8" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#DAFF5E"
+        android:strokeWidth="4.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 59.0,40.0 L 65.2,47.5 L 74.2,41.6" />
+
+    <!-- Rear Push-off Leg + Front High-Knee Leg -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#C6F432"
+        android:strokeWidth="5.0"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 47.2,54.2 L 38.2,64.8 L 27.5,69.5" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#DAFF5E"
+        android:strokeWidth="5.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 50.4,54.6 L 65.8,57.0 L 61.2,73.2 L 65.2,74.2" />
 </vector>

@@ -1,8 +1,8 @@
 {
-    "versionCode":  22,
-    "versionName":  "1.0.21",
+    "versionCode":  23,
+    "versionName":  "1.0.22",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "68e69ad0ce982d42eb67d4a41485c6fa083222492468ec9392fc64d70a7275ed",
-    "changelog":  "Add fluid 120Hz horizontal swipe navigation across pages, continuous sliding pill + thumb-scrubbing on bottom navigation dock, and animated sliding sub-tab switcher.",
-    "publishedAt":  "2026-11-01T07:08:08Z"
+    "sha256":  "ade657532515f8dc21e5fe8e86195fd73456881cc01130473125c85ca286eed9",
+    "changelog":  "Redesign OTA update sheet, banner, and Software Update card to match the AMOLED + Neon Lime + Electric Purple UI; upgrade adaptive launcher icon and app emblem with a dynamic sprinting runner.",
+    "publishedAt":  "2026-11-01T07:21:02Z"
 }

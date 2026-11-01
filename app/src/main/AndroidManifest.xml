@@ -53,9 +53,9 @@
 
     <application
         android:allowBackup="true"
-        android:icon="@drawable/ic_launcher_badge"
+        android:icon="@mipmap/ic_launcher"
         android:label="TS Police 1.6K"
-        android:roundIcon="@drawable/ic_launcher_badge"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.TsPoliceTracker">
 

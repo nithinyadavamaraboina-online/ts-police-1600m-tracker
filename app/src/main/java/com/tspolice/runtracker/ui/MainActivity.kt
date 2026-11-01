@@ -2,11 +2,14 @@ package com.tspolice.runtracker.ui
 
 import android.Manifest
 import android.app.AlertDialog
+import android.app.Dialog
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +20,7 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -73,7 +77,7 @@ class MainActivity : AppCompatActivity() {
     private var currentlyRecording = false
     private var activityVisible = false
     private var lastAutoUpdateCheckElapsedMs = -10_000_000L
-    private var activeUpdateDialog: AlertDialog? = null
+    private var activeUpdateDialog: Dialog? = null
 
     // Samsung Health Sync & Calibration state (Yesterday + Today)
     private var healthSyncStatus: HealthSyncStatus = HealthSyncStatus.PERMISSION_REQUIRED
@@ -103,7 +107,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var headerAudioPill: LinearLayout
     private lateinit var headerAudioIcon: VectorIconView
     private lateinit var headerAudioLabel: TextView
-    private lateinit var updateBanner: TextView
+    private lateinit var updateBanner: LinearLayout
+    private lateinit var updateBannerTitleText: TextView
     private lateinit var mainViewPager: ViewPager2
     private lateinit var bottomNavDock: SlidingBottomNavDock
     private lateinit var backNavCallback: OnBackPressedCallback
@@ -240,6 +245,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var diagStateText: TextView
     private lateinit var labTuningStatusText: TextView
     private lateinit var labSendTuningBtn: TextView
+    private lateinit var updateCardBadge: TextView
     private lateinit var updateStatusText: TextView
     private lateinit var checkUpdateBtn: TextView
 
@@ -484,15 +490,30 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1f).coerceAtLeast(1))
         })
 
-        // OTA Update Banner
-        updateBanner = TextView(this).apply {
+        // Sleek Contoured OTA Update Capsule Banner
+        updateBanner = LinearLayout(this).apply {
             visibility = View.GONE
-            gravity = Gravity.CENTER
-            textSize = 12.5f
-            typeface = AthleticTheme.FONT_SANS_BOLD
-            setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
-            setBackgroundColor(AthleticColors.CYAN_BRIGHT)
-            setPadding(dp(14), dp(9), dp(14), dp(9))
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(9), dp(12), dp(9))
+            background = AthleticTheme.gradientCard(
+                this@MainActivity,
+                AthleticColors.HERO_CYAN_TOP,
+                AthleticColors.HERO_CYAN_BOTTOM,
+                AthleticColors.HERO_CYAN_BORDER,
+                16f
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginStart = dp(16)
+                marginEnd = dp(16)
+                topMargin = dp(8)
+                bottomMargin = dp(2)
+            }
+            isClickable = true
+            isFocusable = true
             setOnClickListener {
                 latestDiscoveredRelease?.let { rel ->
                     val (_, curName) = appUpdater.getInstalledVersion()
@@ -500,6 +521,46 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        updateBanner.addView(
+            VectorIconView(this, IconKind.TRACK_EMBLEM, AthleticColors.EMERALD_BRIGHT, 28f).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(28), dp(28)).apply { marginEnd = dp(10) }
+            }
+        )
+        val bannerTextCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
+        }
+        updateBannerTitleText = TextView(this).apply {
+            text = "Update Ready"
+            textSize = 12.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            maxLines = 1
+        }
+        bannerTextCol.addView(updateBannerTitleText)
+        bannerTextCol.addView(TextView(this).apply {
+            text = "SHA-256 verified  •  Tap to review & install"
+            textSize = 10.5f
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            maxLines = 1
+        })
+        updateBanner.addView(bannerTextCol)
+        updateBanner.addView(TextView(this).apply {
+            text = "Update →"
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            setPadding(dp(11), dp(5), dp(11), dp(5))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                AthleticColors.EMERALD_BRIGHT,
+                AthleticColors.EMERALD_BRIGHT,
+                14f,
+                0f
+            )
+        })
         root.addView(updateBanner)
 
         // Fluid Horizontal Page Pager (Tracker <-> Progress <-> Coach & Lab)
@@ -2171,36 +2232,108 @@ class MainActivity : AppCompatActivity() {
         diagCard.addView(maintRow)
         col.addView(diagCard)
 
-        // 6. GitHub OTA Auto-Update Card
-        val updateCard = cardContainer()
-        updateCard.addView(AthleticTheme.sectionLabel(this, "APP VERSION & GITHUB OTA AUTO-UPDATE"))
-        val (instCode, instName) = appUpdater.getInstalledVersion()
-        updateStatusText = TextView(this).apply {
-            text = "Installed: v$instName (Build $instCode)  •  GitHub Releases OTA"
-            textSize = 12.5f
-            setTextColor(AthleticColors.TEXT_SECONDARY)
-            setPadding(0, dp(8), 0, dp(6))
+        // 6. GitHub OTA Software Update Hub Card
+        val updateCard = cardContainer(
+            topColor = AthleticColors.HERO_CYAN_TOP,
+            bottomColor = AthleticColors.HERO_CYAN_BOTTOM,
+            borderColor = AthleticColors.HERO_CYAN_BORDER
+        )
+        val updateTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
-        updateCard.addView(updateStatusText)
+        updateTopRow.addView(
+            AthleticTheme.sectionLabel(this, "SOFTWARE UPDATE  •  OTA", AthleticColors.CYAN_BRIGHT).apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+        )
+        updateCardBadge = TextView(this).apply {
+            text = "UP TO DATE"
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+            setPadding(dp(9), dp(3.5f), dp(9), dp(3.5f))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                AthleticColors.EMERALD_BRIGHT,
+                AthleticColors.EMERALD_BRIGHT,
+                10f,
+                0f
+            )
+        }
+        updateTopRow.addView(updateCardBadge)
+        updateCard.addView(updateTopRow)
+
+        val (instCode, instName) = appUpdater.getInstalledVersion()
+        val versionShowcase = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                AthleticColors.SURFACE_RECESSED,
+                AthleticColors.BORDER_SUBTLE,
+                14f
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(10)
+                bottomMargin = dp(6)
+            }
+        }
+        versionShowcase.addView(
+            VectorIconView(this, IconKind.TRACK_EMBLEM, AthleticColors.EMERALD_BRIGHT, 38f).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(38), dp(38)).apply { marginEnd = dp(12) }
+            }
+        )
+        val verCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        verCol.addView(TextView(this).apply {
+            text = "TS Police 1.6K  •  v$instName"
+            textSize = 14f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+        })
+        updateStatusText = TextView(this).apply {
+            text = "Build $instCode  •  SHA-256 Verified GitHub Releases"
+            textSize = 11.5f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(0, dp(2), 0, 0)
+        }
+        verCol.addView(updateStatusText)
+        versionShowcase.addView(verCol)
+        updateCard.addView(versionShowcase)
 
         val autoUpdateRow = ModernSettingRow(
             this,
             "Automatic OTA Update Checks",
-            "Checks GitHub Releases in background & notifies on new builds",
+            "Pre-downloads & verifies new releases silently in background",
             appUpdater.autoCheckOnLaunch
         ) { checked -> appUpdater.autoCheckOnLaunch = checked }
         updateCard.addView(autoUpdateRow)
 
         checkUpdateBtn = AthleticTheme.createButton(
             this,
-            "Check for App Updates Now",
-            AthleticTheme.ButtonStyle.PRIMARY_CYAN,
-            46f
+            "Check for App Updates",
+            AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
+            48f
         ).apply {
-            textSize = 13f
+            textSize = 13.5f
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                 .apply { topMargin = dp(8) }
-            setOnClickListener { performUpdateCheck(manualUserTrigger = true) }
+            setOnClickListener {
+                val cachedRel = latestDiscoveredRelease
+                if (cachedRel != null) {
+                    val (_, curName) = appUpdater.getInstalledVersion()
+                    showUpdateAvailableDialog(curName, cachedRel)
+                } else {
+                    performUpdateCheck(manualUserTrigger = true)
+                }
+            }
         }
         updateCard.addView(checkUpdateBtn)
         col.addView(updateCard)
@@ -3493,7 +3626,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // GITHUB OTA AUTO-UPDATE FLOW
+    // GITHUB OTA AUTO-UPDATE FLOW (AMOLED SHEET + NEON PROGRESS BAR)
     // =========================================================================
     private fun performUpdateCheck(manualUserTrigger: Boolean, autoInstallWhenFound: Boolean = false) {
         if (manualUserTrigger) {
@@ -3504,31 +3637,53 @@ class MainActivity : AppCompatActivity() {
         appUpdater.checkForUpdates { result ->
             if (isFinishing) return@checkForUpdates
             checkUpdateBtn.isEnabled = true
-            checkUpdateBtn.text = "Check for App Updates Now"
 
             when (result) {
                 is UpdateCheckResult.UpdateAvailable -> {
                     latestDiscoveredRelease = result.release
-                    updateBanner.text = "UPDATE v${result.release.versionName} READY  •  TAP TO INSTALL"
+                    updateBannerTitleText.text = "Update v${result.release.versionName} Available"
                     updateBanner.visibility = View.VISIBLE
-                    updateStatusText.text = "Update ready: v${result.installedVersionName} → v${result.release.versionName}"
+
+                    updateCardBadge.text = "NEW v${result.release.versionName}"
+                    updateCardBadge.setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+                    updateCardBadge.background = AthleticTheme.solidPill(
+                        this,
+                        AthleticColors.CYAN_BRIGHT,
+                        AthleticColors.CYAN_BRIGHT,
+                        10f,
+                        0f
+                    )
+                    updateStatusText.text = "Update ready: v${result.installedVersionName}  →  v${result.release.versionName}"
                     updateStatusText.setTextColor(AthleticColors.CYAN_BRIGHT)
+                    checkUpdateBtn.text = "Review & Install v${result.release.versionName}  →"
 
                     if (autoInstallWhenFound && !currentlyRecording) {
-                        startUpdateDownloadAndInstall(result.release)
+                        showUpdateSheet(result.installedVersionName, result.release, startImmediately = true)
                     } else if (manualUserTrigger || !currentlyRecording) {
-                        showUpdateAvailableDialog(result.installedVersionName, result.release)
+                        showUpdateSheet(result.installedVersionName, result.release, startImmediately = false)
                     }
                 }
                 is UpdateCheckResult.UpToDate -> {
+                    latestDiscoveredRelease = null
                     updateBanner.visibility = View.GONE
-                    updateStatusText.text = "Up to date: v${result.installedVersionName} (Build ${result.installedVersionCode})"
+                    updateCardBadge.text = "UP TO DATE"
+                    updateCardBadge.setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+                    updateCardBadge.background = AthleticTheme.solidPill(
+                        this,
+                        AthleticColors.EMERALD_BRIGHT,
+                        AthleticColors.EMERALD_BRIGHT,
+                        10f,
+                        0f
+                    )
+                    updateStatusText.text = "Build ${result.installedVersionCode}  •  Latest release installed"
                     updateStatusText.setTextColor(AthleticColors.EMERALD_BRIGHT)
+                    checkUpdateBtn.text = "Check for App Updates"
                     if (manualUserTrigger) {
                         Toast.makeText(this, "You're on the latest version (v${result.installedVersionName})!", Toast.LENGTH_SHORT).show()
                     }
                 }
                 is UpdateCheckResult.Error -> {
+                    checkUpdateBtn.text = "Check for App Updates"
                     if (manualUserTrigger) {
                         Toast.makeText(this, "Update check: ${result.message}", Toast.LENGTH_LONG).show()
                     }
@@ -3538,83 +3693,393 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showUpdateAvailableDialog(currentVersion: String, release: UpdateReleaseInfo) {
-        activeUpdateDialog?.dismiss()
-        activeUpdateDialog = AlertDialog.Builder(this)
-            .setTitle("New App Update: v${release.versionName}")
-            .setMessage(
-                "Installed: v$currentVersion\nAvailable: v${release.versionName}\n\n" +
-                    "What's New:\n${release.changelog}\n\n" +
-                    "Your 1.6 km run history and Samsung calibration stay intact."
-            )
-            .setPositiveButton("Download & Install") { _, _ -> startUpdateDownloadAndInstall(release) }
-            .setNegativeButton("Later", null)
-            .show()
+        showUpdateSheet(currentVersion, release, startImmediately = false)
     }
 
     private fun startUpdateDownloadAndInstall(release: UpdateReleaseInfo) {
-        val box = LinearLayout(this).apply {
+        val (_, curName) = appUpdater.getInstalledVersion()
+        showUpdateSheet(curName, release, startImmediately = true)
+    }
+
+    private fun showUpdateSheet(
+        currentVersion: String,
+        release: UpdateReleaseInfo,
+        startImmediately: Boolean
+    ) {
+        activeUpdateDialog?.dismiss()
+
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        dialog.setCancelable(true)
+
+        val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(18), dp(22), dp(12))
+            setPadding(dp(20), dp(20), dp(20), dp(18))
+            background = AthleticTheme.gradientCard(
+                this@MainActivity,
+                topColor = 0xFF15151B.toInt(),
+                bottomColor = 0xFF09090D.toInt(),
+                borderColor = AthleticColors.HERO_EMERALD_BORDER,
+                radiusDp = 26f,
+                strokeDp = 1.2f
+            )
+            elevation = dp(14).toFloat()
         }
-        val statusTv = TextView(this).apply {
-            text = "Connecting to GitHub Releases..."
-            textSize = 13.5f
-            setPadding(0, 0, 0, dp(10))
-        }
-        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            progress = 0
-            isIndeterminate = true
-        }
-        box.addView(statusTv)
-        box.addView(progressBar)
 
-        val progressDialog = AlertDialog.Builder(this)
-            .setTitle("Downloading Update v${release.versionName}")
-            .setView(box)
-            .setCancelable(false)
-            .create()
-        progressDialog.show()
-
-        appUpdater.downloadAndInstall(
-            release = release,
-            onProgress = { pct, downloaded, total ->
-                if (pct >= 0 && total > 0L) {
-                    progressBar.isIndeterminate = false
-                    progressBar.progress = pct
-                    statusTv.text = String.format(
-                        "Downloading APK... %d%% (%.1f / %.1f MB)",
-                        pct,
-                        downloaded / (1024.0 * 1024.0),
-                        total / (1024.0 * 1024.0)
-                    )
-                } else {
-                    statusTv.text = String.format("Downloading APK... %.1f MB", downloaded / (1024.0 * 1024.0))
+        // 1. Hero Header Row (Sprinting Runner Emblem + Overline + Title)
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val emblemFrame = FrameLayout(this).apply {
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                0xFF1A2406.toInt(),
+                AthleticColors.HERO_EMERALD_BORDER,
+                16f
+            )
+            layoutParams = LinearLayout.LayoutParams(dp(50), dp(50)).apply { marginEnd = dp(13) }
+            addView(
+                VectorIconView(this@MainActivity, IconKind.TRACK_EMBLEM, AthleticColors.EMERALD_BRIGHT, 38f).apply {
+                    layoutParams = FrameLayout.LayoutParams(dp(38), dp(38), Gravity.CENTER)
                 }
-            },
-            onNeedsInstallPermission = {
-                progressDialog.dismiss()
-                AlertDialog.Builder(this)
-                    .setTitle("Allow App Self-Update")
-                    .setMessage(
-                        "Update v${release.versionName} is downloaded and SHA-256 verified!\n\n" +
-                            "Toggle 'Allow from this source' on the next screen and press Back."
-                    )
-                    .setPositiveButton("Open Settings") { _, _ -> appUpdater.openUnknownSourcesSettings(this) }
-                    .setNegativeButton("Cancel", null)
-                    .show()
-            },
-            onError = { msg ->
-                progressDialog.dismiss()
-                AlertDialog.Builder(this)
-                    .setTitle("Update Failed")
-                    .setMessage(msg)
-                    .setPositiveButton("Retry") { _, _ -> startUpdateDownloadAndInstall(release) }
-                    .setNegativeButton("Close", null)
-                    .show()
-            },
-            onInstallerLaunched = { progressDialog.dismiss() }
-        )
+            )
+        }
+        headerRow.addView(emblemFrame)
+
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        titleCol.addView(TextView(this).apply {
+            text = "OVER-THE-AIR UPDATE"
+            textSize = 10.5f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            letterSpacing = 0.08f
+        })
+        titleCol.addView(TextView(this).apply {
+            text = "TS Police 1.6K  v${release.versionName}"
+            textSize = 19f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            setPadding(0, dp(2), 0, 0)
+        })
+        headerRow.addView(titleCol)
+        card.addView(headerRow)
+
+        // 2. Version Transition Pill Row
+        val verRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(14)
+                bottomMargin = dp(12)
+            }
+        }
+        verRow.addView(TextView(this).apply {
+            text = "v$currentVersion"
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(dp(10), dp(4.5f), dp(10), dp(4.5f))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                AthleticColors.SURFACE_RECESSED,
+                AthleticColors.BORDER_SUBTLE,
+                10f
+            )
+        })
+        verRow.addView(TextView(this).apply {
+            text = "  →  "
+            textSize = 13f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.TEXT_MUTED)
+        })
+        verRow.addView(TextView(this).apply {
+            text = "v${release.versionName}" + if (release.versionCode > 0) "  •  Build ${release.versionCode}" else ""
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+            setPadding(dp(10), dp(4.5f), dp(10), dp(4.5f))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                0x24C6F432,
+                AthleticColors.HERO_EMERALD_BORDER,
+                10f
+            )
+        })
+        verRow.addView(View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
+        })
+        verRow.addView(TextView(this).apply {
+            text = "SHA-256"
+            textSize = 10f
+            typeface = AthleticTheme.FONT_SANS_BOLD
+            setTextColor(AthleticColors.CYAN_BRIGHT)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                0x249D6BFF,
+                AthleticColors.HERO_CYAN_BORDER,
+                9f
+            )
+        })
+        card.addView(verRow)
+
+        // 3. Recessed "What's New" Release Notes Box
+        val notesCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                AthleticColors.SURFACE_RECESSED,
+                AthleticColors.BORDER_SUBTLE,
+                15f
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
+        }
+        notesCard.addView(AthleticTheme.sectionLabel(this, "WHAT'S NEW", AthleticColors.EMERALD_BRIGHT))
+
+        val notesScroll = object : ScrollView(this) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val maxH = dp(175)
+                val cappedSpec = MeasureSpec.makeMeasureSpec(maxH, MeasureSpec.AT_MOST)
+                super.onMeasure(widthMeasureSpec, cappedSpec)
+            }
+        }.apply {
+            isVerticalScrollBarEnabled = false
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
+        }
+        notesScroll.addView(TextView(this).apply {
+            text = release.changelog.ifBlank { "Performance, UI & sensor accuracy improvements." }
+            textSize = 13f
+            setTextColor(0xFFE4E4E7.toInt())
+            setLineSpacing(dp(2.5f).toFloat(), 1f)
+        })
+        notesCard.addView(notesScroll)
+        card.addView(notesCard)
+
+        // 4. Data Preservation Pill
+        val safeNote = TextView(this).apply {
+            text = "✓  1.6 km history, daily steps & Samsung calibration stay intact"
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(dp(11), dp(7), dp(11), dp(7))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                0x14C6F432,
+                0x385A7A12,
+                11f
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(14) }
+        }
+        card.addView(safeNote)
+
+        // 5. Seamless Live In-Card Download & Verification Progress Section
+        val progressSection = LinearLayout(this).apply {
+            visibility = View.GONE
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), dp(11), dp(13), dp(12))
+            background = AthleticTheme.solidPill(
+                this@MainActivity,
+                0xFF101016.toInt(),
+                AthleticColors.BORDER_STRONG,
+                14f
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(14) }
+        }
+        val progressTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+        val dlStatusTv = TextView(this).apply {
+            text = "Connecting to GitHub Releases..."
+            textSize = 12f
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            setTextColor(AthleticColors.TEXT_PRIMARY)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
+        }
+        val dlPercentTv = TextView(this).apply {
+            text = ""
+            textSize = 13f
+            typeface = AthleticTheme.FONT_TABULAR_BOLD
+            setTextColor(AthleticColors.EMERALD_BRIGHT)
+        }
+        progressTopRow.addView(dlStatusTv)
+        progressTopRow.addView(dlPercentTv)
+        progressSection.addView(progressTopRow)
+
+        val neonProgressBar = NeonUpdateProgressBarView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(12)
+            )
+        }
+        progressSection.addView(neonProgressBar)
+        card.addView(progressSection)
+
+        // 6. Primary & Secondary Stadium Pill Buttons
+        val primaryBtn = AthleticTheme.createButton(
+            this,
+            "Download & Install Update  →",
+            AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
+            50f
+        ).apply {
+            textSize = 14f
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+
+        val secondaryBtn = AthleticTheme.createButton(
+            this,
+            "Later",
+            AthleticTheme.ButtonStyle.SUBTLE_OUTLINE,
+            44f
+        ).apply {
+            textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            setOnClickListener { dialog.dismiss() }
+        }
+
+        fun runDownloadFlow() {
+            dialog.setCancelable(false)
+            secondaryBtn.visibility = View.GONE
+            primaryBtn.isEnabled = false
+            primaryBtn.alpha = 0.65f
+            primaryBtn.text = "Downloading & Verifying..."
+            AthleticTheme.applyButtonStyle(this, primaryBtn, AthleticTheme.ButtonStyle.SECONDARY_SLATE)
+
+            if (progressSection.visibility != View.VISIBLE) {
+                progressSection.alpha = 0f
+                progressSection.visibility = View.VISIBLE
+                progressSection.animate().alpha(1f).setDuration(180L).start()
+            }
+            neonProgressBar.visibility = View.VISIBLE
+            neonProgressBar.isIndeterminateMode = true
+            dlStatusTv.setTextColor(AthleticColors.TEXT_PRIMARY)
+            dlStatusTv.text = "Connecting to GitHub Releases..."
+            dlPercentTv.text = ""
+
+            appUpdater.downloadAndInstall(
+                release = release,
+                onProgress = { pct, downloaded, total ->
+                    if (!dialog.isShowing) return@downloadAndInstall
+                    if (pct >= 0 && total > 0L) {
+                        neonProgressBar.setProgressPercent(pct, animate = true)
+                        dlPercentTv.text = "$pct%"
+                        dlStatusTv.text = if (pct >= 100) {
+                            "Verifying SHA-256 signature..."
+                        } else {
+                            String.format(
+                                "Downloading APK  •  %.1f / %.1f MB",
+                                downloaded / (1024.0 * 1024.0),
+                                total / (1024.0 * 1024.0)
+                            )
+                        }
+                    } else {
+                        neonProgressBar.isIndeterminateMode = true
+                        dlPercentTv.text = ""
+                        dlStatusTv.text = String.format("Downloading APK  •  %.1f MB", downloaded / (1024.0 * 1024.0))
+                    }
+                },
+                onNeedsInstallPermission = {
+                    if (!dialog.isShowing) return@downloadAndInstall
+                    dialog.setCancelable(true)
+                    neonProgressBar.setProgressPercent(100, animate = false)
+                    dlPercentTv.text = "✓ Verified"
+                    dlStatusTv.setTextColor(AthleticColors.EMERALD_BRIGHT)
+                    dlStatusTv.text = "APK verified! Allow 'Install unknown apps' on the next screen, then press Back."
+
+                    primaryBtn.isEnabled = true
+                    primaryBtn.alpha = 1f
+                    primaryBtn.text = "Allow Self-Update in Settings  →"
+                    AthleticTheme.applyButtonStyle(this, primaryBtn, AthleticTheme.ButtonStyle.PRIMARY_EMERALD)
+                    primaryBtn.setOnClickListener {
+                        dialog.dismiss()
+                        appUpdater.openUnknownSourcesSettings(this)
+                    }
+                    secondaryBtn.text = "Cancel"
+                    secondaryBtn.visibility = View.VISIBLE
+                },
+                onError = { msg ->
+                    if (!dialog.isShowing) return@downloadAndInstall
+                    dialog.setCancelable(true)
+                    neonProgressBar.visibility = View.GONE
+                    dlPercentTv.text = ""
+                    dlStatusTv.setTextColor(AthleticColors.CRIMSON)
+                    dlStatusTv.text = "Update failed: $msg"
+
+                    primaryBtn.isEnabled = true
+                    primaryBtn.alpha = 1f
+                    primaryBtn.text = "Retry Download  →"
+                    AthleticTheme.applyButtonStyle(this, primaryBtn, AthleticTheme.ButtonStyle.PRIMARY_EMERALD)
+                    primaryBtn.setOnClickListener { runDownloadFlow() }
+
+                    secondaryBtn.text = "Close"
+                    secondaryBtn.visibility = View.VISIBLE
+                },
+                onInstallerLaunched = {
+                    if (dialog.isShowing) dialog.dismiss()
+                }
+            )
+        }
+
+        primaryBtn.setOnClickListener { runDownloadFlow() }
+
+        card.addView(primaryBtn)
+        card.addView(secondaryBtn)
+
+        dialog.setContentView(card)
+        dialog.window?.let { win ->
+            win.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            win.setDimAmount(0.80f)
+            val widthPx = (resources.displayMetrics.widthPixels * 0.92f).roundToInt()
+            win.setLayout(widthPx, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+
+        activeUpdateDialog = dialog
+        dialog.show()
+
+        card.alpha = 0f
+        card.translationY = dp(24).toFloat()
+        card.animate()
+            .alpha(1f)
+            .translationY(0f)
+            .setDuration(240L)
+            .setInterpolator(DecelerateInterpolator(1.7f))
+            .start()
+
+        if (startImmediately) {
+            runDownloadFlow()
+        }
     }
 
     // =========================================================================

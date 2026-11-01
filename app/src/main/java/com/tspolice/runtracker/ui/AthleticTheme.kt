@@ -4,9 +4,11 @@ import android.animation.ValueAnimator
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Canvas
+import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
@@ -347,20 +349,67 @@ class VectorIconView(
 
         when (kind) {
             IconKind.TRACK_EMBLEM -> {
-                // Glowing neon-lime stadium track emblem with electric-purple speed bolt
-                fillPaint.color = 0x24C6F432
+                // Signature Sprinting Runner Emblem (matches launcher icon)
+                fillPaint.color = 0x20C6F432
                 canvas.drawCircle(cx, cy, s * 0.48f, fillPaint)
-                strokePaint.color = AthleticColors.EMERALD_BRIGHT
-                strokePaint.strokeWidth = dp(1.8f)
-                rect.set(cx - s * 0.36f, cy - s * 0.22f, cx + s * 0.36f, cy + s * 0.22f)
-                canvas.drawRoundRect(rect, s * 0.22f, s * 0.22f, strokePaint)
 
-                path.reset()
-                path.moveTo(cx + s * 0.04f, cy - s * 0.16f)
-                path.lineTo(cx - s * 0.09f, cy + s * 0.02f)
-                path.lineTo(cx + s * 0.03f, cy + s * 0.02f)
-                path.lineTo(cx - s * 0.04f, cy + s * 0.16f)
+                // Electric-purple sweeping stadium track arc
+                strokePaint.color = AthleticColors.CYAN
+                strokePaint.strokeWidth = s * 0.055f
+                rect.set(x(0.09f), y(0.09f), x(0.91f), y(0.91f))
+                canvas.drawArc(rect, 140f, 245f, false, strokePaint)
+
+                // Speed trails behind sprinter
+                strokePaint.strokeWidth = s * 0.042f
                 strokePaint.color = AthleticColors.CYAN_BRIGHT
+                canvas.drawLine(x(0.15f), y(0.40f), x(0.28f), y(0.40f), strokePaint)
+                strokePaint.color = AthleticColors.EMERALD
+                canvas.drawLine(x(0.12f), y(0.49f), x(0.26f), y(0.49f), strokePaint)
+
+                // Forward-leaning sprinter head
+                fillPaint.color = AthleticColors.EMERALD_BRIGHT
+                canvas.drawCircle(x(0.63f), y(0.26f), s * 0.068f, fillPaint)
+
+                // V-tapered forward-leaning torso
+                path.reset()
+                path.moveTo(x(0.51f), y(0.33f))
+                path.lineTo(x(0.59f), y(0.36f))
+                path.lineTo(x(0.47f), y(0.54f))
+                path.lineTo(x(0.40f), y(0.51f))
+                path.close()
+                canvas.drawPath(path, fillPaint)
+
+                // Rear counter-swing arm + front pumping lead arm
+                strokePaint.color = AthleticColors.EMERALD
+                strokePaint.strokeWidth = s * 0.060f
+                path.reset()
+                path.moveTo(x(0.52f), y(0.35f))
+                path.lineTo(x(0.40f), y(0.36f))
+                path.lineTo(x(0.35f), y(0.45f))
+                canvas.drawPath(path, strokePaint)
+
+                strokePaint.color = AthleticColors.EMERALD_BRIGHT
+                path.reset()
+                path.moveTo(x(0.57f), y(0.37f))
+                path.lineTo(x(0.64f), y(0.45f))
+                path.lineTo(x(0.75f), y(0.38f))
+                canvas.drawPath(path, strokePaint)
+
+                // Rear push-off leg + front high-knee sprint leg
+                strokePaint.color = AthleticColors.EMERALD
+                strokePaint.strokeWidth = s * 0.066f
+                path.reset()
+                path.moveTo(x(0.42f), y(0.52f))
+                path.lineTo(x(0.32f), y(0.65f))
+                path.lineTo(x(0.20f), y(0.70f))
+                canvas.drawPath(path, strokePaint)
+
+                strokePaint.color = AthleticColors.EMERALD_BRIGHT
+                path.reset()
+                path.moveTo(x(0.46f), y(0.53f))
+                path.lineTo(x(0.64f), y(0.56f))
+                path.lineTo(x(0.59f), y(0.75f))
+                path.lineTo(x(0.64f), y(0.76f))
                 canvas.drawPath(path, strokePaint)
             }
 
@@ -1027,5 +1076,143 @@ class SlidingSegmentedBar(
             }
         }
         return true
+    }
+}
+
+/**
+ * Custom AMOLED stadium-pill progress bar for OTA updates (supports both animated indeterminate
+ * comet sweep and smooth determinate Electric Purple -> Neon Lime gradient fill).
+ */
+class NeonUpdateProgressBarView(context: Context) : View(context) {
+    private val density = resources.displayMetrics.density
+    private fun dp(v: Float) = v * density
+
+    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xFF17171E.toInt()
+    }
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(1f)
+        color = AthleticColors.BORDER_STRONG
+    }
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val rect = RectF()
+    private val fillRect = RectF()
+
+    var isIndeterminateMode: Boolean = true
+        set(value) {
+            if (field != value) {
+                field = value
+                syncIndeterminateAnim()
+                invalidate()
+            }
+        }
+
+    private var displayedFraction = 0f
+    private var progressAnim: ValueAnimator? = null
+    private var cometPhase = 0f
+    private var cometAnim: ValueAnimator? = null
+
+    fun setProgressPercent(percent: Int, animate: Boolean = true) {
+        isIndeterminateMode = false
+        val target = (percent.coerceIn(0, 100)) / 100f
+        progressAnim?.cancel()
+        if (!animate || !isLaidOut || abs(displayedFraction - target) < 0.005f) {
+            displayedFraction = target
+            invalidate()
+            return
+        }
+        progressAnim = ValueAnimator.ofFloat(displayedFraction, target).apply {
+            duration = 150L
+            addUpdateListener { a ->
+                displayedFraction = a.animatedValue as Float
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    private fun syncIndeterminateAnim() {
+        if (isIndeterminateMode && isAttachedToWindow && visibility == VISIBLE) {
+            if (cometAnim?.isRunning == true) return
+            cometAnim = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 1150L
+                repeatCount = ValueAnimator.INFINITE
+                repeatMode = ValueAnimator.RESTART
+                addUpdateListener { a ->
+                    cometPhase = a.animatedValue as Float
+                    invalidate()
+                }
+                start()
+            }
+        } else {
+            cometAnim?.cancel()
+            cometAnim = null
+        }
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        syncIndeterminateAnim()
+    }
+
+    override fun onDetachedFromWindow() {
+        cometAnim?.cancel()
+        cometAnim = null
+        progressAnim?.cancel()
+        super.onDetachedFromWindow()
+    }
+
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        syncIndeterminateAnim()
+    }
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val desiredH = dp(12f).roundToInt()
+        val w = MeasureSpec.getSize(widthMeasureSpec)
+        setMeasuredDimension(w, resolveSize(desiredH, heightMeasureSpec))
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (w > 0) {
+            fillPaint.shader = LinearGradient(
+                0f, 0f, w.toFloat(), 0f,
+                intArrayOf(AthleticColors.CYAN, AthleticColors.EMERALD, AthleticColors.EMERALD_BRIGHT),
+                floatArrayOf(0f, 0.55f, 1f),
+                Shader.TileMode.CLAMP
+            )
+        }
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 2f || h <= 2f) return
+        val r = h / 2f
+        val inset = dp(0.6f)
+        rect.set(inset, inset, w - inset, h - inset)
+        canvas.drawRoundRect(rect, r, r, trackPaint)
+        canvas.drawRoundRect(rect, r, r, borderPaint)
+
+        if (isIndeterminateMode) {
+            val cometW = (w * 0.36f).coerceAtLeast(h)
+            val travel = w + cometW
+            val left = (-cometW + cometPhase * travel).coerceIn(inset, w - inset)
+            val right = (-cometW + cometPhase * travel + cometW).coerceIn(inset, w - inset)
+            if (right - left > dp(2f)) {
+                fillRect.set(left, inset, right, h - inset)
+                canvas.drawRoundRect(fillRect, r, r, fillPaint)
+            }
+        } else if (displayedFraction > 0.002f) {
+            val fillW = ((w - inset * 2f) * displayedFraction).coerceAtLeast(h - inset * 2f)
+            fillRect.set(inset, inset, (inset + fillW).coerceAtMost(w - inset), h - inset)
+            canvas.drawRoundRect(fillRect, r, r, fillPaint)
+        }
     }
 }
