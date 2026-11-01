@@ -60,6 +60,11 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_LAST_HANDLED_PULL_ID = "last_handled_pull_id"
         private const val KEY_CACHED_DEEP_SAMSUNG_48H_JSON = "cached_deep_samsung_48h_json"
         private const val KEY_VERIFIED_HW_PEDOMETER = "verified_hw_pedometer_active"
+
+        // Oct 31 evening jog exactly as the phone recorded it (v1.0.16 session row + 20:16 daily totals)
+        private const val OCT31_RECORDED_JOG_SEC = 512.72
+        private const val OCT31_RECORDED_SESSION_M = 789.68
+        private const val OCT31_RECORDED_DAILY_JOG_M = 867.51
     }
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -672,8 +677,9 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     }
 
     /**
-     * Restores the user's real Oct 31 18:14:13–18:24:43 evening slow-jog (`630.44s` = `10m 30s`, `968.6m`)
-     * that had been partially dropped by FIFO batching in v1.0.16 and removed by v1.0.17's migration.
+     * Restores the user's Oct 31 evening jog (started 18:14:13) that v1.0.17's migration wrongly deleted,
+     * using ONLY the values the phone originally recorded (v1.0.16 session row + daily totals in the 20:16 pull):
+     * session `512.72s` / `789.68m` / avg `129.1 spm` / max `2.042 m/s`; daily jog `512.72s` / `867.51m`.
      */
     private fun restoreOct31EveningJogSessionIfNeeded() {
         val flagKey = "restored_v18_oct31_evening_jog"
@@ -682,8 +688,8 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         runCatching {
             val targetDate = "2026-10-31"
             val eveningJogStartMs = 1793450653486L // 2026-10-31 18:14:13.486 IST
-            val jogSecToRestore = 630.44           // 18:14:13.365 -> 18:24:43.806 (10m 30s unbroken jog)
-            val jogMetersToRestore = 968.60        // Full GPS distance across 18:14:13 -> 18:24:43
+            val jogSecToRestore = OCT31_RECORDED_JOG_SEC
+            val jogMetersToRestore = OCT31_RECORDED_DAILY_JOG_M
 
             // 1. Re-insert the 18:14 evening jog session into TABLE_RUNS if absent
             if (!hasSessionNear(eveningJogStartMs, windowMs = 10L * 60_000L)) {
@@ -692,22 +698,22 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
                         startedAtEpochMs = eveningJogStartMs,
                         dateIso = targetDate,
                         mode = RunMode.OPEN_PRACTICE,
-                        distanceMeters = jogMetersToRestore,
+                        distanceMeters = OCT31_RECORDED_SESSION_M,
                         activeDurationSec = jogSecToRestore,
                         pausedDurationSec = 0.0,
                         first1600mSplitSec = null,
                         equiv1600mSec = TsPoliceBenchmark.computeEquiv1600mSec(
-                            distanceMeters = jogMetersToRestore,
+                            distanceMeters = OCT31_RECORDED_SESSION_M,
                             activeDurationSec = jogSecToRestore,
                             first1600mSplitSec = null
                         ),
-                        avgCadenceSpm = 142.4,
+                        avgCadenceSpm = 129.10,
                         maxSpeedMps = 2.042,
                         runningSec = 0.0,
                         joggingSec = jogSecToRestore,
-                        walkingSec = 75.15,
+                        walkingSec = 192.87,
                         lapSplits = emptyList(),
-                        notes = "All-Day Auto-Detected Jog (969m)",
+                        notes = "All-Day Auto-Detected Jog (789m)",
                         isDemo = false
                     )
                 )
@@ -777,10 +783,96 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         }
     }
 
+    /**
+     * v1.0.18 restored the Oct 31 evening jog with made-up figures (630.44s / 968.6m / 142.4 spm) that the
+     * phone never recorded. Puts the session, daily totals and 18:00 hourly bucket back to the real recorded
+     * values (512.72s / 789.68m session, 867.51m daily jog, 129.1 spm), returning the excess to walking.
+     */
+    private fun correctOct31JogToRecordedValuesIfNeeded() {
+        val flagKey = "corrected_v19_oct31_jog_recorded_values"
+        if (prefs.getBoolean(flagKey, false)) return
+        prefs.edit().putBoolean(flagKey, true).apply()
+        runCatching {
+            val targetDate = "2026-10-31"
+            val badJogSec = 630.44
+            val badJogM = 968.60
+            val excessSec = badJogSec - OCT31_RECORDED_JOG_SEC
+            val excessM = badJogM - OCT31_RECORDED_DAILY_JOG_M
+
+            // 1. Session row (only the one v1.0.18 inserted)
+            val sessionValues = ContentValues().apply {
+                put("distance_m", OCT31_RECORDED_SESSION_M)
+                put("active_sec", OCT31_RECORDED_JOG_SEC)
+                put("jogging_sec", OCT31_RECORDED_JOG_SEC)
+                put("walking_sec", 192.87)
+                put("avg_cadence_spm", 129.10)
+                put(
+                    "equiv_1600_sec",
+                    TsPoliceBenchmark.computeEquiv1600mSec(OCT31_RECORDED_SESSION_M, OCT31_RECORDED_JOG_SEC, null)
+                )
+                put("notes", "All-Day Auto-Detected Jog (789m)")
+            }
+            writableDatabase.update(
+                TABLE_RUNS,
+                sessionValues,
+                "date_iso = ? AND is_demo = 0 AND notes = ?",
+                arrayOf(targetDate, "All-Day Auto-Detected Jog (969m)")
+            )
+
+            // 2. Daily totals: only if they still hold the v1.0.18 numbers
+            val cur = readDailyRow(targetDate)
+            if (cur != null && kotlin.math.abs(cur.joggingSec - badJogSec) < 1.0) {
+                upsertDailyActivity(
+                    cur.copy(
+                        walkingSec = cur.walkingSec + excessSec,
+                        joggingSec = OCT31_RECORDED_JOG_SEC,
+                        walkingMeters = cur.walkingMeters +
+                            (cur.joggingMeters - OCT31_RECORDED_DAILY_JOG_M).coerceAtLeast(0.0),
+                        joggingMeters = OCT31_RECORDED_DAILY_JOG_M
+                    )
+                )
+            }
+
+            // 3. 18:00 hourly bucket
+            getHourlySensorBucketsForDates(listOf(targetDate))["2026-10-31T18"]?.let { hb18 ->
+                if (kotlin.math.abs(hb18.jogSec - badJogSec) < 1.0) {
+                    upsertHourlySensorBucket(
+                        hb18.copy(
+                            walkSec = hb18.walkSec + excessSec,
+                            jogSec = OCT31_RECORDED_JOG_SEC,
+                            walkMeters = hb18.walkMeters + if (kotlin.math.abs(hb18.jogRunMeters - badJogM) < 1.0) excessM else 0.0,
+                            jogRunMeters = if (kotlin.math.abs(hb18.jogRunMeters - badJogM) < 1.0) OCT31_RECORDED_DAILY_JOG_M else hb18.jogRunMeters
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private fun readDailyRow(dateIso: String): DailyActivitySummary? {
+        readableDatabase.query(TABLE_DAILY, null, "date_iso = ?", arrayOf(dateIso), null, null, null).use { c ->
+            if (!c.moveToFirst()) return null
+            return DailyActivitySummary(
+                dateIso = c.getString(c.getColumnIndexOrThrow("date_iso")),
+                walkingSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec")),
+                joggingSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec")),
+                runningSec = c.getDouble(c.getColumnIndexOrThrow("running_sec")),
+                walkingMeters = c.getDouble(c.getColumnIndexOrThrow("walking_m")),
+                joggingMeters = c.getDouble(c.getColumnIndexOrThrow("jogging_m")),
+                runningMeters = c.getDouble(c.getColumnIndexOrThrow("running_m")),
+                totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps")),
+                maxSpeedMps = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps")),
+                maxCadenceSpm = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm")),
+                isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
+            )
+        }
+    }
+
     fun getDailyActivity(dateIso: String): DailyActivitySummary {
         healOct31LoosePocketWalkIfNeeded()
         healOct31EveningVehicleTrapIfNeeded()
         restoreOct31EveningJogSessionIfNeeded()
+        correctOct31JogToRecordedValuesIfNeeded()
         readableDatabase.query(
             TABLE_DAILY,
             null,
@@ -894,6 +986,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     fun getAllSessions(): List<RunSessionRecord> {
         healOct31EveningVehicleTrapIfNeeded()
         restoreOct31EveningJogSessionIfNeeded()
+        correctOct31JogToRecordedValuesIfNeeded()
         val out = mutableListOf<RunSessionRecord>()
         readableDatabase.query(
             TABLE_RUNS,

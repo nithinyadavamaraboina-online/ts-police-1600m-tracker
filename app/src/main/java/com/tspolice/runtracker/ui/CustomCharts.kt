@@ -99,9 +99,9 @@ class DailyActivityRingsView(context: Context) : View(context) {
         innerPaint.strokeWidth = stroke
 
         // Background tracks
-        trackPaint.color = 0x2410B981
+        trackPaint.color = 0x24C6F432
         canvas.drawOval(outerRect, trackPaint)
-        trackPaint.color = 0x2438BDF8
+        trackPaint.color = 0x249D6BFF
         canvas.drawOval(innerRect, trackPaint)
 
         // Outer ring: Jog+Run goal = 900s (15 mins daily conditioning)
@@ -111,7 +111,7 @@ class DailyActivityRingsView(context: Context) : View(context) {
 
         // Glowing tip dot on outer ring
         val outerEndRad = Math.toRadians((-90.0 + 360.0 * runRatio))
-        tipPaint.color = 0xFF6EE7B7.toInt()
+        tipPaint.color = 0xFFE4FF8A.toInt()
         canvas.drawCircle(
             cx + (rOuter * cos(outerEndRad)).toFloat(),
             cy + (rOuter * sin(outerEndRad)).toFloat(),
@@ -154,7 +154,7 @@ class PaceArcGaugeView(context: Context) : View(context) {
     private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
-        color = 0xFF172236.toInt()
+        color = 0xFF1C1C21.toInt()
     }
     private val progressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -170,13 +170,13 @@ class PaceArcGaugeView(context: Context) : View(context) {
     private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = dp(2f)
-        color = 0xFF475569.toInt()
+        color = 0xFF52525B.toInt()
     }
     private val tickLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         typeface = AthleticTheme.FONT_SANS_BOLD
         textSize = sp(9.5f)
-        color = 0xFF64748B.toInt()
+        color = 0xFF71717A.toInt()
     }
     private val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -197,7 +197,7 @@ class PaceArcGaugeView(context: Context) : View(context) {
         textAlign = Paint.Align.CENTER
         typeface = AthleticTheme.FONT_SANS_BOLD
         textSize = sp(15.5f)
-        color = 0xFFCBD5E1.toInt()
+        color = 0xFFD4D4D8.toInt()
     }
     private val deltaPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
@@ -208,7 +208,7 @@ class PaceArcGaugeView(context: Context) : View(context) {
         textAlign = Paint.Align.CENTER
         typeface = AthleticTheme.FONT_SANS_MEDIUM
         textSize = sp(11f)
-        color = 0xFFFCA5A5.toInt()
+        color = 0xFFFF8FA3.toInt()
     }
 
     private val arcRect = RectF()
@@ -302,7 +302,7 @@ class PaceArcGaugeView(context: Context) : View(context) {
             val lx = cx + (rLbl * cos(rad)).toFloat()
             val ly = cy + (rLbl * sin(rad)).toFloat() + dp(3f)
             val passed = distanceM >= lap * 400.0
-            tickLabelPaint.color = if (passed) AthleticColors.EMERALD_BRIGHT else 0xFF64748B.toInt()
+            tickLabelPaint.color = if (passed) AthleticColors.EMERALD_BRIGHT else 0xFF71717A.toInt()
             canvas.drawText(lapLabels[lap - 1], lx, ly, tickLabelPaint)
         }
 
@@ -315,7 +315,7 @@ class PaceArcGaugeView(context: Context) : View(context) {
         val pillColor = when {
             isArmed && !isRecording -> AthleticColors.AMBER_BRIGHT
             isRecording && state == MotionState.STANDING -> AthleticColors.CRIMSON
-            !isRecording && state == MotionState.STANDING -> 0xFF94A3B8.toInt()
+            !isRecording && state == MotionState.STANDING -> 0xFFA1A1AA.toInt()
             else -> state.colorArgb
         }
         val textW = badgeTextPaint.measureText(badgeStr)
@@ -380,7 +380,7 @@ class IntervalDialView(context: Context) : View(context) {
     private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
-        color = 0xFF172236.toInt()
+        color = 0xFF1C1C21.toInt()
     }
     private val arcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -500,7 +500,7 @@ class GaitBreakdownBarView(context: Context) : View(context) {
         val h = height.toFloat()
         val w = width.toFloat()
         if (total <= 0.1) {
-            paint.color = 0xFF172236.toInt()
+            paint.color = 0xFF1C1C21.toInt()
             rect.set(0f, 0f, w, h)
             canvas.drawRoundRect(rect, h / 2f, h / 2f, paint)
             return
@@ -539,7 +539,7 @@ class ProgressTrendChartView(context: Context) : View(context) {
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = dp(1f)
-        color = 0xFF182438.toInt()
+        color = 0xFF1C1C21.toInt()
     }
     private val targetZonePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -663,7 +663,7 @@ class ProgressTrendChartView(context: Context) : View(context) {
         val targetY = yForSec(targetSec)
         targetZonePaint.shader = LinearGradient(
             0f, targetY, 0f, topPad + plotH,
-            0x2810B981, 0x0510B981, Shader.TileMode.CLAMP
+            0x28C6F432, 0x05C6F432, Shader.TileMode.CLAMP
         )
         canvas.drawRect(leftPad, targetY, leftPad + plotW, topPad + plotH, targetZonePaint)
         canvas.drawLine(leftPad, targetY, leftPad + plotW, targetY, targetLinePaint)
@@ -699,7 +699,7 @@ class ProgressTrendChartView(context: Context) : View(context) {
 
             areaPaint.shader = LinearGradient(
                 0f, topPad, 0f, topPad + plotH,
-                0x4838BDF8, 0x0038BDF8, Shader.TileMode.CLAMP
+                0x489D6BFF, 0x009D6BFF, Shader.TileMode.CLAMP
             )
             canvas.drawPath(fillPath, areaPaint)
             canvas.drawPath(linePath, trendLinePaint)
@@ -715,7 +715,7 @@ class ProgressTrendChartView(context: Context) : View(context) {
                 lineTo(endX, targetY)
             }
             canvas.drawPath(projPath, projectionPaint)
-            dotHaloPaint.color = 0x4410B981
+            dotHaloPaint.color = 0x44C6F432
             dotPaint.color = AthleticColors.EMERALD_BRIGHT
             canvas.drawCircle(endX, targetY, dp(8f), dotHaloPaint)
             canvas.drawCircle(endX, targetY, dp(4.5f), dotPaint)

@@ -83,7 +83,7 @@ object SessionDialogs {
             setPadding(dp(ctx, 10f), dp(ctx, 6f), dp(ctx, 10f), dp(ctx, 6f))
             background = AthleticTheme.solidPill(
                 ctx,
-                if (merit.qualified) 0x2210B981 else 0x22F59E0B,
+                if (merit.qualified) 0x22C6F432 else 0x22FF9F1C,
                 if (merit.qualified) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.HERO_AMBER_BORDER,
                 10f
             )
@@ -574,7 +574,7 @@ object SessionDialogs {
             setPadding(dp(ctx, 11f), dp(ctx, 8f), dp(ctx, 11f), dp(ctx, 8f))
             background = AthleticTheme.solidPill(
                 ctx,
-                if (result.uploadedToCloud) 0x2210B981 else 0x22F59E0B,
+                if (result.uploadedToCloud) 0x22C6F432 else 0x22FF9F1C,
                 if (result.uploadedToCloud) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.HERO_AMBER_BORDER,
                 10f
             )

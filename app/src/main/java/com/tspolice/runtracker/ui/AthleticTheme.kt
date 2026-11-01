@@ -19,48 +19,58 @@ import android.widget.TextView
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+/**
+ * Pure-black AMOLED palette with neon lime (primary / "go") and electric purple (secondary) accents.
+ * Legacy token names (EMERALD / CYAN / AMBER) are kept so every screen re-skins from this one place:
+ *  - EMERALD_* = neon lime   (walking-to-target success, primary actions, active nav)
+ *  - CYAN_*    = electric purple (jogging, secondary actions, info)
+ *  - AMBER_*   = hot orange  (warnings, running effort)
+ */
 object AthleticColors {
-    const val BG_CANVAS = 0xFF060A12.toInt()
-    const val BG_HEADER = 0xFF080E1A.toInt()
-    const val BG_NAV = 0xFF090F1D.toInt()
+    const val BG_CANVAS = 0xFF000000.toInt()
+    const val BG_HEADER = 0xFF000000.toInt()
+    const val BG_NAV = 0xFF0A0A0C.toInt()
 
-    const val SURFACE_TOP = 0xFF10192B.toInt()
-    const val SURFACE_BOTTOM = 0xFF0B111E.toInt()
-    const val SURFACE_RECESSED = 0xFF070C15.toInt()
-    const val BORDER_SUBTLE = 0xFF1C2A44.toInt()
-    const val BORDER_STRONG = 0xFF293B5C.toInt()
-    const val DIVIDER = 0xFF162136.toInt()
+    const val SURFACE_TOP = 0xFF141417.toInt()
+    const val SURFACE_BOTTOM = 0xFF0C0C0E.toInt()
+    const val SURFACE_RECESSED = 0xFF08080A.toInt()
+    const val BORDER_SUBTLE = 0xFF222227.toInt()
+    const val BORDER_STRONG = 0xFF34343C.toInt()
+    const val DIVIDER = 0xFF1A1A1F.toInt()
 
-    const val HERO_EMERALD_TOP = 0xFF0D2924.toInt()
-    const val HERO_EMERALD_BOTTOM = 0xFF0A1322.toInt()
-    const val HERO_EMERALD_BORDER = 0xFF1D6B53.toInt()
+    const val HERO_EMERALD_TOP = 0xFF1C2606.toInt()
+    const val HERO_EMERALD_BOTTOM = 0xFF0A0B07.toInt()
+    const val HERO_EMERALD_BORDER = 0xFF5A7A12.toInt()
 
-    const val HERO_CYAN_TOP = 0xFF0D233A.toInt()
-    const val HERO_CYAN_BOTTOM = 0xFF0A1322.toInt()
-    const val HERO_CYAN_BORDER = 0xFF1E5680.toInt()
+    const val HERO_CYAN_TOP = 0xFF1E1236.toInt()
+    const val HERO_CYAN_BOTTOM = 0xFF0A090E.toInt()
+    const val HERO_CYAN_BORDER = 0xFF5B34B8.toInt()
 
-    const val HERO_AMBER_TOP = 0xFF2B1E0D.toInt()
-    const val HERO_AMBER_BOTTOM = 0xFF0B1220.toInt()
-    const val HERO_AMBER_BORDER = 0xFF855516.toInt()
+    const val HERO_AMBER_TOP = 0xFF2A1606.toInt()
+    const val HERO_AMBER_BOTTOM = 0xFF0B0907.toInt()
+    const val HERO_AMBER_BORDER = 0xFF8F4C0E.toInt()
 
-    const val EMERALD = 0xFF10B981.toInt()
-    const val EMERALD_BRIGHT = 0xFF34D399.toInt()
-    const val EMERALD_DARK = 0xFF059669.toInt()
+    // Neon lime
+    const val EMERALD = 0xFFC6F432.toInt()
+    const val EMERALD_BRIGHT = 0xFFDAFF5E.toInt()
+    const val EMERALD_DARK = 0xFF9ACB10.toInt()
 
-    const val CYAN = 0xFF38BDF8.toInt()
-    const val CYAN_BRIGHT = 0xFF7DD3FC.toInt()
-    const val CYAN_DARK = 0xFF0284C7.toInt()
+    // Electric purple
+    const val CYAN = 0xFF9D6BFF.toInt()
+    const val CYAN_BRIGHT = 0xFFBB97FF.toInt()
+    const val CYAN_DARK = 0xFF7C3AED.toInt()
 
-    const val AMBER = 0xFFF59E0B.toInt()
-    const val AMBER_BRIGHT = 0xFFFBBF24.toInt()
-    const val CRIMSON = 0xFFF43F5E.toInt()
+    // Hot orange / red / magenta
+    const val AMBER = 0xFFFF9F1C.toInt()
+    const val AMBER_BRIGHT = 0xFFFFB84D.toInt()
+    const val CRIMSON = 0xFFFF3B5C.toInt()
     const val CRIMSON_DARK = 0xFFE11D48.toInt()
-    const val VIOLET = 0xFFA78BFA.toInt()
+    const val VIOLET = 0xFFF472D0.toInt()
 
-    const val TEXT_PRIMARY = 0xFFF8FAFC.toInt()
-    const val TEXT_SECONDARY = 0xFF94A3B8.toInt()
-    const val TEXT_MUTED = 0xFF64748B.toInt()
-    const val TEXT_ON_DARK_ACCENT = 0xFF03140E.toInt()
+    const val TEXT_PRIMARY = 0xFFFFFFFF.toInt()
+    const val TEXT_SECONDARY = 0xFFA1A1AA.toInt()
+    const val TEXT_MUTED = 0xFF71717A.toInt()
+    const val TEXT_ON_DARK_ACCENT = 0xFF0A0F00.toInt()
 }
 
 enum class IconKind {
@@ -78,7 +88,8 @@ object AthleticTheme {
     val FONT_SANS_MEDIUM: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     val FONT_SANS_BOLD: Typeface = Typeface.create("sans-serif", Typeface.BOLD)
     val FONT_CONDENSED_BOLD: Typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
-    val FONT_TABULAR_BOLD: Typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    // Roboto Black: heavy athletic numerals (Roboto digits are tabular by default, so live stats never jitter)
+    val FONT_TABULAR_BOLD: Typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
 
     fun dp(ctx: Context, v: Float): Int = (v * ctx.resources.displayMetrics.density).roundToInt()
 
@@ -87,7 +98,7 @@ object AthleticTheme {
         topColor: Int = AthleticColors.SURFACE_TOP,
         bottomColor: Int = AthleticColors.SURFACE_BOTTOM,
         borderColor: Int = AthleticColors.BORDER_SUBTLE,
-        radiusDp: Float = 18f,
+        radiusDp: Float = 22f,
         strokeDp: Float = 1f
     ): GradientDrawable = GradientDrawable(
         GradientDrawable.Orientation.TOP_BOTTOM,
@@ -150,10 +161,11 @@ object AthleticTheme {
             gravity = Gravity.CENTER
             textSize = 14f
             typeface = FONT_SANS_BOLD
+            letterSpacing = 0.04f
             isClickable = true
             isFocusable = true
             minHeight = dp(ctx, heightDp)
-            setPadding(dp(ctx, 16f), dp(ctx, 13f), dp(ctx, 16f), dp(ctx, 13f))
+            setPadding(dp(ctx, 18f), dp(ctx, 13f), dp(ctx, 18f), dp(ctx, 13f))
             applyButtonStyle(ctx, this, style)
         }
     }
@@ -167,7 +179,8 @@ object AthleticTheme {
         SUBTLE_OUTLINE
     }
 
-    fun applyButtonStyle(ctx: Context, view: TextView, style: ButtonStyle, radiusDp: Float = 14f) {
+    // Fully rounded pill buttons (Nike Run Club / Strava style)
+    fun applyButtonStyle(ctx: Context, view: TextView, style: ButtonStyle, radiusDp: Float = 28f) {
         when (style) {
             ButtonStyle.PRIMARY_EMERALD -> {
                 view.setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
@@ -181,14 +194,15 @@ object AthleticTheme {
                 )
             }
             ButtonStyle.PRIMARY_CYAN -> {
-                view.setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
+                // White text on electric purple for legible contrast
+                view.setTextColor(AthleticColors.TEXT_PRIMARY)
                 view.background = rippleSurface(
                     ctx,
-                    AthleticColors.CYAN_BRIGHT,
+                    AthleticColors.CYAN,
                     AthleticColors.CYAN_DARK,
                     AthleticColors.CYAN_BRIGHT,
                     radiusDp,
-                    0x33000000
+                    0x33FFFFFF
                 )
             }
             ButtonStyle.WARNING_AMBER -> {
@@ -216,8 +230,8 @@ object AthleticTheme {
                 view.setTextColor(AthleticColors.TEXT_PRIMARY)
                 view.background = rippleSurface(
                     ctx,
-                    0xFF162238.toInt(),
-                    0xFF10192B.toInt(),
+                    0xFF1E1E23.toInt(),
+                    0xFF141417.toInt(),
                     AthleticColors.BORDER_STRONG,
                     radiusDp
                 )
@@ -305,7 +319,7 @@ class VectorIconView(
         when (kind) {
             IconKind.TRACK_EMBLEM -> {
                 // Glowing emerald stadium track emblem with speed bolt
-                fillPaint.color = 0x2410B981
+                fillPaint.color = 0x24C6F432
                 canvas.drawCircle(cx, cy, s * 0.48f, fillPaint)
                 strokePaint.color = AthleticColors.EMERALD_BRIGHT
                 strokePaint.strokeWidth = dp(1.8f)
@@ -439,7 +453,7 @@ class ModernToggleSwitchView(context: Context, initialChecked: Boolean = false) 
         val r = h / 2f
         rect.set(dp(1f), dp(1f), w - dp(1f), h - dp(1f))
 
-        trackPaint.color = if (isChecked) AthleticColors.EMERALD else 0xFF182235.toInt()
+        trackPaint.color = if (isChecked) AthleticColors.EMERALD else 0xFF1E1E23.toInt()
         canvas.drawRoundRect(rect, r, r, trackPaint)
 
         if (!isChecked) {
@@ -450,7 +464,7 @@ class ModernToggleSwitchView(context: Context, initialChecked: Boolean = false) 
         val thumbRadius = (h - dp(6f)) / 2f
         val cx = if (isChecked) w - dp(3f) - thumbRadius else dp(3f) + thumbRadius
         val cy = h / 2f
-        thumbPaint.color = if (isChecked) 0xFF03140E.toInt() else 0xFFCBD5E1.toInt()
+        thumbPaint.color = if (isChecked) 0xFF0A0F00.toInt() else 0xFFD4D4D8.toInt()
         canvas.drawCircle(cx, cy, thumbRadius, thumbPaint)
     }
 }
@@ -537,12 +551,12 @@ class BottomNavTabView(
         )
 
         indicator.layoutParams = LayoutParams(
-            AthleticTheme.dp(context, 28f),
-            AthleticTheme.dp(context, 3f)
+            AthleticTheme.dp(context, 34f),
+            AthleticTheme.dp(context, 4f)
         ).apply {
             bottomMargin = AthleticTheme.dp(context, 5f)
         }
-        indicator.background = AthleticTheme.solidPill(context, AthleticColors.EMERALD, AthleticColors.EMERALD, 3f, 0f)
+        indicator.background = AthleticTheme.solidPill(context, AthleticColors.EMERALD, AthleticColors.EMERALD, 4f, 0f)
 
         labelView.apply {
             text = label
@@ -562,7 +576,7 @@ class BottomNavTabView(
         indicator.visibility = if (active) View.VISIBLE else View.INVISIBLE
         val color = if (active) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_MUTED
         iconView.update(newTint = color)
-        labelView.setTextColor(if (active) AthleticColors.TEXT_PRIMARY else AthleticColors.TEXT_MUTED)
+        labelView.setTextColor(if (active) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_MUTED)
     }
 
     fun setBadgeLabel(newLabel: String) {

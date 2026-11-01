@@ -594,7 +594,7 @@ class MainActivity : AppCompatActivity() {
         permissionBanner.addView(TextView(this).apply {
             text = "Grant GPS & Step Sensor access for accurate 1.6 km & daily tracking"
             textSize = 12f
-            setTextColor(0xFFFDE68A.toInt())
+            setTextColor(0xFFFFD08A.toInt())
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginEnd = dp(10)
             }
@@ -977,7 +977,7 @@ class MainActivity : AppCompatActivity() {
             typeface = AthleticTheme.FONT_SANS_MEDIUM
             setTextColor(AthleticColors.CYAN_BRIGHT)
             setPadding(dp(10), dp(6), dp(10), dp(6))
-            background = AthleticTheme.solidPill(this@MainActivity, 0x1A38BDF8, AthleticColors.HERO_CYAN_BORDER, 9f)
+            background = AthleticTheme.solidPill(this@MainActivity, 0x1A9D6BFF, AthleticColors.HERO_CYAN_BORDER, 9f)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -1441,7 +1441,7 @@ class MainActivity : AppCompatActivity() {
             textSize = 10.5f
             typeface = AthleticTheme.FONT_SANS_BOLD
             setPadding(dp(9), dp(3.5f), dp(9), dp(3.5f))
-            background = AthleticTheme.solidPill(this@MainActivity, 0x3310B981, AthleticColors.EMERALD_BRIGHT, 10f)
+            background = AthleticTheme.solidPill(this@MainActivity, 0x33C6F432, AthleticColors.EMERALD_BRIGHT, 10f)
             setTextColor(AthleticColors.EMERALD_BRIGHT)
         }
         topRow.addView(meritBadgeText)
@@ -1467,7 +1467,7 @@ class MainActivity : AppCompatActivity() {
             textSize = 12f
             setTextColor(AthleticColors.CYAN_BRIGHT)
             setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = AthleticTheme.solidPill(this@MainActivity, 0x2238BDF8, AthleticColors.HERO_CYAN_BORDER, 11f)
+            background = AthleticTheme.solidPill(this@MainActivity, 0x229D6BFF, AthleticColors.HERO_CYAN_BORDER, 11f)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                 .apply { topMargin = dp(12) }
         }
@@ -2106,7 +2106,7 @@ class MainActivity : AppCompatActivity() {
                 isFocusable = isToday || isYesterday
                 background = AthleticTheme.solidPill(
                     this@MainActivity,
-                    if (isToday) 0xFF0E1D30.toInt() else AthleticColors.SURFACE_RECESSED,
+                    if (isToday) 0xFF1A2008.toInt() else AthleticColors.SURFACE_RECESSED,
                     when {
                         isToday -> AthleticColors.HERO_CYAN_BORDER
                         isYesterday && samSnap != null -> AthleticColors.HERO_EMERALD_BORDER
@@ -2279,17 +2279,17 @@ class MainActivity : AppCompatActivity() {
             snap.isGpsLocked && acc != null && acc <= 12f -> {
                 ptGpsReadinessPill.text = "TRACK GPS READY ±${acc.toInt()}m"
                 ptGpsReadinessPill.setTextColor(AthleticColors.EMERALD_BRIGHT)
-                ptGpsReadinessPill.background = AthleticTheme.solidPill(this, 0x2210B981, AthleticColors.HERO_EMERALD_BORDER, 10f)
+                ptGpsReadinessPill.background = AthleticTheme.solidPill(this, 0x22C6F432, AthleticColors.HERO_EMERALD_BORDER, 10f)
             }
             acc != null && acc <= 26f -> {
                 ptGpsReadinessPill.text = "GPS WARMING ±${acc.toInt()}m"
                 ptGpsReadinessPill.setTextColor(AthleticColors.AMBER_BRIGHT)
-                ptGpsReadinessPill.background = AthleticTheme.solidPill(this, 0x22F59E0B, AthleticColors.HERO_AMBER_BORDER, 10f)
+                ptGpsReadinessPill.background = AthleticTheme.solidPill(this, 0x22FF9F1C, AthleticColors.HERO_AMBER_BORDER, 10f)
             }
             else -> {
                 ptGpsReadinessPill.text = "STRIDE FUSION READY"
                 ptGpsReadinessPill.setTextColor(AthleticColors.CYAN_BRIGHT)
-                ptGpsReadinessPill.background = AthleticTheme.solidPill(this, 0x2238BDF8, AthleticColors.HERO_CYAN_BORDER, 10f)
+                ptGpsReadinessPill.background = AthleticTheme.solidPill(this, 0x229D6BFF, AthleticColors.HERO_CYAN_BORDER, 10f)
             }
         }
 
@@ -3201,13 +3201,13 @@ class MainActivity : AppCompatActivity() {
         if (unrestricted) {
             batteryStatusBadge.text = "UNRESTRICTED ✓"
             batteryStatusBadge.setTextColor(AthleticColors.EMERALD_BRIGHT)
-            batteryStatusBadge.background = AthleticTheme.solidPill(this, 0x2210B981, AthleticColors.HERO_EMERALD_BORDER, 9f)
+            batteryStatusBadge.background = AthleticTheme.solidPill(this, 0x22C6F432, AthleticColors.HERO_EMERALD_BORDER, 9f)
             batteryStatusBtn.text = "Background Battery Protection Active"
             AthleticTheme.applyButtonStyle(this, batteryStatusBtn, AthleticTheme.ButtonStyle.SECONDARY_SLATE)
         } else {
             batteryStatusBadge.text = "RESTRICTED"
             batteryStatusBadge.setTextColor(AthleticColors.AMBER_BRIGHT)
-            batteryStatusBadge.background = AthleticTheme.solidPill(this, 0x22F59E0B, AthleticColors.HERO_AMBER_BORDER, 9f)
+            batteryStatusBadge.background = AthleticTheme.solidPill(this, 0x22FF9F1C, AthleticColors.HERO_AMBER_BORDER, 9f)
             batteryStatusBtn.text = "Allow Unrestricted Background Tracking"
             AthleticTheme.applyButtonStyle(this, batteryStatusBtn, AthleticTheme.ButtonStyle.PRIMARY_CYAN)
         }
@@ -3275,13 +3275,13 @@ class MainActivity : AppCompatActivity() {
                 headerAudioIcon.update(IconKind.AUDIO_SMART, AthleticColors.EMERALD_BRIGHT)
                 headerAudioLabel.text = "Smart"
                 headerAudioLabel.setTextColor(AthleticColors.EMERALD_BRIGHT)
-                headerAudioPill.background = AthleticTheme.solidPill(this, 0x2210B981, AthleticColors.HERO_EMERALD_BORDER, 18f)
+                headerAudioPill.background = AthleticTheme.solidPill(this, 0x22C6F432, AthleticColors.HERO_EMERALD_BORDER, 18f)
             }
             PocketAudioMode.ALL_STATES -> {
                 headerAudioIcon.update(IconKind.AUDIO_ALL, AthleticColors.CYAN_BRIGHT)
                 headerAudioLabel.text = "All Audio"
                 headerAudioLabel.setTextColor(AthleticColors.CYAN_BRIGHT)
-                headerAudioPill.background = AthleticTheme.solidPill(this, 0x2238BDF8, AthleticColors.HERO_CYAN_BORDER, 18f)
+                headerAudioPill.background = AthleticTheme.solidPill(this, 0x229D6BFF, AthleticColors.HERO_CYAN_BORDER, 18f)
             }
             PocketAudioMode.MUTED -> {
                 headerAudioIcon.update(IconKind.AUDIO_MUTED, AthleticColors.TEXT_MUTED)
