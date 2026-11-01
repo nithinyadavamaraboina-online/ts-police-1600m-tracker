@@ -311,6 +311,10 @@ class VectorIconView(
         val s = min(w, h)
         val cx = w / 2f
         val cy = h / 2f
+        val ox = cx - s / 2f
+        val oy = cy - s / 2f
+        fun x(f: Float): Float = ox + s * f
+        fun y(f: Float): Float = oy + s * f
 
         strokePaint.color = tintColor
         strokePaint.strokeWidth = dp(1.9f)
@@ -318,7 +322,7 @@ class VectorIconView(
 
         when (kind) {
             IconKind.TRACK_EMBLEM -> {
-                // Glowing emerald stadium track emblem with speed bolt
+                // Glowing neon-lime stadium track emblem with electric-purple speed bolt
                 fillPaint.color = 0x24C6F432
                 canvas.drawCircle(cx, cy, s * 0.48f, fillPaint)
                 strokePaint.color = AthleticColors.EMERALD_BRIGHT
@@ -336,69 +340,70 @@ class VectorIconView(
             }
 
             IconKind.NAV_TRACKER -> {
-                // Concentric athletic ring + pulse dot
-                canvas.drawCircle(cx, cy, s * 0.38f, strokePaint)
-                rect.set(cx - s * 0.21f, cy - s * 0.21f, cx + s * 0.21f, cy + s * 0.21f)
-                canvas.drawArc(rect, -90f, 250f, false, strokePaint)
-                canvas.drawCircle(cx, cy, s * 0.07f, fillPaint)
+                // Crisp athletic stopwatch (1:1 square-bounded)
+                val bodyCy = y(0.55f)
+                canvas.drawCircle(cx, bodyCy, s * 0.34f, strokePaint)
+                canvas.drawLine(x(0.39f), y(0.11f), x(0.61f), y(0.11f), strokePaint)
+                canvas.drawLine(cx, y(0.11f), cx, y(0.21f), strokePaint)
+                canvas.drawLine(x(0.73f), y(0.27f), x(0.81f), y(0.19f), strokePaint)
+                canvas.drawLine(cx, bodyCy, x(0.64f), y(0.41f), strokePaint)
+                canvas.drawCircle(cx, bodyCy, s * 0.06f, fillPaint)
             }
 
             IconKind.NAV_PROGRESS -> {
-                // Rising performance trend curve + arrow peak
-                path.reset()
-                path.moveTo(w * 0.16f, h * 0.76f)
-                path.lineTo(w * 0.40f, h * 0.52f)
-                path.lineTo(w * 0.58f, h * 0.62f)
-                path.lineTo(w * 0.84f, h * 0.26f)
-                canvas.drawPath(path, strokePaint)
-                path.reset()
-                path.moveTo(w * 0.66f, h * 0.26f)
-                path.lineTo(w * 0.84f, h * 0.26f)
-                path.lineTo(w * 0.84f, h * 0.44f)
-                canvas.drawPath(path, strokePaint)
+                // 3 ascending rounded performance bars (1:1 square-bounded)
+                strokePaint.strokeWidth = dp(2.6f)
+                canvas.drawLine(x(0.23f), y(0.84f), x(0.23f), y(0.58f), strokePaint)
+                canvas.drawLine(x(0.50f), y(0.84f), x(0.50f), y(0.38f), strokePaint)
+                canvas.drawLine(x(0.77f), y(0.84f), x(0.77f), y(0.16f), strokePaint)
             }
 
             IconKind.NAV_SETTINGS -> {
-                // Clean 2-slider tuning icon
-                canvas.drawLine(w * 0.18f, h * 0.34f, w * 0.82f, h * 0.34f, strokePaint)
-                canvas.drawLine(w * 0.18f, h * 0.66f, w * 0.82f, h * 0.66f, strokePaint)
-                fillPaint.color = AthleticColors.BG_NAV
-                canvas.drawCircle(w * 0.62f, h * 0.34f, s * 0.12f, fillPaint)
-                canvas.drawCircle(w * 0.62f, h * 0.34f, s * 0.12f, strokePaint)
-                canvas.drawCircle(w * 0.38f, h * 0.66f, s * 0.12f, fillPaint)
-                canvas.drawCircle(w * 0.38f, h * 0.66f, s * 0.12f, strokePaint)
+                // Dual precision tuning sliders with open-knob tracks (1:1 square-bounded)
+                val r = s * 0.115f
+                val y1 = y(0.33f)
+                val kx1 = x(0.63f)
+                canvas.drawLine(x(0.15f), y1, kx1 - r, y1, strokePaint)
+                canvas.drawLine(kx1 + r, y1, x(0.85f), y1, strokePaint)
+                canvas.drawCircle(kx1, y1, r, strokePaint)
+
+                val y2 = y(0.67f)
+                val kx2 = x(0.37f)
+                canvas.drawLine(x(0.15f), y2, kx2 - r, y2, strokePaint)
+                canvas.drawLine(kx2 + r, y2, x(0.85f), y2, strokePaint)
+                canvas.drawCircle(kx2, y2, r, strokePaint)
             }
 
             IconKind.AUDIO_SMART, IconKind.AUDIO_ALL, IconKind.AUDIO_MUTED -> {
-                // Speaker cone
+                // Speaker cone (1:1 square-bounded)
                 path.reset()
-                path.moveTo(w * 0.18f, h * 0.40f)
-                path.lineTo(w * 0.34f, h * 0.40f)
-                path.lineTo(w * 0.54f, h * 0.22f)
-                path.lineTo(w * 0.54f, h * 0.78f)
-                path.lineTo(w * 0.34f, h * 0.60f)
-                path.lineTo(w * 0.18f, h * 0.60f)
+                path.moveTo(x(0.18f), y(0.40f))
+                path.lineTo(x(0.34f), y(0.40f))
+                path.lineTo(x(0.54f), y(0.22f))
+                path.lineTo(x(0.54f), y(0.78f))
+                path.lineTo(x(0.34f), y(0.60f))
+                path.lineTo(x(0.18f), y(0.60f))
                 path.close()
                 canvas.drawPath(path, strokePaint)
 
                 if (kind == IconKind.AUDIO_MUTED) {
-                    canvas.drawLine(w * 0.66f, h * 0.36f, w * 0.86f, h * 0.64f, strokePaint)
-                    canvas.drawLine(w * 0.86f, h * 0.36f, w * 0.66f, h * 0.64f, strokePaint)
+                    canvas.drawLine(x(0.66f), y(0.36f), x(0.86f), y(0.64f), strokePaint)
+                    canvas.drawLine(x(0.86f), y(0.36f), x(0.66f), y(0.64f), strokePaint)
                 } else {
-                    rect.set(w * 0.48f, h * 0.32f, w * 0.74f, h * 0.68f)
+                    rect.set(x(0.48f), y(0.32f), x(0.74f), y(0.68f))
                     canvas.drawArc(rect, -45f, 90f, false, strokePaint)
                     if (kind == IconKind.AUDIO_ALL) {
-                        rect.set(w * 0.54f, h * 0.20f, w * 0.90f, h * 0.80f)
+                        rect.set(x(0.54f), y(0.20f), x(0.90f), y(0.80f))
                         canvas.drawArc(rect, -48f, 96f, false, strokePaint)
                     }
                 }
             }
 
             IconKind.TRASH -> {
-                canvas.drawLine(w * 0.22f, h * 0.28f, w * 0.78f, h * 0.28f, strokePaint)
-                rect.set(w * 0.30f, h * 0.28f, w * 0.70f, h * 0.82f)
+                canvas.drawLine(x(0.22f), y(0.28f), x(0.78f), y(0.28f), strokePaint)
+                rect.set(x(0.30f), y(0.28f), x(0.70f), y(0.82f))
                 canvas.drawRoundRect(rect, dp(2f), dp(2f), strokePaint)
-                canvas.drawLine(w * 0.40f, h * 0.18f, w * 0.60f, h * 0.18f, strokePaint)
+                canvas.drawLine(x(0.40f), y(0.18f), x(0.60f), y(0.18f), strokePaint)
             }
         }
     }
@@ -527,56 +532,79 @@ class ModernSettingRow(
 }
 
 /**
- * Sleek bottom navigation bar item with glowing active top indicator pill + custom vector icon + label.
+ * Sleek stadium-pill bottom navigation tab item with strictly centered square icon + centered label.
  */
 class BottomNavTabView(
     context: Context,
     iconKind: IconKind,
     label: String
 ) : LinearLayout(context) {
-    private val indicator = View(context)
-    private val iconView = VectorIconView(context, iconKind, AthleticColors.TEXT_MUTED, 21f)
+    private val iconView = VectorIconView(context, iconKind, AthleticColors.TEXT_SECONDARY, 20f)
     private val labelView = TextView(context)
 
     init {
         orientation = VERTICAL
-        gravity = Gravity.CENTER_HORIZONTAL
+        gravity = Gravity.CENTER
         isClickable = true
         isFocusable = true
         setPadding(
             AthleticTheme.dp(context, 6f),
+            AthleticTheme.dp(context, 7f),
             AthleticTheme.dp(context, 6f),
-            AthleticTheme.dp(context, 6f),
-            AthleticTheme.dp(context, 8f)
+            AthleticTheme.dp(context, 7f)
         )
 
-        indicator.layoutParams = LayoutParams(
-            AthleticTheme.dp(context, 34f),
-            AthleticTheme.dp(context, 4f)
-        ).apply {
-            bottomMargin = AthleticTheme.dp(context, 5f)
+        val iconSizePx = AthleticTheme.dp(context, 20f)
+        iconView.layoutParams = LayoutParams(iconSizePx, iconSizePx).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
         }
-        indicator.background = AthleticTheme.solidPill(context, AthleticColors.EMERALD, AthleticColors.EMERALD, 4f, 0f)
 
         labelView.apply {
             text = label
-            textSize = 11f
-            typeface = AthleticTheme.FONT_SANS_BOLD
-            setPadding(0, AthleticTheme.dp(context, 3f), 0, 0)
-            setTextColor(AthleticColors.TEXT_MUTED)
+            textSize = 11.5f
+            typeface = AthleticTheme.FONT_SANS_MEDIUM
+            gravity = Gravity.CENTER
+            textAlignment = View.TEXT_ALIGNMENT_CENTER
+            maxLines = 1
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            layoutParams = LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                topMargin = AthleticTheme.dp(context, 3.5f)
+            }
         }
 
-        addView(indicator)
         addView(iconView)
         addView(labelView)
         setActive(false)
     }
 
     fun setActive(active: Boolean) {
-        indicator.visibility = if (active) View.VISIBLE else View.INVISIBLE
-        val color = if (active) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_MUTED
-        iconView.update(newTint = color)
-        labelView.setTextColor(if (active) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_MUTED)
+        if (active) {
+            background = AthleticTheme.rippleSurface(
+                context,
+                startColor = 0xFF233008.toInt(),
+                endColor = 0xFF131A05.toInt(),
+                borderColor = 0xFF7CA81B.toInt(),
+                radiusDp = 26f,
+                rippleColor = 0x33DAFF5E
+            )
+            iconView.update(newTint = AthleticColors.EMERALD_BRIGHT)
+            labelView.typeface = AthleticTheme.FONT_SANS_BOLD
+            labelView.setTextColor(AthleticColors.EMERALD_BRIGHT)
+        } else {
+            val mask = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = AthleticTheme.dp(context, 26f).toFloat()
+                setColor(0xFFFFFFFF.toInt())
+            }
+            background = RippleDrawable(ColorStateList.valueOf(0x22FFFFFF), null, mask)
+            iconView.update(newTint = AthleticColors.TEXT_SECONDARY)
+            labelView.typeface = AthleticTheme.FONT_SANS_MEDIUM
+            labelView.setTextColor(0xFF94949E.toInt())
+        }
     }
 
     fun setBadgeLabel(newLabel: String) {

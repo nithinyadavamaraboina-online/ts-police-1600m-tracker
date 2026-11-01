@@ -1,8 +1,8 @@
 {
-    "versionCode":  20,
-    "versionName":  "1.0.19",
+    "versionCode":  21,
+    "versionName":  "1.0.20",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "9e3c34972b5342b5f44fba2c7cf52e8ae9aa6537845e040e432d489270eeeae1",
-    "changelog":  "New AMOLED black theme with neon lime and electric purple, pill buttons, bold athletic numerals. Corrects Oct 31 evening jog to the values the phone actually recorded.",
-    "publishedAt":  "2026-11-01T06:22:55Z"
+    "sha256":  "74a2ba62731880a798d21a691468ce95593bb9e7df5b66e757db596934258fdd",
+    "changelog":  "Fix bottom navigation stretched icons and left-aligned labels; upgrade bottom nav to a sleek AMOLED stadium-capsule dock.",
+    "publishedAt":  "2026-11-01T06:44:47Z"
 }

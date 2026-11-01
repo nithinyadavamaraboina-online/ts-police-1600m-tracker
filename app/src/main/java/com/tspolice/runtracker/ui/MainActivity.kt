@@ -493,17 +493,28 @@ class MainActivity : AppCompatActivity() {
         contentFrame.addView(tabGuideContainer)
         root.addView(contentFrame)
 
-        // Top hairline above Bottom Navigation Bar
-        root.addView(View(this).apply {
-            setBackgroundColor(AthleticColors.DIVIDER)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1f).coerceAtLeast(1))
-        })
-
-        // Sleek Icon Bottom Navigation Bar
+        // Contoured AMOLED Stadium-Capsule Bottom Navigation Dock
+        val bottomDockHost = FrameLayout(this).apply {
+            setBackgroundColor(AthleticColors.BG_CANVAS)
+            setPadding(dp(16), dp(6), dp(16), dp(10))
+        }
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(AthleticColors.BG_NAV)
-            setPadding(dp(8), dp(2), dp(8), dp(4))
+            gravity = Gravity.CENTER_VERTICAL
+            background = AthleticTheme.gradientCard(
+                this@MainActivity,
+                topColor = 0xFF151519.toInt(),
+                bottomColor = 0xFF0C0C10.toInt(),
+                borderColor = AthleticColors.BORDER_STRONG,
+                radiusDp = 32f,
+                strokeDp = 1f
+            )
+            setPadding(dp(5), dp(5), dp(5), dp(5))
+            elevation = dp(8).toFloat()
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
         }
         val navSpec = listOf(
             IconKind.NAV_TRACKER to "Tracker",
@@ -518,7 +529,8 @@ class MainActivity : AppCompatActivity() {
             navTabViews.add(tabView)
             bottomBar.addView(tabView)
         }
-        root.addView(bottomBar)
+        bottomDockHost.addView(bottomBar)
+        root.addView(bottomDockHost)
         return root
     }
 
@@ -710,7 +722,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        topRow.addView(AthleticTheme.sectionLabel(this, "TODAY'S MOVEMENT  •  AUTO-DETECT", AthleticColors.EMERALD_BRIGHT).apply {
+        topRow.addView(AthleticTheme.sectionLabel(this, "TODAY'S MOVEMENT", AthleticColors.EMERALD_BRIGHT).apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         allDayLiveChip = TextView(this).apply {
@@ -809,10 +821,11 @@ class MainActivity : AppCompatActivity() {
         // 2. Immediate 1-Tap Track Trial CTA (placed high for instant thumb access!)
         launchPtFromOpenBtn = AthleticTheme.createButton(
             this,
-            "Arm 1.6 km PT Trial (Launches on Jog/Run)  →",
+            "Arm 1.6 km PT Trial  •  Auto-Start  →",
             AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
             52f
         ).apply {
+            textSize = 13.5f
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -2239,9 +2252,9 @@ class MainActivity : AppCompatActivity() {
         )
 
         launchPtFromOpenBtn.text = when (snap.ptTrialPhase) {
-            PtTrialPhase.IDLE -> "Arm 1.6 km PT Trial (Launches on Jog/Run)  →"
-            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> "1.6 km PT Trial Armed  •  Open Cockpit  →"
-            PtTrialPhase.RUNNING_TRIAL -> "View Live 1.6 km PT Trial (${snap.distanceMeters.toInt()}m)  →"
+            PtTrialPhase.IDLE -> "Arm 1.6 km PT Trial  •  Auto-Start  →"
+            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> "1.6 km Trial Armed  •  Open Cockpit  →"
+            PtTrialPhase.RUNNING_TRIAL -> "Live 1.6 km Trial (${snap.distanceMeters.toInt()}m)  •  View  →"
         }
 
         dailyMaxPaceVal.text = TsPoliceBenchmark.formatPacePerKm(daily.maxSpeedMps)
@@ -3162,7 +3175,11 @@ class MainActivity : AppCompatActivity() {
                         refreshProgressDashboard()
                     }
                 }
-                addView(VectorIconView(this@MainActivity, IconKind.TRASH, AthleticColors.CRIMSON, 15f))
+                addView(
+                    VectorIconView(this@MainActivity, IconKind.TRASH, AthleticColors.CRIMSON, 15f).apply {
+                        layoutParams = FrameLayout.LayoutParams(dp(15), dp(15), Gravity.CENTER)
+                    }
+                )
             }
             bottomLine.addView(delHitbox)
             rowCard.addView(bottomLine)
