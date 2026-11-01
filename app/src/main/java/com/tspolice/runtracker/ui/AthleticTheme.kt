@@ -1,5 +1,6 @@
 package com.tspolice.runtracker.ui
 
+import android.animation.ValueAnimator
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Canvas
@@ -12,10 +13,15 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.animation.PathInterpolator
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -92,6 +98,25 @@ object AthleticTheme {
     val FONT_TABULAR_BOLD: Typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
 
     fun dp(ctx: Context, v: Float): Int = (v * ctx.resources.displayMetrics.density).roundToInt()
+
+    fun lerpColor(startColor: Int, endColor: Int, fraction: Float): Int {
+        val f = fraction.coerceIn(0f, 1f)
+        val sA = (startColor ushr 24) and 0xFF
+        val sR = (startColor ushr 16) and 0xFF
+        val sG = (startColor ushr 8) and 0xFF
+        val sB = startColor and 0xFF
+
+        val eA = (endColor ushr 24) and 0xFF
+        val eR = (endColor ushr 16) and 0xFF
+        val eG = (endColor ushr 8) and 0xFF
+        val eB = endColor and 0xFF
+
+        val a = (sA + (eA - sA) * f).roundToInt()
+        val r = (sR + (eR - sR) * f).roundToInt()
+        val g = (sG + (eG - sG) * f).roundToInt()
+        val b = (sB + (eB - sB) * f).roundToInt()
+        return (a shl 24) or (r shl 16) or (g shl 8) or b
+    }
 
     fun gradientCard(
         ctx: Context,
@@ -532,7 +557,8 @@ class ModernSettingRow(
 }
 
 /**
- * Sleek stadium-pill bottom navigation tab item with strictly centered square icon + centered label.
+ * Sleek stadium-pill bottom navigation tab item with strictly centered square icon + centered label
+ * and continuous 120Hz selection interpolation driven by [SlidingBottomNavDock].
  */
 class BottomNavTabView(
     context: Context,
@@ -541,6 +567,8 @@ class BottomNavTabView(
 ) : LinearLayout(context) {
     private val iconView = VectorIconView(context, iconKind, AthleticColors.TEXT_SECONDARY, 20f)
     private val labelView = TextView(context)
+    private var lastFraction = -1f
+    private var isBoldLabel = false
 
     init {
         orientation = VERTICAL
@@ -554,6 +582,13 @@ class BottomNavTabView(
             AthleticTheme.dp(context, 7f)
         )
 
+        val mask = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = AthleticTheme.dp(context, 26f).toFloat()
+            setColor(0xFFFFFFFF.toInt())
+        }
+        background = RippleDrawable(ColorStateList.valueOf(0x1FFFFFFF), null, mask)
+
         val iconSizePx = AthleticTheme.dp(context, 20f)
         iconView.layoutParams = LayoutParams(iconSizePx, iconSizePx).apply {
             gravity = Gravity.CENTER_HORIZONTAL
@@ -566,7 +601,7 @@ class BottomNavTabView(
             gravity = Gravity.CENTER
             textAlignment = View.TEXT_ALIGNMENT_CENTER
             maxLines = 1
-            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setTextColor(0xFF94949E.toInt())
             layoutParams = LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -578,36 +613,419 @@ class BottomNavTabView(
 
         addView(iconView)
         addView(labelView)
-        setActive(false)
+        setSelectionFraction(0f)
+    }
+
+    fun setSelectionFraction(fraction: Float) {
+        val f = fraction.coerceIn(0f, 1f)
+        if (abs(f - lastFraction) < 0.003f) return
+        lastFraction = f
+
+        val iconCol = AthleticTheme.lerpColor(
+            AthleticColors.TEXT_SECONDARY,
+            AthleticColors.EMERALD_BRIGHT,
+            f
+        )
+        val textCol = AthleticTheme.lerpColor(
+            0xFF94949E.toInt(),
+            AthleticColors.EMERALD_BRIGHT,
+            f
+        )
+        iconView.update(newTint = iconCol)
+        val scale = 1f + 0.08f * f
+        iconView.scaleX = scale
+        iconView.scaleY = scale
+        iconView.translationY = -context.resources.displayMetrics.density * 1.0f * f
+
+        labelView.setTextColor(textCol)
+        val wantBold = f >= 0.5f
+        if (wantBold != isBoldLabel) {
+            isBoldLabel = wantBold
+            labelView.typeface = if (wantBold) AthleticTheme.FONT_SANS_BOLD else AthleticTheme.FONT_SANS_MEDIUM
+        }
     }
 
     fun setActive(active: Boolean) {
-        if (active) {
-            background = AthleticTheme.rippleSurface(
-                context,
-                startColor = 0xFF233008.toInt(),
-                endColor = 0xFF131A05.toInt(),
-                borderColor = 0xFF7CA81B.toInt(),
-                radiusDp = 26f,
-                rippleColor = 0x33DAFF5E
-            )
-            iconView.update(newTint = AthleticColors.EMERALD_BRIGHT)
-            labelView.typeface = AthleticTheme.FONT_SANS_BOLD
-            labelView.setTextColor(AthleticColors.EMERALD_BRIGHT)
-        } else {
-            val mask = GradientDrawable().apply {
-                shape = GradientDrawable.RECTANGLE
-                cornerRadius = AthleticTheme.dp(context, 26f).toFloat()
-                setColor(0xFFFFFFFF.toInt())
-            }
-            background = RippleDrawable(ColorStateList.valueOf(0x22FFFFFF), null, mask)
-            iconView.update(newTint = AthleticColors.TEXT_SECONDARY)
-            labelView.typeface = AthleticTheme.FONT_SANS_MEDIUM
-            labelView.setTextColor(0xFF94949E.toInt())
-        }
+        setSelectionFraction(if (active) 1f else 0f)
     }
 
     fun setBadgeLabel(newLabel: String) {
         labelView.text = newLabel
+    }
+}
+
+/**
+ * Contoured AMOLED stadium-capsule bottom navigation dock with a continuous hardware-accelerated
+ * sliding neon-lime pill that tracks both horizontal page swipes AND direct thumb-scrubbing on the dock.
+ */
+class SlidingBottomNavDock(
+    context: Context,
+    specs: List<Pair<IconKind, String>>,
+    private val onTabTapped: (Int) -> Unit
+) : FrameLayout(context) {
+
+    private val slidingPill = View(context)
+    private val tabsRow = LinearLayout(context)
+    val tabViews: List<BottomNavTabView>
+
+    var onScrubStart: (() -> Unit)? = null
+    var onScrubDelta: ((Float) -> Unit)? = null
+    var onScrubEnd: ((Int) -> Unit)? = null
+
+    var currentProgress: Float = 0f
+        private set
+
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop * 0.75f
+    private var downX = 0f
+    private var downY = 0f
+    private var lastX = 0f
+    private var startProgress = 0f
+    private var isScrubbing = false
+
+    init {
+        val pad = AthleticTheme.dp(context, 5f)
+        setPadding(pad, pad, pad, pad)
+        clipToPadding = false
+        background = AthleticTheme.gradientCard(
+            context,
+            topColor = 0xFF151519.toInt(),
+            bottomColor = 0xFF0C0C10.toInt(),
+            borderColor = AthleticColors.BORDER_STRONG,
+            radiusDp = 32f,
+            strokeDp = 1f
+        )
+        elevation = AthleticTheme.dp(context, 8f).toFloat()
+
+        slidingPill.background = AthleticTheme.gradientCard(
+            context,
+            topColor = 0xFF253409.toInt(),
+            bottomColor = 0xFF141C05.toInt(),
+            borderColor = 0xFF84B61D.toInt(),
+            radiusDp = 26f,
+            strokeDp = 1.2f
+        )
+        addView(slidingPill, LayoutParams(0, 0))
+
+        tabsRow.orientation = LinearLayout.HORIZONTAL
+        tabsRow.gravity = Gravity.CENTER_VERTICAL
+        val builtTabs = mutableListOf<BottomNavTabView>()
+        specs.forEachIndexed { index, (icon, label) ->
+            val tv = BottomNavTabView(context, icon, label).apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener { onTabTapped(index) }
+            }
+            builtTabs.add(tv)
+            tabsRow.addView(tv)
+        }
+        tabViews = builtTabs
+        addView(
+            tabsRow,
+            LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        )
+        setScrollProgress(0f)
+    }
+
+    fun setScrollProgress(progress: Float) {
+        val maxIdx = (tabViews.size - 1).coerceAtLeast(0).toFloat()
+        currentProgress = progress.coerceIn(0f, maxIdx)
+        applyProgressToViews()
+    }
+
+    private fun applyProgressToViews() {
+        val innerW = (width - paddingLeft - paddingRight).coerceAtLeast(0)
+        if (innerW > 0 && tabViews.isNotEmpty()) {
+            val tabW = innerW.toFloat() / tabViews.size
+            slidingPill.translationX = currentProgress * tabW
+        }
+        tabViews.forEachIndexed { i, tv ->
+            val frac = (1f - abs(currentProgress - i)).coerceIn(0f, 1f)
+            tv.setSelectionFraction(frac)
+        }
+    }
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        val innerW = (right - left - paddingLeft - paddingRight).coerceAtLeast(0)
+        val innerH = (bottom - top - paddingTop - paddingBottom).coerceAtLeast(0)
+        if (tabViews.isNotEmpty() && innerW > 0 && innerH > 0) {
+            val pillW = (innerW.toFloat() / tabViews.size).roundToInt()
+            slidingPill.measure(
+                MeasureSpec.makeMeasureSpec(pillW, MeasureSpec.EXACTLY),
+                MeasureSpec.makeMeasureSpec(innerH, MeasureSpec.EXACTLY)
+            )
+            slidingPill.layout(paddingLeft, paddingTop, paddingLeft + pillW, paddingTop + innerH)
+            applyProgressToViews()
+        }
+    }
+
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = ev.x
+                downY = ev.y
+                lastX = ev.x
+                startProgress = currentProgress
+                isScrubbing = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = abs(ev.x - downX)
+                val dy = abs(ev.y - downY)
+                if (dx > touchSlop && dx > dy) {
+                    isScrubbing = true
+                    lastX = ev.x
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    onScrubStart?.invoke()
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> return true
+            MotionEvent.ACTION_MOVE -> {
+                if (!isScrubbing) {
+                    val dx = abs(ev.x - downX)
+                    val dy = abs(ev.y - downY)
+                    if (dx > touchSlop && dx > dy) {
+                        isScrubbing = true
+                        lastX = ev.x
+                        parent?.requestDisallowInterceptTouchEvent(true)
+                        onScrubStart?.invoke()
+                    }
+                }
+                if (isScrubbing) {
+                    val innerW = (width - paddingLeft - paddingRight).coerceAtLeast(1)
+                    val tabW = innerW.toFloat() / tabViews.size.coerceAtLeast(1)
+                    val deltaProgress = (ev.x - lastX) / tabW
+                    lastX = ev.x
+                    onScrubDelta?.invoke(deltaProgress)
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (isScrubbing) {
+                    isScrubbing = false
+                    val lastIdx = (tabViews.size - 1).coerceAtLeast(0)
+                    val moved = currentProgress - startProgress
+                    val target = when {
+                        moved > 0.22f && moved < 0.5f -> (startProgress.roundToInt() + 1).coerceIn(0, lastIdx)
+                        moved < -0.22f && moved > -0.5f -> (startProgress.roundToInt() - 1).coerceIn(0, lastIdx)
+                        else -> currentProgress.roundToInt().coerceIn(0, lastIdx)
+                    }
+                    onScrubEnd?.invoke(target)
+                }
+            }
+        }
+        return true
+    }
+}
+
+/**
+ * Fluid 3-segment capsule switcher with an animated color-morphing sliding pill and thumb-scrubbing.
+ */
+class SlidingSegmentedBar(
+    context: Context,
+    labels: List<String>,
+    private val accentColors: IntArray,
+    private val onSegmentSelected: (Int) -> Unit
+) : FrameLayout(context) {
+
+    private val pillDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = AthleticTheme.dp(context, 12f).toFloat()
+        setColor(accentColors.firstOrNull() ?: AthleticColors.EMERALD_BRIGHT)
+    }
+    private val slidingPill = View(context).apply { background = pillDrawable }
+    private val labelsRow = LinearLayout(context)
+    val segmentViews: List<TextView>
+
+    private var currentProgress = 0f
+    private var activeIndex = 0
+    private var pillAnimator: ValueAnimator? = null
+    private val smoothInterpolator = PathInterpolator(0.2f, 0f, 0f, 1f)
+
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop * 0.75f
+    private var downX = 0f
+    private var downY = 0f
+    private var lastX = 0f
+    private var startProgress = 0f
+    private var isScrubbing = false
+
+    init {
+        val pad = AthleticTheme.dp(context, 4f)
+        setPadding(pad, pad, pad, pad)
+        clipToPadding = false
+        background = AthleticTheme.solidPill(
+            context,
+            AthleticColors.SURFACE_RECESSED,
+            AthleticColors.BORDER_SUBTLE,
+            15f
+        )
+        addView(slidingPill, LayoutParams(0, 0))
+
+        labelsRow.orientation = LinearLayout.HORIZONTAL
+        labelsRow.gravity = Gravity.CENTER_VERTICAL
+        val builtViews = mutableListOf<TextView>()
+        labels.forEachIndexed { idx, text ->
+            val tv = TextView(context).apply {
+                this.text = text
+                gravity = Gravity.CENTER
+                textAlignment = View.TEXT_ALIGNMENT_CENTER
+                textSize = 12.5f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                maxLines = 1
+                setPadding(
+                    AthleticTheme.dp(context, 6f),
+                    AthleticTheme.dp(context, 10f),
+                    AthleticTheme.dp(context, 6f),
+                    AthleticTheme.dp(context, 10f)
+                )
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    selectSegment(idx, animate = true)
+                    onSegmentSelected(idx)
+                }
+            }
+            builtViews.add(tv)
+            labelsRow.addView(tv)
+        }
+        segmentViews = builtViews
+        addView(
+            labelsRow,
+            LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        )
+        setProgressInternal(0f)
+    }
+
+    fun selectSegment(index: Int, animate: Boolean = true) {
+        val clamped = index.coerceIn(0, (segmentViews.size - 1).coerceAtLeast(0))
+        activeIndex = clamped
+        pillAnimator?.cancel()
+        val target = clamped.toFloat()
+        if (!animate || !isLaidOut || abs(currentProgress - target) < 0.005f) {
+            setProgressInternal(target)
+            return
+        }
+        val start = currentProgress
+        pillAnimator = ValueAnimator.ofFloat(start, target).apply {
+            duration = 250L
+            interpolator = smoothInterpolator
+            addUpdateListener { anim ->
+                setProgressInternal(anim.animatedValue as Float)
+            }
+            start()
+        }
+    }
+
+    private fun sampleColor(progress: Float): Int {
+        if (accentColors.isEmpty()) return AthleticColors.EMERALD_BRIGHT
+        val maxIdx = accentColors.lastIndex
+        val clamped = progress.coerceIn(0f, maxIdx.toFloat())
+        val low = clamped.toInt().coerceIn(0, maxIdx)
+        val high = (low + 1).coerceIn(0, maxIdx)
+        val frac = clamped - low
+        return AthleticTheme.lerpColor(accentColors[low], accentColors[high], frac)
+    }
+
+    private fun setProgressInternal(progress: Float) {
+        val maxIdx = (segmentViews.size - 1).coerceAtLeast(0).toFloat()
+        currentProgress = progress.coerceIn(0f, maxIdx)
+        pillDrawable.setColor(sampleColor(currentProgress))
+        val innerW = (width - paddingLeft - paddingRight).coerceAtLeast(0)
+        if (innerW > 0 && segmentViews.isNotEmpty()) {
+            val segW = innerW.toFloat() / segmentViews.size
+            slidingPill.translationX = currentProgress * segW
+        }
+        segmentViews.forEachIndexed { idx, tv ->
+            val frac = (1f - abs(currentProgress - idx)).coerceIn(0f, 1f)
+            tv.setTextColor(
+                AthleticTheme.lerpColor(
+                    AthleticColors.TEXT_SECONDARY,
+                    AthleticColors.TEXT_ON_DARK_ACCENT,
+                    frac
+                )
+            )
+        }
+    }
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        val innerW = (right - left - paddingLeft - paddingRight).coerceAtLeast(0)
+        val innerH = (bottom - top - paddingTop - paddingBottom).coerceAtLeast(0)
+        if (segmentViews.isNotEmpty() && innerW > 0 && innerH > 0) {
+            val pillW = (innerW.toFloat() / segmentViews.size).roundToInt()
+            slidingPill.measure(
+                MeasureSpec.makeMeasureSpec(pillW, MeasureSpec.EXACTLY),
+                MeasureSpec.makeMeasureSpec(innerH, MeasureSpec.EXACTLY)
+            )
+            slidingPill.layout(paddingLeft, paddingTop, paddingLeft + pillW, paddingTop + innerH)
+            setProgressInternal(currentProgress)
+        }
+    }
+
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = ev.x
+                downY = ev.y
+                lastX = ev.x
+                startProgress = currentProgress
+                isScrubbing = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = abs(ev.x - downX)
+                val dy = abs(ev.y - downY)
+                if (dx > touchSlop && dx > dy) {
+                    isScrubbing = true
+                    lastX = ev.x
+                    pillAnimator?.cancel()
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> return true
+            MotionEvent.ACTION_MOVE -> {
+                if (!isScrubbing) {
+                    val dx = abs(ev.x - downX)
+                    val dy = abs(ev.y - downY)
+                    if (dx > touchSlop && dx > dy) {
+                        isScrubbing = true
+                        lastX = ev.x
+                        pillAnimator?.cancel()
+                        parent?.requestDisallowInterceptTouchEvent(true)
+                    }
+                }
+                if (isScrubbing) {
+                    val innerW = (width - paddingLeft - paddingRight).coerceAtLeast(1)
+                    val segW = innerW.toFloat() / segmentViews.size.coerceAtLeast(1)
+                    val delta = (ev.x - lastX) / segW
+                    lastX = ev.x
+                    setProgressInternal(currentProgress + delta)
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (isScrubbing) {
+                    isScrubbing = false
+                    val lastIdx = (segmentViews.size - 1).coerceAtLeast(0)
+                    val moved = currentProgress - startProgress
+                    val target = when {
+                        moved > 0.22f && moved < 0.5f -> (startProgress.roundToInt() + 1).coerceIn(0, lastIdx)
+                        moved < -0.22f && moved > -0.5f -> (startProgress.roundToInt() - 1).coerceIn(0, lastIdx)
+                        else -> currentProgress.roundToInt().coerceIn(0, lastIdx)
+                    }
+                    selectSegment(target, animate = true)
+                    onSegmentSelected(target)
+                }
+            }
+        }
+        return true
     }
 }

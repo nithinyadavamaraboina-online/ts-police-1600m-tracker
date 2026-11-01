@@ -17,16 +17,20 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.RecyclerView
+import androidx.viewpager2.widget.ViewPager2
 import com.tspolice.runtracker.data.RunRepository
 import com.tspolice.runtracker.domain.ComparisonDayScope
 import com.tspolice.runtracker.domain.DailyActivitySummary
@@ -82,7 +86,10 @@ class MainActivity : AppCompatActivity() {
     private var lastHealthSyncElapsedMs = -120_000L
     private var lastSamsungRenderKey = ""
 
-    // Tracker sub-tab: 0 = Today (All-Day Auto), 1 = 1.6K PT Trial, 2 = 400m Intervals
+    // Main tab & Tracker sub-tab: 0 = Today (All-Day Auto), 1 = 1.6K PT Trial, 2 = 400m Intervals
+    private var activeMainTab = 0
+    private var pagerScrollState = ViewPager2.SCROLL_STATE_IDLE
+    private var pendingTabRefreshIndex = -1
     private var activeTrackerSubTab = 0
     private var selectedIntervalReps = 6
     private var lastRenderedPtPhase: PtTrialPhase = PtTrialPhase.IDLE
@@ -97,6 +104,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var headerAudioIcon: VectorIconView
     private lateinit var headerAudioLabel: TextView
     private lateinit var updateBanner: TextView
+    private lateinit var mainViewPager: ViewPager2
+    private lateinit var bottomNavDock: SlidingBottomNavDock
+    private lateinit var backNavCallback: OnBackPressedCallback
     private lateinit var tabTrackerContainer: ScrollView
     private lateinit var tabProgressContainer: ScrollView
     private lateinit var tabGuideContainer: ScrollView
@@ -105,6 +115,7 @@ class MainActivity : AppCompatActivity() {
     // Tab 1: Banners, Sub-Tab Switcher & Containers
     private lateinit var permissionBanner: LinearLayout
     private lateinit var batteryGuardBanner: LinearLayout
+    private lateinit var trackerSegmentedBar: SlidingSegmentedBar
     private lateinit var subTabTodayBtn: TextView
     private lateinit var subTabPtBtn: TextView
     private lateinit var subTabIntervalsBtn: TextView
@@ -283,9 +294,20 @@ class MainActivity : AppCompatActivity() {
             healthSyncStatus = HealthSyncStatus.SYNCED
         }
 
+        backNavCallback = object : OnBackPressedCallback(false) {
+            override fun handleOnBackPressed() {
+                if (activeMainTab != 0) {
+                    selectTab(0, smooth = true)
+                } else if (activeTrackerSubTab != 0 && !currentlyRecording) {
+                    selectTrackerSubTab(0, animate = true)
+                }
+            }
+        }
+        onBackPressedDispatcher.addCallback(this, backNavCallback)
+
         setContentView(buildRootLayout())
-        selectTab(0)
-        selectTrackerSubTab(0)
+        selectTab(0, smooth = false)
+        selectTrackerSubTab(0, animate = false)
         refreshSettingsHighlights()
         refreshTuningStatusLabels()
         refreshCachedDailyHistory(forceRender = true)
@@ -480,67 +502,145 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(updateBanner)
 
-        // Content Frame
-        val contentFrame = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-        }
+        // Fluid Horizontal Page Pager (Tracker <-> Progress <-> Coach & Lab)
         tabTrackerContainer = buildTrackerTab()
         tabProgressContainer = buildProgressTab()
         tabGuideContainer = buildGuideAndSensorsTab()
+        val pages = listOf(tabTrackerContainer, tabProgressContainer, tabGuideContainer)
 
-        contentFrame.addView(tabTrackerContainer)
-        contentFrame.addView(tabProgressContainer)
-        contentFrame.addView(tabGuideContainer)
-        root.addView(contentFrame)
+        mainViewPager = ViewPager2(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            offscreenPageLimit = 2
+            adapter = object : RecyclerView.Adapter<MainPageViewHolder>() {
+                override fun getItemCount(): Int = pages.size
 
-        // Contoured AMOLED Stadium-Capsule Bottom Navigation Dock
+                override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): MainPageViewHolder {
+                    val host = FrameLayout(parent.context).apply {
+                        layoutParams = ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                    }
+                    return MainPageViewHolder(host)
+                }
+
+                override fun onBindViewHolder(holder: MainPageViewHolder, position: Int) {
+                    val pageView = pages[position]
+                    (pageView.parent as? ViewGroup)?.removeView(pageView)
+                    pageView.visibility = View.VISIBLE
+                    pageView.layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    holder.host.removeAllViews()
+                    holder.host.addView(pageView)
+                }
+            }
+            (getChildAt(0) as? RecyclerView)?.overScrollMode = View.OVER_SCROLL_NEVER
+            setPageTransformer { page, position ->
+                val clamped = abs(position).coerceIn(0f, 1f)
+                page.alpha = 1f - 0.14f * clamped
+            }
+        }
+        root.addView(mainViewPager)
+
+        // Contoured AMOLED Stadium-Capsule Bottom Navigation Dock (120Hz sliding pill + thumb scrubbing)
         val bottomDockHost = FrameLayout(this).apply {
             setBackgroundColor(AthleticColors.BG_CANVAS)
             setPadding(dp(16), dp(6), dp(16), dp(10))
-        }
-        val bottomBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = AthleticTheme.gradientCard(
-                this@MainActivity,
-                topColor = 0xFF151519.toInt(),
-                bottomColor = 0xFF0C0C10.toInt(),
-                borderColor = AthleticColors.BORDER_STRONG,
-                radiusDp = 32f,
-                strokeDp = 1f
-            )
-            setPadding(dp(5), dp(5), dp(5), dp(5))
-            elevation = dp(8).toFloat()
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
         }
         val navSpec = listOf(
             IconKind.NAV_TRACKER to "Tracker",
             IconKind.NAV_PROGRESS to "Progress",
             IconKind.NAV_SETTINGS to "Coach & Lab"
         )
-        navSpec.forEachIndexed { index, (icon, label) ->
-            val tabView = BottomNavTabView(this, icon, label).apply {
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                setOnClickListener { selectTab(index) }
+        bottomNavDock = SlidingBottomNavDock(this, navSpec) { index ->
+            selectTab(index, smooth = true)
+        }.apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            onScrubStart = {
+                if (!mainViewPager.isFakeDragging) {
+                    mainViewPager.beginFakeDrag()
+                }
             }
-            navTabViews.add(tabView)
-            bottomBar.addView(tabView)
+            onScrubDelta = { deltaProgress ->
+                if (mainViewPager.isFakeDragging && mainViewPager.width > 0) {
+                    val cur = currentProgress
+                    val clampedNext = (cur + deltaProgress).coerceIn(0f, (pages.size - 1).toFloat())
+                    val effectiveDelta = clampedNext - cur
+                    if (abs(effectiveDelta) > 0.0005f) {
+                        mainViewPager.fakeDragBy(-effectiveDelta * mainViewPager.width)
+                    }
+                }
+            }
+            onScrubEnd = { targetIndex ->
+                if (mainViewPager.isFakeDragging) {
+                    mainViewPager.endFakeDrag()
+                }
+                selectTab(targetIndex, smooth = true)
+            }
         }
-        bottomDockHost.addView(bottomBar)
+        navTabViews.clear()
+        navTabViews.addAll(bottomNavDock.tabViews)
+
+        mainViewPager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
+            override fun onPageScrolled(position: Int, positionOffset: Float, positionOffsetPixels: Int) {
+                bottomNavDock.setScrollProgress(position + positionOffset)
+            }
+
+            override fun onPageSelected(position: Int) {
+                activeMainTab = position
+                syncBackCallbackEnabled()
+                if (pagerScrollState == ViewPager2.SCROLL_STATE_IDLE) {
+                    performTabDataRefresh(position)
+                } else {
+                    pendingTabRefreshIndex = position
+                }
+            }
+
+            override fun onPageScrollStateChanged(state: Int) {
+                pagerScrollState = state
+                if (state == ViewPager2.SCROLL_STATE_IDLE && pendingTabRefreshIndex >= 0) {
+                    val idx = pendingTabRefreshIndex
+                    pendingTabRefreshIndex = -1
+                    performTabDataRefresh(idx)
+                }
+            }
+        })
+
+        bottomDockHost.addView(bottomNavDock)
         root.addView(bottomDockHost)
         return root
     }
 
-    private fun selectTab(index: Int) {
-        tabTrackerContainer.visibility = if (index == 0) View.VISIBLE else View.GONE
-        tabProgressContainer.visibility = if (index == 1) View.VISIBLE else View.GONE
-        tabGuideContainer.visibility = if (index == 2) View.VISIBLE else View.GONE
+    private class MainPageViewHolder(val host: FrameLayout) : RecyclerView.ViewHolder(host)
 
-        navTabViews.forEachIndexed { i, tv -> tv.setActive(i == index) }
+    private fun syncBackCallbackEnabled() {
+        if (::backNavCallback.isInitialized) {
+            backNavCallback.isEnabled = activeMainTab != 0 || (activeTrackerSubTab != 0 && !currentlyRecording)
+        }
+    }
 
+    private fun selectTab(index: Int, smooth: Boolean = true) {
+        val clamped = index.coerceIn(0, 2)
+        activeMainTab = clamped
+        syncBackCallbackEnabled()
+        if (mainViewPager.currentItem != clamped) {
+            mainViewPager.setCurrentItem(clamped, smooth)
+            if (!smooth) {
+                bottomNavDock.setScrollProgress(clamped.toFloat())
+                performTabDataRefresh(clamped)
+            }
+        } else if (!smooth || pagerScrollState == ViewPager2.SCROLL_STATE_IDLE) {
+            bottomNavDock.setScrollProgress(clamped.toFloat())
+            performTabDataRefresh(clamped)
+        }
+    }
+
+    private fun performTabDataRefresh(index: Int) {
         if (index == 0) {
             refreshTuningStatusLabels()
             refreshCachedDailyHistory(forceRender = true)
@@ -556,24 +656,71 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun selectTrackerSubTab(subIndex: Int) {
-        activeTrackerSubTab = subIndex.coerceIn(0, 2)
-        openAllDayContainer.visibility = if (activeTrackerSubTab == 0) View.VISIBLE else View.GONE
-        ptTrialContainer.visibility = if (activeTrackerSubTab == 1) View.VISIBLE else View.GONE
-        intervalsContainer.visibility = if (activeTrackerSubTab == 2) View.VISIBLE else View.GONE
+    private fun selectTrackerSubTab(subIndex: Int, animate: Boolean = true, fromBar: Boolean = false) {
+        val nextIndex = subIndex.coerceIn(0, 2)
+        val prevIndex = activeTrackerSubTab
+        activeTrackerSubTab = nextIndex
+        syncBackCallbackEnabled()
 
-        fun styleSeg(btn: TextView, active: Boolean, activeColor: Int) {
-            if (active) {
-                btn.background = AthleticTheme.solidPill(this, activeColor, activeColor, 11f, 0f)
-                btn.setTextColor(AthleticColors.TEXT_ON_DARK_ACCENT)
-            } else {
-                btn.background = null
-                btn.setTextColor(AthleticColors.TEXT_SECONDARY)
+        if (!fromBar) {
+            trackerSegmentedBar.selectSegment(nextIndex, animate = animate)
+        }
+
+        val views = listOf(openAllDayContainer, ptTrialContainer, intervalsContainer)
+        views.forEach { it.animate().cancel() }
+
+        if (!animate || prevIndex == nextIndex || !tabTrackerContainer.isLaidOut) {
+            views.forEachIndexed { idx, v ->
+                v.translationX = 0f
+                v.alpha = 1f
+                v.visibility = if (idx == nextIndex) View.VISIBLE else View.GONE
+            }
+            return
+        }
+
+        val dir = if (nextIndex > prevIndex) 1f else -1f
+        val incoming = views[nextIndex]
+        val outgoing = views[prevIndex]
+        views.forEachIndexed { idx, v ->
+            if (idx != nextIndex && idx != prevIndex) {
+                v.visibility = View.GONE
+                v.translationX = 0f
+                v.alpha = 1f
             }
         }
-        styleSeg(subTabTodayBtn, activeTrackerSubTab == 0, AthleticColors.EMERALD_BRIGHT)
-        styleSeg(subTabPtBtn, activeTrackerSubTab == 1, AthleticColors.CYAN_BRIGHT)
-        styleSeg(subTabIntervalsBtn, activeTrackerSubTab == 2, AthleticColors.AMBER_BRIGHT)
+
+        val slideInPx = dp(34f).toFloat() * dir
+        val slideOutPx = -dp(24f).toFloat() * dir
+
+        incoming.visibility = View.VISIBLE
+        incoming.alpha = 0f
+        incoming.translationX = slideInPx
+        incoming.animate()
+            .translationX(0f)
+            .alpha(1f)
+            .setDuration(230L)
+            .setInterpolator(DecelerateInterpolator(1.7f))
+            .withEndAction {
+                incoming.translationX = 0f
+                incoming.alpha = 1f
+            }
+            .start()
+
+        outgoing.animate()
+            .translationX(slideOutPx)
+            .alpha(0f)
+            .setDuration(190L)
+            .setInterpolator(DecelerateInterpolator(1.5f))
+            .withEndAction {
+                outgoing.visibility = View.GONE
+                outgoing.translationX = 0f
+                outgoing.alpha = 1f
+            }
+            .start()
+
+        if (tabTrackerContainer.scrollY > dp(100)) {
+            tabTrackerContainer.smoothScrollTo(0, 0)
+        }
     }
 
     // =========================================================================
@@ -655,45 +802,44 @@ class MainActivity : AppCompatActivity() {
         )
         col.addView(batteryGuardBanner)
 
-        // 3. Recessed 3-Segment Capsule Switcher: [Today] | [1.6K Trial] | [Intervals]
-        val segTrack = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            background = AthleticTheme.solidPill(
-                this@MainActivity,
-                AthleticColors.SURFACE_RECESSED,
-                AthleticColors.BORDER_SUBTLE,
-                14f
-            )
-            setPadding(dp(4), dp(4), dp(4), dp(4))
+        // 3. Fluid Sliding 3-Segment Capsule Switcher: [Today] | [1.6K Trial] | [400m Coach]
+        trackerSegmentedBar = SlidingSegmentedBar(
+            this,
+            labels = listOf("Today", "1.6K Trial", "400m Coach"),
+            accentColors = intArrayOf(
+                AthleticColors.EMERALD_BRIGHT,
+                AthleticColors.CYAN_BRIGHT,
+                AthleticColors.AMBER_BRIGHT
+            ),
+            onSegmentSelected = { idx ->
+                selectTrackerSubTab(idx, animate = true, fromBar = true)
+            }
+        ).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = dp(14) }
         }
-        fun segItem(label: String, idx: Int) = TextView(this).apply {
-            text = label
-            gravity = Gravity.CENTER
-            textSize = 12.5f
-            typeface = AthleticTheme.FONT_SANS_BOLD
-            setPadding(dp(6), dp(10), dp(6), dp(10))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { selectTrackerSubTab(idx) }
-        }
-        subTabTodayBtn = segItem("Today", 0)
-        subTabPtBtn = segItem("1.6K Trial", 1)
-        subTabIntervalsBtn = segItem("400m Coach", 2)
-        segTrack.addView(subTabTodayBtn)
-        segTrack.addView(subTabPtBtn)
-        segTrack.addView(subTabIntervalsBtn)
-        col.addView(segTrack)
+        subTabTodayBtn = trackerSegmentedBar.segmentViews[0]
+        subTabPtBtn = trackerSegmentedBar.segmentViews[1]
+        subTabIntervalsBtn = trackerSegmentedBar.segmentViews[2]
+        col.addView(trackerSegmentedBar)
 
+        val subPagesFrame = FrameLayout(this).apply {
+            clipChildren = false
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
         openAllDayContainer = buildOpenAllDaySubView()
         ptTrialContainer = buildPtTrialSubView()
         intervalsContainer = buildIntervalsSubView()
 
-        col.addView(openAllDayContainer)
-        col.addView(ptTrialContainer)
-        col.addView(intervalsContainer)
+        subPagesFrame.addView(openAllDayContainer)
+        subPagesFrame.addView(ptTrialContainer)
+        subPagesFrame.addView(intervalsContainer)
+        col.addView(subPagesFrame)
 
         scroll.addView(col)
         return scroll
@@ -2187,6 +2333,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderLiveTelemetry(snap: LiveTelemetry) {
         currentlyRecording = snap.isRecording
+        syncBackCallbackEnabled()
         refreshHeaderAudioPill()
         val targetSec = repository.targetTimeSec
         val daily = snap.dailySummary

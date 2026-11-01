@@ -1,8 +1,8 @@
 {
-    "versionCode":  21,
-    "versionName":  "1.0.20",
+    "versionCode":  22,
+    "versionName":  "1.0.21",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "74a2ba62731880a798d21a691468ce95593bb9e7df5b66e757db596934258fdd",
-    "changelog":  "Fix bottom navigation stretched icons and left-aligned labels; upgrade bottom nav to a sleek AMOLED stadium-capsule dock.",
-    "publishedAt":  "2026-11-01T06:44:47Z"
+    "sha256":  "68e69ad0ce982d42eb67d4a41485c6fa083222492468ec9392fc64d70a7275ed",
+    "changelog":  "Add fluid 120Hz horizontal swipe navigation across pages, continuous sliding pill + thumb-scrubbing on bottom navigation dock, and animated sliding sub-tab switcher.",
+    "publishedAt":  "2026-11-01T07:08:08Z"
 }
