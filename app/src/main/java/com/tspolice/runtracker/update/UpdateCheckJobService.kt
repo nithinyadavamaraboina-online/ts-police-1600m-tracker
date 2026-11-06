@@ -28,15 +28,17 @@ class UpdateCheckJobService : JobService() {
 
         scope.launch {
             runCatching {
-                val repo = RunRepository(appCtx)
-                val telemetry = TuningTelemetryManager(
-                    context = appCtx,
-                    repository = repo,
-                    healthSyncManager = SamsungHealthSyncManager(appCtx, repo)
-                )
-                val handledPull = telemetry.checkAndHandlePendingPullCommands { null }
-                if (!handledPull) {
-                    telemetry.maybeAutoSyncIfDue(reason = "job_scheduler_background")
+                val repo = RunRepository.getInstance(appCtx)
+                if (repo.remoteDiagnosticsOptIn) {
+                    val telemetry = TuningTelemetryManager(
+                        context = appCtx,
+                        repository = repo,
+                        healthSyncManager = SamsungHealthSyncManager(appCtx, repo)
+                    )
+                    val handledPull = telemetry.checkAndHandlePendingPullCommands { null }
+                    if (!handledPull) {
+                        telemetry.maybeAutoSyncIfDue(reason = "job_scheduler_background")
+                    }
                 }
             }
             val updater = AppUpdater(appCtx)

@@ -26,6 +26,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -87,7 +88,8 @@ class TuningTelemetryManager(
     suspend fun pullBuildAndUploadTuningBundle(
         liveTodayOverride: DailyActivitySummary? = null,
         triggerReason: String = "manual",
-        requestId: String? = null
+        requestId: String? = null,
+        allowCloudUpload: Boolean = repository.remoteDiagnosticsOptIn
     ): TuningPullAndUploadResult = uploadMutex.withLock {
         val deepSamsung = healthSyncManager.pullFineTuningDataset()
         val zone = ZoneId.systemDefault()
@@ -196,7 +198,7 @@ class TuningTelemetryManager(
         val intradayArr = JSONArray()
         for (dIso in listOf(yesterdayIso, todayIso)) {
             for (hr in 0..23) {
-                val bKey = String.format("%sT%02d", dIso, hr)
+                val bKey = String.format(Locale.US, "%sT%02d", dIso, hr)
                 val trkH = hourlyTrackerMap[bKey]
                 val samH = effectiveSamsungHourly[bKey]
                 if (trkH != null || (samH != null && (samH.steps > 0 || samH.distanceMeters > 1.0))) {
@@ -317,9 +319,13 @@ class TuningTelemetryManager(
         val outFile = File(outDir, LOCAL_EXPORT_FILENAME)
         runCatching { outFile.writeText(jsonText, Charsets.UTF_8) }
 
-        // Upload to cloud fine-tuning channel
-        val uploadPair = uploadBundleToCloud(jsonText, todayIso, triggerReason, requestId)
-        val nowClock = Instant.now().atZone(zone).format(DateTimeFormatter.ofPattern("dd MMM HH:mm"))
+        // Upload to cloud fine-tuning channel strictly when user has explicitly opted in
+        val uploadPair = if (allowCloudUpload) {
+            uploadBundleToCloud(jsonText, todayIso, triggerReason, requestId)
+        } else {
+            null
+        }
+        val nowClock = Instant.now().atZone(zone).format(DateTimeFormatter.ofPattern("dd MMM HH:mm", Locale.US))
 
         return if (uploadPair != null) {
             val (code, url) = uploadPair
@@ -340,7 +346,8 @@ class TuningTelemetryManager(
                 deepSamsung = deepSamsung
             )
         } else {
-            val summaryLine = "Saved locally $nowClock (Offline — tap Share JSON)"
+            val statusReason = if (allowCloudUpload) "Offline — tap Share JSON" else "Cloud sync OFF — tap Share JSON"
+            val summaryLine = "Saved locally $nowClock ($statusReason)"
             repository.lastTuningSyncSummary = summaryLine
             TuningPullAndUploadResult(
                 uploadedToCloud = false,
@@ -356,11 +363,11 @@ class TuningTelemetryManager(
     }
 
     /**
-     * Hands-free automatic cloud telemetry sync:
+     * Opt-in automatic cloud telemetry sync (strictly disabled unless `remoteDiagnosticsOptIn == true`):
      *  - Uploads immediately on `force == true` (e.g. finished 1.6K/400m/Open run or live remote pull request)
      *  - Uploads automatically on the first wakeup of each calendar day (`lastTuningSyncDateIso != todayIso`)
      *  - Uploads silently on foreground app open (`reason == "app_open"`) if >=8m elapsed & >=20 new steps (or >=40m)
-     *  - Uploads every 90m on active step days or every 5h heartbeat in the background so cloud relay stays 100% live!
+     *  - Uploads every 90m on active step days or every 5h heartbeat in the background when opted in.
      */
     suspend fun maybeAutoSyncIfDue(
         liveTodayOverride: DailyActivitySummary? = null,
@@ -368,6 +375,7 @@ class TuningTelemetryManager(
         force: Boolean = false,
         requestId: String? = null
     ): TuningPullAndUploadResult? {
+        if (!repository.remoteDiagnosticsOptIn) return null
         val nowEpochMs = System.currentTimeMillis()
         val todayIso = LocalDate.now(ZoneId.systemDefault()).toString()
         val currentSteps = (liveTodayOverride?.takeIf { it.dateIso == todayIso }
@@ -390,38 +398,41 @@ class TuningTelemetryManager(
         return pullBuildAndUploadTuningBundle(
             liveTodayOverride = liveTodayOverride,
             triggerReason = reason,
-            requestId = requestId
+            requestId = requestId,
+            allowCloudUpload = true
         )
     }
 
     /**
-     * Polls `CLOUD_COMMAND_CHANNEL` once (used by JobScheduler & service startup) for any recent `PULL_NOW` request.
+     * Polls `CLOUD_COMMAND_CHANNEL` once (strictly when `remoteDiagnosticsOptIn == true`).
      */
     suspend fun checkAndHandlePendingPullCommands(
         liveTodayProvider: () -> DailyActivitySummary?
     ): Boolean {
+        if (!repository.remoteDiagnosticsOptIn) return false
         val pending = runCatching { fetchLatestUnhandledPullCommand() }.getOrNull() ?: return false
         val (reqId, cmdEpochSec) = pending
         markPullCommandHandled(reqId, cmdEpochSec)
         val res = pullBuildAndUploadTuningBundle(
             liveTodayOverride = liveTodayProvider(),
             triggerReason = "remote_pull_poll",
-            requestId = reqId
+            requestId = reqId,
+            allowCloudUpload = true
         )
         return res.uploadedToCloud
     }
 
     /**
-     * Long-lived, near-zero-battery streaming command listener run on a single daemon IO thread inside
-     * [com.tspolice.runtracker.service.RunTrackingService]. Wakes within ~1 second whenever the PC runs
-     * `scripts/pull-tuning-data.ps1` and triggers an immediate hands-free snapshot upload!
+     * Opt-in streaming command listener run inside [com.tspolice.runtracker.service.RunTrackingService]
+     * strictly when `remoteDiagnosticsOptIn == true` and not in low-power standby.
      */
     fun listenForRemotePullCommandsBlocking(
         shouldContinue: () -> Boolean,
         onPullCommand: (requestId: String) -> Unit
     ) {
+        if (!repository.remoteDiagnosticsOptIn) return
         var backoffMs = 5_000L
-        while (shouldContinue()) {
+        while (shouldContinue() && repository.remoteDiagnosticsOptIn) {
             var conn: HttpURLConnection? = null
             try {
                 conn = (URL(COMMAND_STREAM_URL).openConnection() as HttpURLConnection).apply {
@@ -433,7 +444,7 @@ class TuningTelemetryManager(
                 if (conn.responseCode in 200..299) {
                     backoffMs = 5_000L
                     conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
-                        while (shouldContinue()) {
+                        while (shouldContinue() && repository.remoteDiagnosticsOptIn) {
                             val line = reader.readLine() ?: break
                             val parsed = parseRemotePullCommandLine(line) ?: continue
                             val (reqId, timeSec) = parsed
@@ -451,7 +462,7 @@ class TuningTelemetryManager(
             } finally {
                 runCatching { conn?.disconnect() }
             }
-            if (!shouldContinue()) break
+            if (!shouldContinue() || !repository.remoteDiagnosticsOptIn) break
             try {
                 Thread.sleep(backoffMs)
             } catch (_: InterruptedException) {
@@ -625,7 +636,7 @@ class TuningTelemetryManager(
             val denom = maxOf(combSam.steps, combTrk.totalSteps, 1)
             val matchPct = 100.0 * (1.0 - abs(stepDiff).toDouble() / denom)
             if (matchPct >= 93.0) {
-                recommendations.add(String.format("2-Day Step Accuracy is strong (%.1f%% match: %,d vs %,d steps).", matchPct, combTrk.totalSteps, combSam.steps))
+                recommendations.add(String.format(Locale.US, "2-Day Step Accuracy is strong (%.1f%% match: %,d vs %,d steps).", matchPct, combTrk.totalSteps, combSam.steps))
             } else if (stepDiff < -300) {
                 recommendations.add("Samsung has ${-stepDiff} more steps over 2 days (likely Watch / pre-app walking or background sleep) — use Align or check Unrestricted Battery.")
             } else if (stepDiff > 300) {
@@ -633,10 +644,10 @@ class TuningTelemetryManager(
             }
         }
         if (observedWalkStrideM != null) {
-            recommendations.add(String.format("Observed Samsung walk stride: %.2f m/step (current scale %.2fx).", observedWalkStrideM, strideScale))
+            recommendations.add(String.format(Locale.US, "Observed Samsung walk stride: %.2f m/step (current scale %.2fx).", observedWalkStrideM, strideScale))
         }
         if (observedRunStrideM != null) {
-            recommendations.add(String.format("Observed Samsung run-hour stride: %.2f m/step.", observedRunStrideM))
+            recommendations.add(String.format(Locale.US, "Observed Samsung run-hour stride: %.2f m/step.", observedRunStrideM))
         }
         if (totalVehicleSec >= 15.0) {
             recommendations.add("Bike/Vehicle filter cleanly rejected ${TsPoliceBenchmark.formatDuration(totalVehicleSec)} of non-foot travel.")
@@ -661,6 +672,7 @@ class TuningTelemetryManager(
             appendLine("• 2-Day Steps: Tracker ${combTrk.totalSteps} vs Samsung ${combSam?.steps ?: 0}")
             appendLine(
                 String.format(
+                    Locale.US,
                     "• 2-Day Distance: Tracker %.2f km vs Samsung %.2f km",
                     combTrk.totalDistanceMeters / 1000.0,
                     (combSam?.distanceMeters ?: 0.0) / 1000.0

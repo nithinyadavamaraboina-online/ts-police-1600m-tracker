@@ -64,8 +64,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.ZoneId
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArraySet
 import kotlin.math.abs
@@ -92,7 +94,10 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         private const val MAX_ACCEPTABLE_GPS_ACCURACY_M = 26f
         private const val MAX_PT_TRIAL_GPS_ACCURACY_M = 24f
         private const val MAX_PLAUSIBLE_VEHICLE_SPEED_MPS = 55.0 // 198 km/h — keeps real bike/vehicle GPS speeds visible
+        private const val STANDBY_SENSOR_BATCH_LATENCY_US = 3_000_000
+        private const val WORKOUT_CKPT_PREFS = "ts_police_active_workout_ckpt"
         const val ACTION_MUTE_POCKET_AUDIO = "com.tspolice.runtracker.ACTION_MUTE_POCKET_AUDIO"
+        const val EXTRA_BOOT_AUTOSTART = "com.tspolice.runtracker.EXTRA_BOOT_AUTOSTART"
     }
 
     inner class LocalBinder : Binder() {
@@ -135,6 +140,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var stepsAtLastStepCounter: Int = 0
     private var uiForegroundVisible = false
     private var isInForeground = false
+    private var startedFromBootBackground = false
+    private var lastForegroundServiceType = 0
+    private var lastNotifiedSignature = ""
 
     // Smart 24/7 Battery Duty-Cycling state
     private var isLowPowerStandby = false
@@ -148,6 +156,11 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var ptJogRunConfirmMs = 0L
     private var ptLaunchBufferSec = 0.0
     private var ptLaunchBufferMeters = 0.0
+    private var trialStartElapsedMs: Long = 0L
+    private var trialInitialCreditSec: Double = 0.0
+    private var lastTrialStepDtSec: Double = 0.2
+    private var sessionTrackScale: Double = 1.0
+    private var lastWorkoutCheckpointElapsedMs: Long = 0L
     private var announcedFinal200mKick = false
     private var lastAnnouncedState: MotionState = MotionState.STANDING
     private var lastMilestoneSpeechMs: Long = -10_000L
@@ -232,9 +245,11 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private val preVehicleCheckpoints = ArrayDeque<PreVehicleCheckpoint>()
     private var lastCheckpointSampleMs = 0L
     private var wasInVehicleLatchLastTick = false
+    private var wasInVehicleOrCooldownLastTick = false
 
     // Automatic Open Jog/Run bout detector (logs >= 600m casual jog/runs into 7:15 Progress & ETA automatically!)
     private var openBoutStartedWallMs = 0L
+    private var openBoutStartedElapsedMs = 0L
     private var openBoutJogRunMeters = 0.0
     private var openBoutActiveSec = 0.0
     private var openBoutPausedSec = 0.0
@@ -252,7 +267,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     private var lastValidLocationElapsedMs: Long = 0L
     private var lastValidBearingDeg: Float? = null
     private var lastLocationElapsedMs: Long = 0L
+    private var lastPureGpsFixElapsedMs: Long = -100_000L
     private var lastGpsDistanceContributionMs: Long = -100_000L
+    private var fallbackMetersCreditedSinceLastGps: Double = 0.0
     private var smoothedGpsSpeedMps: Double = 0.0
     private var latestGpsAccuracyM: Float? = null
     private var lastNotificationUpdateMs: Long = 0L
@@ -275,7 +292,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     override fun onCreate() {
         super.onCreate()
         serviceAlive = true
-        repository = RunRepository(this)
+        repository = RunRepository.getInstance(applicationContext)
         tuningTelemetryManager = TuningTelemetryManager(
             context = applicationContext,
             repository = repository,
@@ -326,15 +343,16 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             }
         }
 
-        startRemotePullCommandListener()
+        syncRemoteDiagnosticsSetting()
         mainHandler.postDelayed({
-            if (serviceAlive) {
+            if (serviceAlive && repository.remoteDiagnosticsOptIn) {
                 triggerBackgroundAutoTelemetryIfDue(reason = "service_startup", checkPendingCommands = true)
             }
         }, 5_000L)
     }
 
     override fun onBind(intent: Intent?): IBinder {
+        startedFromBootBackground = false
         startPassiveTelemetry()
         syncPocketForegroundAndWakeLock()
         return binder
@@ -343,9 +361,17 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_MUTE_POCKET_AUDIO) {
             repository.pocketAudioMode = PocketAudioMode.MUTED
+            lastNotifiedSignature = ""
             syncPocketForegroundAndWakeLock()
             broadcastTelemetry()
             return START_STICKY
+        }
+        if (intent?.getBooleanExtra(EXTRA_BOOT_AUTOSTART, false) == true) {
+            startedFromBootBackground = true
+        }
+        if (intent == null) {
+            // OS restarted service via START_STICKY after memory reclaim — recover in-progress workout if any
+            restoreActiveWorkoutCheckpointIfNeeded()
         }
         startPassiveTelemetry()
         syncPocketForegroundAndWakeLock()
@@ -356,9 +382,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         serviceAlive = false
         remotePullListenerThread?.interrupt()
         remotePullListenerThread = null
-        serviceScope.cancel()
+        if (isHighPrecisionSessionActive()) {
+            persistActiveWorkoutCheckpoint()
+        }
         flushOpenBoutIfQualified()
-        persistDailySummaryNow()
+        persistDailySummaryNow(async = false)
+        serviceScope.cancel()
         mainHandler.removeCallbacksAndMessages(null)
         unregisterHardwareStreams()
         releaseWakeLockQuietly()
@@ -373,6 +402,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     fun setUiForegroundVisible(visible: Boolean) {
         uiForegroundVisible = visible
         if (visible) {
+            startedFromBootBackground = false
             wakeFromLowPowerStandby()
         }
         syncPocketForegroundAndWakeLock()
@@ -395,8 +425,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         }
 
         val needCpuWakeLock = isHighPrecisionSessionActive() ||
-            repository.pocketAudioMode == PocketAudioMode.ALL_STATES ||
-            (keepForeground && !isLowPowerStandby)
+            (!isLowPowerStandby && (keepForeground || repository.pocketAudioMode == PocketAudioMode.ALL_STATES))
         if (needCpuWakeLock) {
             acquireWakeLockQuietly()
         } else {
@@ -410,6 +439,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         ) return
         isLowPowerStandby = true
         pauseLocationUpdatesOnly()
+        remotePullListenerThread?.interrupt()
+        remotePullListenerThread = null
         registerAccelerometerWithRate(lowPower = true)
         armSignificantMotionWakeSensor()
         syncPocketForegroundAndWakeLock()
@@ -423,10 +454,131 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (isHighPrecisionSessionActive() || uiForegroundVisible) {
             registerLocationIfPermitted()
         }
+        syncRemoteDiagnosticsSetting()
         syncPocketForegroundAndWakeLock()
         mainHandler.removeCallbacks(tickRunnable)
         lastTickElapsedMs = SystemClock.elapsedRealtime()
         mainHandler.post(tickRunnable)
+    }
+
+    private fun persistActiveWorkoutCheckpoint() {
+        val ckpt = getSharedPreferences(WORKOUT_CKPT_PREFS, Context.MODE_PRIVATE)
+        if (ptTrialPhase != PtTrialPhase.RUNNING_TRIAL && intervalPhase == IntervalPhase.IDLE) {
+            ckpt.edit().clear().apply()
+            return
+        }
+        ckpt.edit()
+            .putLong("savedAtWallMs", System.currentTimeMillis())
+            .putString("ptTrialPhase", ptTrialPhase.name)
+            .putLong("sessionStartedWallMs", sessionStartedWallMs)
+            .putFloat("distanceMeters", distanceMeters.toFloat())
+            .putFloat("activeDurationSec", activeDurationSec.toFloat())
+            .putFloat("pausedDurationSec", pausedDurationSec.toFloat())
+            .putFloat("runningSec", runningSec.toFloat())
+            .putFloat("joggingSec", joggingSec.toFloat())
+            .putFloat("walkingSec", walkingSec.toFloat())
+            .putFloat("runningMeters", runningMeters.toFloat())
+            .putFloat("joggingMeters", joggingMeters.toFloat())
+            .putFloat("walkingMeters", walkingMeters.toFloat())
+            .putFloat("maxSpeedMps", maxSpeedMps.toFloat())
+            .putFloat("cadenceSamplesSum", cadenceSamplesSum.toFloat())
+            .putInt("cadenceSamplesCount", cadenceSamplesCount)
+            .putFloat("nextLapBoundaryM", nextLapBoundaryM.toFloat())
+            .putFloat("prevLapCumulativeSec", prevLapCumulativeSec.toFloat())
+            .putFloat("sessionTrackScale", sessionTrackScale.toFloat())
+            .putBoolean("announcedFinal200mKick", announcedFinal200mKick)
+            .putString("splitsJson", RunRepository.encodeSplitsJson(lapSplits))
+            .putString("intervalPhase", intervalPhase.name)
+            .putInt("intervalCurrentRep", intervalCurrentRep)
+            .putInt("intervalTotalReps", intervalTotalReps)
+            .putFloat("intervalRepDistM", intervalRepDistM.toFloat())
+            .putFloat("intervalRepSec", intervalRepSec.toFloat())
+            .putFloat("intervalRestRemainingSec", intervalRestRemainingSec.toFloat())
+            .putFloat("intervalRestDurationSec", intervalRestDurationSec.toFloat())
+            .putFloat("intervalTargetRepSec", intervalTargetRepSec.toFloat())
+            .putLong("intervalStartedWallMs", intervalStartedWallMs)
+            .putFloat("intervalMaxSpeedMps", intervalMaxSpeedMps.toFloat())
+            .putFloat("intervalCadenceSum", intervalCadenceSum.toFloat())
+            .putInt("intervalCadenceCount", intervalCadenceCount)
+            .putString("intervalSplitsCsv", intervalCompletedSplitsSec.joinToString(","))
+            .apply()
+    }
+
+    private fun clearActiveWorkoutCheckpoint() {
+        getSharedPreferences(WORKOUT_CKPT_PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+    }
+
+    private fun restoreActiveWorkoutCheckpointIfNeeded() {
+        if (isHighPrecisionSessionActive()) return
+        val ckpt = getSharedPreferences(WORKOUT_CKPT_PREFS, Context.MODE_PRIVATE)
+        val savedAt = ckpt.getLong("savedAtWallMs", 0L)
+        if (savedAt <= 0L) return
+        val ageMs = System.currentTimeMillis() - savedAt
+        if (ageMs !in 0L..(2L * 60L * 60L * 1000L)) {
+            clearActiveWorkoutCheckpoint()
+            return
+        }
+        val gapSec = ageMs / 1000.0
+        val savedPtPhase = runCatching {
+            PtTrialPhase.valueOf(ckpt.getString("ptTrialPhase", PtTrialPhase.IDLE.name) ?: PtTrialPhase.IDLE.name)
+        }.getOrDefault(PtTrialPhase.IDLE)
+        val savedIntPhase = runCatching {
+            IntervalPhase.valueOf(ckpt.getString("intervalPhase", IntervalPhase.IDLE.name) ?: IntervalPhase.IDLE.name)
+        }.getOrDefault(IntervalPhase.IDLE)
+
+        if (savedPtPhase == PtTrialPhase.RUNNING_TRIAL) {
+            runMode = RunMode.TIMED_1600M
+            ptTrialPhase = PtTrialPhase.RUNNING_TRIAL
+            isRecording = true
+            isAutoStartArmed = false
+            startedFromBootBackground = false
+            sessionStartedWallMs = ckpt.getLong("sessionStartedWallMs", System.currentTimeMillis())
+            distanceMeters = ckpt.getFloat("distanceMeters", 0f).toDouble()
+            val savedActive = ckpt.getFloat("activeDurationSec", 0f).toDouble() + gapSec
+            activeDurationSec = savedActive
+            trialStartElapsedMs = SystemClock.elapsedRealtime()
+            trialInitialCreditSec = savedActive
+            pausedDurationSec = ckpt.getFloat("pausedDurationSec", 0f).toDouble()
+            runningSec = ckpt.getFloat("runningSec", 0f).toDouble()
+            joggingSec = ckpt.getFloat("joggingSec", 0f).toDouble()
+            walkingSec = ckpt.getFloat("walkingSec", 0f).toDouble()
+            runningMeters = ckpt.getFloat("runningMeters", 0f).toDouble()
+            joggingMeters = ckpt.getFloat("joggingMeters", 0f).toDouble()
+            walkingMeters = ckpt.getFloat("walkingMeters", 0f).toDouble()
+            maxSpeedMps = ckpt.getFloat("maxSpeedMps", 0f).toDouble()
+            cadenceSamplesSum = ckpt.getFloat("cadenceSamplesSum", 0f).toDouble()
+            cadenceSamplesCount = ckpt.getInt("cadenceSamplesCount", 0)
+            nextLapBoundaryM = ckpt.getFloat("nextLapBoundaryM", TsPoliceBenchmark.LAP_DISTANCE_M.toFloat()).toDouble()
+            prevLapCumulativeSec = ckpt.getFloat("prevLapCumulativeSec", 0f).toDouble()
+            sessionTrackScale = ckpt.getFloat("sessionTrackScale", 1.0f).toDouble().coerceIn(0.92, 1.08)
+            announcedFinal200mKick = ckpt.getBoolean("announcedFinal200mKick", false)
+            lapSplits.clear()
+            lapSplits.addAll(RunRepository.decodeSplitsJson(ckpt.getString("splitsJson", "").orEmpty()))
+            registerLocationIfPermitted()
+        } else if (savedIntPhase == IntervalPhase.RUNNING_REP || savedIntPhase == IntervalPhase.REST_COUNTDOWN) {
+            startedFromBootBackground = false
+            intervalPhase = savedIntPhase
+            intervalCurrentRep = ckpt.getInt("intervalCurrentRep", 1)
+            intervalTotalReps = ckpt.getInt("intervalTotalReps", 6)
+            intervalRepDistM = ckpt.getFloat("intervalRepDistM", 0f).toDouble()
+            intervalRepSec = ckpt.getFloat("intervalRepSec", 0f).toDouble() +
+                if (savedIntPhase == IntervalPhase.RUNNING_REP) gapSec else 0.0
+            intervalRestDurationSec = ckpt.getFloat("intervalRestDurationSec", 90f).toDouble()
+            intervalRestRemainingSec = if (savedIntPhase == IntervalPhase.REST_COUNTDOWN) {
+                (ckpt.getFloat("intervalRestRemainingSec", 0f).toDouble() - gapSec).coerceAtLeast(1.0)
+            } else 0.0
+            intervalTargetRepSec = ckpt.getFloat("intervalTargetRepSec", 104f).toDouble()
+            intervalStartedWallMs = ckpt.getLong("intervalStartedWallMs", System.currentTimeMillis())
+            intervalMaxSpeedMps = ckpt.getFloat("intervalMaxSpeedMps", 0f).toDouble()
+            intervalCadenceSum = ckpt.getFloat("intervalCadenceSum", 0f).toDouble()
+            intervalCadenceCount = ckpt.getInt("intervalCadenceCount", 0)
+            intervalCompletedSplitsSec.clear()
+            ckpt.getString("intervalSplitsCsv", "").orEmpty()
+                .split(",")
+                .mapNotNull { it.trim().toDoubleOrNull() }
+                .forEach { intervalCompletedSplitsSec.add(it) }
+            registerLocationIfPermitted()
+        }
     }
 
     private fun armSignificantMotionWakeSensor() {
@@ -483,8 +635,13 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         val today = LocalDate.now().toString()
         if (dailyDateIso == today) return
         if (dailyDateIso.isNotBlank() && dailyDirty) {
-            flushOpenBoutIfQualified()
-            persistDailySummaryNow()
+            // Defer flushing an active open bout if the runner is actively jogging/running across midnight!
+            val activelyRunningAtMidnight = openBoutStartedWallMs > 0L &&
+                (gaitClassifier.currentState().isJogOrRun() || openBoutIdleMs < 15_000L)
+            if (!activelyRunningAtMidnight) {
+                flushOpenBoutIfQualified()
+            }
+            persistDailySummaryNow(async = true)
         }
         val stored = repository.getDailyActivity(today)
         dailyDateIso = today
@@ -508,14 +665,19 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         val nowDt = LocalDateTime.now()
         val dIso = nowDt.toLocalDate().toString()
         val hr = nowDt.hour
-        val bKey = String.format("%sT%02d", dIso, hr)
+        val bKey = String.format(Locale.US, "%sT%02d", dIso, hr)
         val existing = currentHourlyBucket
         if (existing != null && existing.bucketKey == bKey) {
             return existing
         }
         if (existing != null && hourlyDirty) {
-            runCatching { repository.upsertHourlySensorBucket(existing) }
+            val snapToSave = existing
             hourlyDirty = false
+            if (serviceAlive) {
+                serviceScope.launch { runCatching { repository.upsertHourlySensorBucket(snapToSave) } }
+            } else {
+                runCatching { repository.upsertHourlySensorBucket(snapToSave) }
+            }
         }
         val loaded = runCatching { repository.getHourlySensorBucket(bKey, dIso, hr) }
             .getOrElse { HourlySensorBucket(bucketKey = bKey, dateIso = dIso, hourOfDay = hr) }
@@ -524,7 +686,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     fun flushTuningBuffersNow() {
-        persistDailySummaryNow()
+        persistDailySummaryNow(async = false)
         currentHourlyBucket?.let { b ->
             runCatching { repository.upsertHourlySensorBucket(b) }
             hourlyDirty = false
@@ -545,18 +707,29 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         isDemo = false
     )
 
-    private fun persistDailySummaryNow() {
+    private fun persistDailySummaryNow(async: Boolean = true) {
         if (dailyDateIso.isBlank()) return
-        runCatching {
-            repository.upsertDailyActivity(currentDailySnapshot())
-            currentHourlyBucket?.let { b ->
-                if (hourlyDirty) {
-                    repository.upsertHourlySensorBucket(b)
-                    hourlyDirty = false
+        val dailySnap = currentDailySnapshot()
+        val bucketSnap = currentHourlyBucket?.takeIf { hourlyDirty }
+        dailyDirty = false
+        hourlyDirty = false
+        lastDailyPersistElapsedMs = SystemClock.elapsedRealtime()
+        if (async && serviceAlive) {
+            serviceScope.launch {
+                runCatching {
+                    repository.upsertDailyActivity(dailySnap)
+                    if (bucketSnap != null) {
+                        repository.upsertHourlySensorBucket(bucketSnap)
+                    }
                 }
             }
-            dailyDirty = false
-            lastDailyPersistElapsedMs = SystemClock.elapsedRealtime()
+        } else {
+            runCatching {
+                repository.upsertDailyActivity(dailySnap)
+                if (bucketSnap != null) {
+                    repository.upsertHourlySensorBucket(bucketSnap)
+                }
+            }
         }
     }
 
@@ -580,7 +753,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     fun alignTodayWithSamsungHealth(samsung: SamsungDailySnapshot) {
         ensureDailyLoadedForToday()
         if (samsung.dateIso.isNotBlank() && samsung.dateIso != dailyDateIso) return
-        persistDailySummaryNow()
+        persistDailySummaryNow(async = false)
 
         val aligned = repository.alignDailyActivityWithSamsung(dailyDateIso, samsung)
         dailyWalkSec = aligned.walkingSec
@@ -605,6 +778,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     fun armPtTrial() {
         if (ptTrialPhase != PtTrialPhase.IDLE) return
         if (intervalPhase != IntervalPhase.IDLE) cancelIntervalWorkout(silent = true)
+        startedFromBootBackground = false
         gaitClassifier.clearVehicleLatchForManualWorkout()
         signalProcessor.suppressStepsForVehicle = false
         signalProcessor.manualWorkoutActive = true
@@ -624,6 +798,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         ptJogRunConfirmMs = 0L
         ptLaunchBufferSec = 0.0
         ptLaunchBufferMeters = 0.0
+        sessionTrackScale = 1.0
+        fallbackMetersCreditedSinceLastGps = 0.0
         announcedFinal200mKick = false
         lastCompletedSessionId = null
 
@@ -656,14 +832,20 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         ptTrialPhase = PtTrialPhase.RUNNING_TRIAL
         isAutoStartArmed = false
         isRecording = true
+        startedFromBootBackground = false
         signalProcessor.manualWorkoutActive = true
         lastStoppedPenaltySpeechElapsedMs = -60_000L
-        sessionStartedWallMs = System.currentTimeMillis() - (ptLaunchBufferSec * 1000.0).toLong()
+        val creditSec = ptLaunchBufferSec.coerceIn(0.0, 2.6)
+        val creditMeters = ptLaunchBufferMeters.coerceIn(0.0, 14.0)
+        val nowElapsed = SystemClock.elapsedRealtime()
+        trialStartElapsedMs = nowElapsed
+        trialInitialCreditSec = creditSec
+        lastTrialStepDtSec = 0.2
+        sessionTrackScale = 1.0
+        sessionStartedWallMs = System.currentTimeMillis() - (creditSec * 1000.0).toLong()
         lastCompletedSessionId = null
         announcedFinal200mKick = false
 
-        val creditSec = ptLaunchBufferSec.coerceIn(0.0, 2.6)
-        val creditMeters = ptLaunchBufferMeters.coerceIn(0.0, 14.0)
         ptJogRunConfirmMs = 0L
         ptLaunchBufferSec = 0.0
         ptLaunchBufferMeters = 0.0
@@ -693,6 +875,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (creditMeters > 0.0) {
             addPtTrialDistanceDelta(creditMeters, initialState, allowDuringWarmup = true)
         }
+        persistActiveWorkoutCheckpoint()
 
         syncPocketForegroundAndWakeLock()
         playStateTone(MotionState.TARGET_PACE)
@@ -702,19 +885,49 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     }
 
     /**
-     * Optional manual 400m chalk-line lap snap for curved grounds where phone GPS drifts slightly.
+     * Bidirectional (±30m) manual 400m chalk-line lap snap for curved grounds where phone GPS drifts slightly.
+     *  - Under-measured (`370m..399.5m` at chalk line): snaps to `nextLapBoundaryM` without inflating `runningMeters`
+     *  - Over-measured (`400.5m..430m` right after auto-split): pulls `distanceMeters` back to the chalk boundary
+     *    and updates the just-recorded split timestamp, nudging `sessionTrackScale` within `0.92..1.08`.
      */
     fun snapNext400mLap(): Boolean {
         if (ptTrialPhase != PtTrialPhase.RUNNING_TRIAL) return false
         val remainingToNextLap = nextLapBoundaryM - distanceMeters
-        if (remainingToNextLap !in 0.5..90.0) return false
-        addPtTrialDistanceDelta(
-            deltaM = remainingToNextLap + 0.05,
-            state = gaitClassifier.currentState().let { if (it.countsAsActiveMovement) it else MotionState.RUNNING },
-            allowDuringWarmup = true
-        )
-        broadcastTelemetry()
-        return true
+        if (remainingToNextLap in 0.5..30.0) {
+            val observedM = distanceMeters.coerceAtLeast(1.0)
+            sessionTrackScale = (sessionTrackScale * (nextLapBoundaryM / observedM)).coerceIn(0.92, 1.08)
+            addPtTrialDistanceDelta(
+                deltaM = remainingToNextLap,
+                state = gaitClassifier.currentState().let { if (it.countsAsActiveMovement) it else MotionState.RUNNING },
+                allowDuringWarmup = true,
+                isManualSnap = true
+            )
+            persistActiveWorkoutCheckpoint()
+            broadcastTelemetry()
+            return true
+        }
+        val prevBoundaryM = nextLapBoundaryM - TsPoliceBenchmark.LAP_DISTANCE_M
+        val overshootPastPrevM = distanceMeters - prevBoundaryM
+        if (prevBoundaryM >= TsPoliceBenchmark.LAP_DISTANCE_M &&
+            overshootPastPrevM in 0.5..30.0 &&
+            lapSplits.isNotEmpty()
+        ) {
+            val observedM = distanceMeters.coerceAtLeast(1.0)
+            sessionTrackScale = (sessionTrackScale * (prevBoundaryM / observedM)).coerceIn(0.92, 1.08)
+            distanceMeters = prevBoundaryM
+            val lastIdx = lapSplits.lastIndex
+            val prevCum = if (lastIdx > 0) lapSplits[lastIdx - 1].cumulativeSec else 0.0
+            val updatedDur = (activeDurationSec - prevCum).coerceAtLeast(0.1)
+            lapSplits[lastIdx] = lapSplits[lastIdx].copy(
+                lapDurationSec = updatedDur,
+                cumulativeSec = activeDurationSec
+            )
+            prevLapCumulativeSec = activeDurationSec
+            persistActiveWorkoutCheckpoint()
+            broadcastTelemetry()
+            return true
+        }
+        return false
     }
 
     fun finishWorkout(forceSave: Boolean = true): Long? {
@@ -722,6 +935,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         ptTrialPhase = PtTrialPhase.IDLE
         isRecording = false
         isAutoStartArmed = false
+        clearActiveWorkoutCheckpoint()
         signalProcessor.manualWorkoutActive = isHighPrecisionSessionActive()
         syncPocketForegroundAndWakeLock()
 
@@ -738,9 +952,14 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             val stopPenaltyNote = if (pausedDurationSec >= 3.0) {
                 " • ${pausedDurationSec.toInt()}s stopped"
             } else ""
+            val startedDateIso = if (sessionStartedWallMs > 0L) {
+                Instant.ofEpochMilli(sessionStartedWallMs).atZone(ZoneId.systemDefault()).toLocalDate().toString()
+            } else {
+                LocalDate.now().toString()
+            }
             val record = RunSessionRecord(
                 startedAtEpochMs = sessionStartedWallMs,
-                dateIso = LocalDate.now().toString(),
+                dateIso = startedDateIso,
                 mode = RunMode.TIMED_1600M,
                 distanceMeters = distanceMeters,
                 activeDurationSec = activeDurationSec,
@@ -764,7 +983,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             lastCompletedSessionId = savedId
             vibratePulse(320L)
         }
-        persistDailySummaryNow()
+        persistDailySummaryNow(async = true)
         if (savedId != null) {
             triggerBackgroundAutoTelemetryIfDue(reason = "pt_trial_finished", force = true)
         }
@@ -777,10 +996,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         ptTrialPhase = PtTrialPhase.IDLE
         isRecording = false
         isAutoStartArmed = false
+        clearActiveWorkoutCheckpoint()
         signalProcessor.manualWorkoutActive = isHighPrecisionSessionActive()
         ptJogRunConfirmMs = 0L
         ptLaunchBufferSec = 0.0
         ptLaunchBufferMeters = 0.0
+        sessionTrackScale = 1.0
         announcedFinal200mKick = false
         distanceMeters = 0.0
         activeDurationSec = 0.0
@@ -798,8 +1019,13 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     // =========================================================================
     // GUIDED 400M SPEED-ENDURANCE INTERVAL COACH (6 x 400m / 4 x 400m)
     // =========================================================================
-    fun startIntervalWorkout(totalReps: Int = 6, restSeconds: Double = 90.0) {
+    fun startIntervalWorkout(
+        totalReps: Int = 6,
+        restSeconds: Double = 90.0,
+        targetRepSec: Double? = null
+    ) {
         if (ptTrialPhase != PtTrialPhase.IDLE) cancelPtTrial()
+        startedFromBootBackground = false
         gaitClassifier.clearVehicleLatchForManualWorkout()
         signalProcessor.suppressStepsForVehicle = false
         signalProcessor.manualWorkoutActive = true
@@ -810,6 +1036,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         flushOpenBoutIfQualified()
         resetOpenBout()
         syncThresholdsFromPrefs()
+        if (targetRepSec != null && targetRepSec > 35.0) {
+            intervalTargetRepSec = targetRepSec.coerceIn(70.0, 180.0)
+        }
 
         intervalTotalReps = totalReps.coerceIn(2, 12)
         intervalRestDurationSec = restSeconds.coerceIn(30.0, 240.0)
@@ -824,10 +1053,11 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         intervalCadenceCount = 0
         intervalCompletedSplitsSec.clear()
         intervalPhase = IntervalPhase.RUNNING_REP
+        persistActiveWorkoutCheckpoint()
 
         syncPocketForegroundAndWakeLock()
         vibratePulse(200L)
-        speakCoach("Starting $intervalTotalReps by 400 meter track intervals. Rep 1, Go!")
+        speakCoach("Starting $intervalTotalReps by 400 meter track intervals. Target ${spokenTime(intervalTargetRepSec)} per rep. Rep 1, Go!")
         broadcastTelemetry()
     }
 
@@ -839,6 +1069,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         intervalRestRemainingSec = 0.0
         intervalAnnounced10sReady = false
         intervalPhase = IntervalPhase.RUNNING_REP
+        persistActiveWorkoutCheckpoint()
         vibratePulse(180L)
         speakCoach("Rep $intervalCurrentRep of $intervalTotalReps, Go!")
         broadcastTelemetry()
@@ -850,6 +1081,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         intervalRepDistM = 0.0
         intervalRepSec = 0.0
         intervalRestRemainingSec = 0.0
+        clearActiveWorkoutCheckpoint()
         syncPocketForegroundAndWakeLock()
         if (wasActive && !silent) {
             speakCoach("Interval workout stopped.")
@@ -870,6 +1102,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 intervalPhase = IntervalPhase.REST_COUNTDOWN
                 intervalRestRemainingSec = intervalRestDurationSec
                 intervalAnnounced10sReady = false
+                persistActiveWorkoutCheckpoint()
                 speakCoach(
                     "Rep $intervalCurrentRep done in ${spokenTime(finishedSplit)}. Walk and recover for ${intervalRestDurationSec.toInt()} seconds."
                 )
@@ -879,6 +1112,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
     private fun completeIntervalSession() {
         intervalPhase = IntervalPhase.IDLE
+        clearActiveWorkoutCheckpoint()
         val repsDone = intervalCompletedSplitsSec.size
         if (repsDone > 0) {
             val totalDistM = repsDone * 400.0
@@ -895,10 +1129,15 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                     dominantState = MotionState.RUNNING
                 )
             }
+            val startedDateIso = if (intervalStartedWallMs > 0L) {
+                Instant.ofEpochMilli(intervalStartedWallMs).atZone(ZoneId.systemDefault()).toLocalDate().toString()
+            } else {
+                LocalDate.now().toString()
+            }
             val savedId = repository.insertSession(
                 RunSessionRecord(
                     startedAtEpochMs = intervalStartedWallMs,
-                    dateIso = LocalDate.now().toString(),
+                    dateIso = startedDateIso,
                     mode = RunMode.INTERVAL_400M,
                     distanceMeters = totalDistM,
                     activeDurationSec = totalActiveSec,
@@ -921,7 +1160,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             )
         }
         syncPocketForegroundAndWakeLock()
-        persistDailySummaryNow()
+        persistDailySummaryNow(async = true)
         if (repsDone > 0) {
             triggerBackgroundAutoTelemetryIfDue(reason = "intervals_finished", force = true)
         }
@@ -986,12 +1225,19 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             accelRegistered = false
         }
         val delay = if (lowPower) SensorManager.SENSOR_DELAY_NORMAL else SensorManager.SENSOR_DELAY_GAME
-        accelRegistered = sensorManager.registerListener(this, rawAccel, delay, 0)
+        val maxBatchUs = if (lowPower) STANDBY_SENSOR_BATCH_LATENCY_US else 0
+        accelRegistered = sensorManager.registerListener(this, rawAccel, delay, maxBatchUs)
         accelLowPowerMode = lowPower
     }
 
     private fun registerLocationIfPermitted() {
         if (locationRegistered) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+            startedFromBootBackground && !uiForegroundVisible && !isHighPrecisionSessionActive()
+        ) {
+            // Avoid background location access while running as a post-boot HEALTH-only standby service
+            return
+        }
         val hasFine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
         val hasCoarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) ==
@@ -1020,6 +1266,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 )
             }
             locationRegistered = true
+            syncPocketForegroundAndWakeLock()
         }
     }
 
@@ -1029,6 +1276,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         locationRegistered = false
         lastValidLocation = null
         lastValidBearingDeg = null
+        fallbackMetersCreditedSinceLastGps = 0.0
     }
 
     private fun unregisterHardwareStreams() {
@@ -1069,6 +1317,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             }
             Sensor.TYPE_STEP_COUNTER -> {
                 val cumulative = event.values.firstOrNull()?.toDouble() ?: return
+                if (gaitClassifier.isInOrCoolingDownFromVehicle() || signalProcessor.suppressStepsForVehicle) {
+                    // Discard batched scooter/vehicle vibration steps and re-anchor hardware counter
+                    lastStepCounterHwValue = cumulative
+                    stepsAtLastStepCounter = signalProcessor.totalSteps
+                    return
+                }
                 val prevHw = lastStepCounterHwValue
                 if (prevHw != null && cumulative > prevHw) {
                     val hwDelta = (cumulative - prevHw).toInt()
@@ -1110,6 +1364,15 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     override fun onLocationChanged(location: Location) {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        // Single-provider arbitration: when outdoor GPS_PROVIDER is fresh (<= 3.5s), ignore FUSED_PROVIDER
+        // so two slightly offset streams never interleave zig-zag chords or artificial bearing swings!
+        if (location.provider == LocationManager.GPS_PROVIDER) {
+            lastPureGpsFixElapsedMs = nowElapsed
+        } else if ((nowElapsed - lastPureGpsFixElapsedMs) <= 3_500L) {
+            return
+        }
+
         latestGpsAccuracyM = if (location.hasAccuracy()) location.accuracy else null
         val maxAllowedAcc = if (isHighPrecisionSessionActive()) {
             MAX_PT_TRIAL_GPS_ACCURACY_M
@@ -1129,7 +1392,6 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             hourlyDirty = true
         }
 
-        val nowElapsed = SystemClock.elapsedRealtime()
         val prev = lastValidLocation
         var observedSpeed = if (location.hasSpeed()) location.speed.toDouble() else -1.0
 
@@ -1157,15 +1419,16 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 val onFoot = !inVeh && curState != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
                     (curState.countsAsActiveMovement || activeCadence)
 
-                // 400m oval track curve arc-to-chord compensation so 36.5m semicircular bends don't under-measure!
+                // 400m oval track curve arc-to-chord compensation (strictly on crisp fixes <= 12m accuracy)
                 val segBearing = prev.bearingTo(location)
                 val prevBearing = lastValidBearingDeg
-                val curveAdjustedMeters = if (onFoot && prevBearing != null && chordMeters in 2.2..18.0 &&
+                val crispAccuracy = !location.hasAccuracy() || location.accuracy <= 12f
+                val curveAdjustedMeters = if (onFoot && crispAccuracy && prevBearing != null && chordMeters in 2.5..18.0 &&
                     (curState.isJogOrRun() || candState.isJogOrRun())
                 ) {
                     var turnDeg = abs(segBearing - prevBearing)
                     if (turnDeg > 180f) turnDeg = 360f - turnDeg
-                    if (turnDeg in 8f..55f) {
+                    if (turnDeg in 12f..50f) {
                         val halfRad = Math.toRadians((turnDeg / 2f).toDouble())
                         val arcFactor = (halfRad / sin(halfRad)).coerceIn(1.0, 1.042)
                         chordMeters * arcFactor
@@ -1179,32 +1442,42 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
                 if (onFoot) {
                     lastGpsDistanceContributionMs = nowElapsed
-                    if (repository.allDayTrackingEnabled) {
-                        val effectiveState = if (curState.countsAsActiveMovement) curState else {
-                            if (candState.countsAsActiveMovement) candState else MotionState.WALKING
-                        }
-                        addAllDayDistanceDelta(curveAdjustedMeters, effectiveState)
-                        val hb = ensureHourlyBucketLoaded()
-                        currentHourlyBucket = hb.copy(
-                            gpsMeters = hb.gpsMeters + curveAdjustedMeters,
-                            walkMeters = hb.walkMeters + if (effectiveState.isJogOrRun()) 0.0 else curveAdjustedMeters,
-                            jogRunMeters = hb.jogRunMeters + if (effectiveState.isJogOrRun()) curveAdjustedMeters else 0.0
-                        )
-                        hourlyDirty = true
-                    }
-                    when (ptTrialPhase) {
-                        PtTrialPhase.RUNNING_TRIAL -> {
-                            addPtTrialDistanceDelta(curveAdjustedMeters, curState, allowDuringWarmup = activeCadence)
-                        }
-                        PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> {
-                            if (curState.isJogOrRun() || candState.isJogOrRun()) {
-                                ptLaunchBufferMeters = (ptLaunchBufferMeters + curveAdjustedMeters).coerceAtMost(14.0)
+                    // Subtract any step-fallback meters already credited during a >4.0s GPS dropout window
+                    val dedupedMeters = (curveAdjustedMeters - fallbackMetersCreditedSinceLastGps).coerceAtLeast(0.0)
+                    fallbackMetersCreditedSinceLastGps = (fallbackMetersCreditedSinceLastGps - curveAdjustedMeters).coerceAtLeast(0.0)
+
+                    if (dedupedMeters > 0.0) {
+                        if (repository.allDayTrackingEnabled) {
+                            val effectiveState = if (curState.countsAsActiveMovement) curState else {
+                                if (candState.countsAsActiveMovement) candState else MotionState.WALKING
                             }
+                            addAllDayDistanceDelta(dedupedMeters, effectiveState)
+                            val hb = ensureHourlyBucketLoaded()
+                            currentHourlyBucket = hb.copy(
+                                gpsMeters = hb.gpsMeters + dedupedMeters,
+                                walkMeters = hb.walkMeters + if (effectiveState.isJogOrRun()) 0.0 else dedupedMeters,
+                                jogRunMeters = hb.jogRunMeters + if (effectiveState.isJogOrRun()) dedupedMeters else 0.0
+                            )
+                            hourlyDirty = true
                         }
-                        PtTrialPhase.IDLE -> Unit
-                    }
-                    if (intervalPhase == IntervalPhase.RUNNING_REP) {
-                        addIntervalDistanceDelta(curveAdjustedMeters, curState)
+                        when (ptTrialPhase) {
+                            PtTrialPhase.RUNNING_TRIAL -> {
+                                addPtTrialDistanceDelta(
+                                    dedupedMeters * sessionTrackScale,
+                                    curState,
+                                    allowDuringWarmup = activeCadence
+                                )
+                            }
+                            PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> {
+                                if (curState.isJogOrRun() || candState.isJogOrRun()) {
+                                    ptLaunchBufferMeters = (ptLaunchBufferMeters + dedupedMeters).coerceAtMost(14.0)
+                                }
+                            }
+                            PtTrialPhase.IDLE -> Unit
+                        }
+                        if (intervalPhase == IntervalPhase.RUNNING_REP) {
+                            addIntervalDistanceDelta(dedupedMeters, curState)
+                        }
                     }
                 }
                 lastValidLocation = location
@@ -1214,6 +1487,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             lastValidLocation = location
             lastValidLocationElapsedMs = nowElapsed
             lastLocationElapsedMs = nowElapsed
+            fallbackMetersCreditedSinceLastGps = 0.0
         }
 
         if (observedSpeed >= 0.0) {
@@ -1271,6 +1545,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         )
         val candState = gaitClassifier.candidateState()
         val inVehicleOrCooldown = gaitClassifier.isInOrCoolingDownFromVehicle()
+        if (wasInVehicleOrCooldownLastTick && !inVehicleOrCooldown) {
+            // Re-anchor TYPE_STEP_COUNTER on dismount so batched riding vibration steps are never injected!
+            lastStepCounterHwValue = null
+            stepsAtLastStepCounter = signalProcessor.totalSteps
+        }
+        wasInVehicleOrCooldownLastTick = inVehicleOrCooldown
         signalProcessor.suppressStepsForVehicle = inVehicleOrCooldown
         wasInVehicleLatchLastTick = gaitClassifier.isVehicleLatched()
 
@@ -1344,25 +1624,24 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (state != lastAnnouncedState) {
             val previousState = lastAnnouncedState
             lastAnnouncedState = state
-            runCatching {
-                repository.recordSensorTransition(
-                    SensorTransitionEvent(
-                        epochMs = System.currentTimeMillis(),
-                        fromState = previousState.name,
-                        toState = state.name,
-                        gpsSpeedMps = gpsForClassifier,
-                        gpsAccMeters = latestGpsAccuracyM?.toDouble(),
-                        cadenceSpm = cadenceSpm,
-                        accelRms = accelRms,
-                        minRawNorm = minRawNorm,
-                        peakToTroughNorm = peakToTroughNorm,
-                        p20RawNorm = p20RawNorm,
-                        isLowPower = isLowPowerStandby,
-                        ptPhase = ptTrialPhase.name
-                    )
-                )
+            val transitionEvent = SensorTransitionEvent(
+                epochMs = System.currentTimeMillis(),
+                fromState = previousState.name,
+                toState = state.name,
+                gpsSpeedMps = gpsForClassifier,
+                gpsAccMeters = latestGpsAccuracyM?.toDouble(),
+                cadenceSpm = cadenceSpm,
+                accelRms = accelRms,
+                minRawNorm = minRawNorm,
+                peakToTroughNorm = peakToTroughNorm,
+                p20RawNorm = p20RawNorm,
+                isLowPower = isLowPowerStandby,
+                ptPhase = ptTrialPhase.name
+            )
+            if (serviceAlive) {
+                serviceScope.launch { runCatching { repository.recordSensorTransition(transitionEvent) } }
             }
-            if (dailyDirty || hourlyDirty) persistDailySummaryNow()
+            if (dailyDirty || hourlyDirty) persistDailySummaryNow(async = true)
             onMotionStateChanged(previousState, state, nowMs)
         }
 
@@ -1389,7 +1668,11 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         val onFootNow = !inVehicleOrCooldown && state != MotionState.VEHICLE && candState != MotionState.VEHICLE &&
             (state.countsAsActiveMovement || cadenceSpm >= GaitClassifier.MIN_WALKING_CADENCE_SPM)
         val stepFallbackDeltaM = if (!gpsActivelyMeasuringDistance && repository.indoorStepFallbackEnabled && newSteps > 0 && onFootNow) {
-            newSteps * gaitClassifier.estimateStrideLengthMeters(cadenceSpm.coerceAtLeast(85.0), accelRms)
+            val dm = newSteps * gaitClassifier.estimateStrideLengthMeters(cadenceSpm.coerceAtLeast(85.0), accelRms)
+            if (locationRegistered && lastValidLocation != null) {
+                fallbackMetersCreditedSinceLastGps = (fallbackMetersCreditedSinceLastGps + dm).coerceAtMost(120.0)
+            }
+            dm
         } else {
             0.0
         }
@@ -1494,12 +1777,12 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             }
 
             if ((dailyDirty || hourlyDirty) && (nowMs - lastDailyPersistElapsedMs) >= 5000L) {
-                persistDailySummaryNow()
+                persistDailySummaryNow(async = true)
             }
         }
 
         // =========================================================================
-        // 2. 1.6 KM PT TRIAL STATE MACHINE (CONTINUOUS TSLPRB RFID CLOCK!)
+        // 2. 1.6 KM PT TRIAL STATE MACHINE (CONTINUOUS MONOTONIC TSLPRB RFID CLOCK!)
         // =========================================================================
         when (ptTrialPhase) {
             PtTrialPhase.ARMED_WAITING_FOR_JOG_RUN -> {
@@ -1524,9 +1807,19 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             }
             PtTrialPhase.RUNNING_TRIAL -> {
                 // Official TSLPRB rule: once you cross the start line, the race clock NEVER pauses!
-                activeDurationSec += dtSec
+                // Anchor directly to SystemClock.elapsedRealtime() so even >2.5s main-looper stalls never lose race time.
+                val prevActiveSec = activeDurationSec
+                val monotonicSec = if (trialStartElapsedMs > 0L) {
+                    ((nowMs - trialStartElapsedMs).coerceAtLeast(0L) / 1000.0) + trialInitialCreditSec
+                } else {
+                    prevActiveSec + dtSec
+                }
+                activeDurationSec = max(prevActiveSec, monotonicSec)
+                val trialStepDtSec = (activeDurationSec - prevActiveSec).coerceAtLeast(0.0)
+                lastTrialStepDtSec = trialStepDtSec
+
                 if (!state.countsAsActiveMovement) {
-                    pausedDurationSec += dtSec // Tracks stopped/standing penalty seconds diagnostically
+                    pausedDurationSec += trialStepDtSec // Tracks stopped/standing penalty seconds diagnostically
                 } else {
                     if (effectiveSpeedMps > maxSpeedMps) maxSpeedMps = effectiveSpeedMps
                     if (cadenceSpm > 30.0) {
@@ -1534,14 +1827,14 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                         cadenceSamplesCount++
                     }
                     when (state) {
-                        MotionState.RUNNING, MotionState.TARGET_PACE -> runningSec += dtSec
-                        MotionState.JOGGING -> joggingSec += dtSec
-                        MotionState.WALKING -> walkingSec += dtSec
+                        MotionState.RUNNING, MotionState.TARGET_PACE -> runningSec += trialStepDtSec
+                        MotionState.JOGGING -> joggingSec += trialStepDtSec
+                        MotionState.WALKING -> walkingSec += trialStepDtSec
                         MotionState.STANDING, MotionState.VEHICLE -> Unit
                     }
                 }
                 if (stepFallbackDeltaM > 0.0) {
-                    addPtTrialDistanceDelta(stepFallbackDeltaM, state, allowDuringWarmup = true)
+                    addPtTrialDistanceDelta(stepFallbackDeltaM * sessionTrackScale, state, allowDuringWarmup = true)
                 }
             }
             PtTrialPhase.IDLE -> Unit
@@ -1576,13 +1869,17 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             IntervalPhase.IDLE, IntervalPhase.COMPLETED -> Unit
         }
 
-        if (isInForeground && nowMs - lastNotificationUpdateMs >= 1000L) {
-            lastNotificationUpdateMs = nowMs
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.notify(NOTIFICATION_ID, buildForegroundNotification(state, effectiveSpeedMps))
+        if (isHighPrecisionSessionActive() && (nowMs - lastWorkoutCheckpointElapsedMs) >= 5_000L) {
+            lastWorkoutCheckpointElapsedMs = nowMs
+            persistActiveWorkoutCheckpoint()
         }
 
-        if (nowMs - lastAutoTelemetryCheckElapsedMs >= 15L * 60_000L) {
+        if (isInForeground && nowMs - lastNotificationUpdateMs >= 1000L) {
+            lastNotificationUpdateMs = nowMs
+            updateForegroundNotificationIfChanged(state, effectiveSpeedMps)
+        }
+
+        if (repository.remoteDiagnosticsOptIn && nowMs - lastAutoTelemetryCheckElapsedMs >= 15L * 60_000L) {
             lastAutoTelemetryCheckElapsedMs = nowMs
             triggerBackgroundAutoTelemetryIfDue(reason = "periodic_background", checkPendingCommands = true)
         }
@@ -1609,7 +1906,14 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             val prevBoutM = openBoutJogRunMeters
             openBoutJogRunMeters += deltaM
             if (prevBoutM < 1600.0 && openBoutJogRunMeters >= 1600.0 && openBoutFirst1600Sec == null) {
-                openBoutFirst1600Sec = openBoutActiveSec
+                // Include any mid-bout walking/standing breaks (<75s) so broken runs never masquerade as nonstop 1.6K trials!
+                val totalBoutElapsedSec = if (openBoutStartedElapsedMs > 0L) {
+                    ((SystemClock.elapsedRealtime() - openBoutStartedElapsedMs).coerceAtLeast(0L) / 1000.0)
+                        .coerceAtLeast(openBoutActiveSec + openBoutPausedSec + openBoutWalkSec)
+                } else {
+                    openBoutActiveSec + openBoutPausedSec + openBoutWalkSec
+                }
+                openBoutFirst1600Sec = totalBoutElapsedSec
             }
         }
         dailyDirty = true
@@ -1625,6 +1929,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (state.isJogOrRun()) {
             if (openBoutStartedWallMs == 0L) {
                 openBoutStartedWallMs = System.currentTimeMillis()
+                openBoutStartedElapsedMs = SystemClock.elapsedRealtime()
             }
             openBoutIdleMs = 0L
             openBoutActiveSec += dtSec
@@ -1654,16 +1959,24 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             val avgSpeedMps = openBoutJogRunMeters / openBoutActiveSec
             val isGenuineJogOrRunBout = openBoutRunSec >= 5.0 || avgSpeedMps >= 1.85 || avgCad >= 124.0
             if (isGenuineJogOrRunBout) {
+                val totalElapsedBoutSec = openBoutActiveSec + openBoutPausedSec + openBoutWalkSec
+                val effectiveFirst1600 = openBoutFirst1600Sec?.takeIf {
+                    openBoutPausedSec < 15.0 && openBoutWalkSec < 20.0
+                }
                 val equiv = TsPoliceBenchmark.computeEquiv1600mSec(
                     distanceMeters = openBoutJogRunMeters,
-                    activeDurationSec = openBoutActiveSec,
-                    first1600mSplitSec = openBoutFirst1600Sec
+                    activeDurationSec = max(openBoutActiveSec, totalElapsedBoutSec * 0.85),
+                    first1600mSplitSec = effectiveFirst1600
                 )
                 val labelKind = if (openBoutRunSec >= openBoutActiveSec * 0.25 || avgSpeedMps >= 2.60) "Run" else "Jog"
+                val boutDateIso = Instant.ofEpochMilli(openBoutStartedWallMs)
+                    .atZone(ZoneId.systemDefault())
+                    .toLocalDate()
+                    .toString()
                 val savedId = repository.insertSession(
                     RunSessionRecord(
                         startedAtEpochMs = openBoutStartedWallMs,
-                        dateIso = dailyDateIso.ifBlank { LocalDate.now().toString() },
+                        dateIso = boutDateIso,
                         mode = RunMode.OPEN_PRACTICE,
                         distanceMeters = openBoutJogRunMeters,
                         activeDurationSec = openBoutActiveSec,
@@ -1681,29 +1994,40 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                     )
                 )
                 lastCompletedSessionId = savedId
-                persistDailySummaryNow()
+                persistDailySummaryNow(async = true)
                 triggerBackgroundAutoTelemetryIfDue(reason = "open_run_finished", force = true)
             }
         }
         resetOpenBout()
     }
 
+    fun syncRemoteDiagnosticsSetting() {
+        if (!repository.remoteDiagnosticsOptIn || isLowPowerStandby || !serviceAlive) {
+            remotePullListenerThread?.interrupt()
+            remotePullListenerThread = null
+        } else {
+            startRemotePullCommandListener()
+        }
+    }
+
     private fun startRemotePullCommandListener() {
+        if (!repository.remoteDiagnosticsOptIn || isLowPowerStandby || !serviceAlive) return
         if (remotePullListenerThread?.isAlive == true) return
         remotePullListenerThread = Thread({
             tuningTelemetryManager.listenForRemotePullCommandsBlocking(
-                shouldContinue = { serviceAlive },
+                shouldContinue = { serviceAlive && repository.remoteDiagnosticsOptIn && !isLowPowerStandby },
                 onPullCommand = { reqId ->
                     mainHandler.post {
-                        if (!serviceAlive) return@post
-                        persistDailySummaryNow()
+                        if (!serviceAlive || !repository.remoteDiagnosticsOptIn) return@post
+                        persistDailySummaryNow(async = true)
                         val liveSnap = currentDailySnapshot()
                         serviceScope.launch {
                             runCatching {
                                 tuningTelemetryManager.pullBuildAndUploadTuningBundle(
                                     liveTodayOverride = liveSnap,
                                     triggerReason = "remote_pull_live",
-                                    requestId = reqId
+                                    requestId = reqId,
+                                    allowCloudUpload = true
                                 )
                             }
                         }
@@ -1721,8 +2045,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         force: Boolean = false,
         checkPendingCommands: Boolean = false
     ) {
-        if (!::tuningTelemetryManager.isInitialized) return
-        persistDailySummaryNow()
+        if (!::tuningTelemetryManager.isInitialized || !repository.remoteDiagnosticsOptIn) return
+        persistDailySummaryNow(async = true)
         val liveSnap = currentDailySnapshot()
         serviceScope.launch {
             runCatching {
@@ -1744,6 +2068,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
 
     private fun resetOpenBout() {
         openBoutStartedWallMs = 0L
+        openBoutStartedElapsedMs = 0L
         openBoutJogRunMeters = 0.0
         openBoutActiveSec = 0.0
         openBoutPausedSec = 0.0
@@ -1757,38 +2082,58 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         openBoutIdleMs = 0L
     }
 
-    private fun addPtTrialDistanceDelta(deltaM: Double, state: MotionState, allowDuringWarmup: Boolean = false) {
+    private fun addPtTrialDistanceDelta(
+        deltaM: Double,
+        state: MotionState,
+        allowDuringWarmup: Boolean = false,
+        isManualSnap: Boolean = false
+    ) {
         if (deltaM <= 0.0 || ptTrialPhase != PtTrialPhase.RUNNING_TRIAL) return
         if (state == MotionState.VEHICLE) return
         if (!state.countsAsActiveMovement && !allowDuringWarmup) return
+
+        val prevDist = distanceMeters
         distanceMeters += deltaM
-        when (state) {
-            MotionState.RUNNING, MotionState.TARGET_PACE -> runningMeters += deltaM
-            MotionState.JOGGING -> joggingMeters += deltaM
-            MotionState.WALKING -> walkingMeters += deltaM
-            MotionState.STANDING -> runningMeters += deltaM
-            MotionState.VEHICLE -> Unit
+        if (!isManualSnap) {
+            when (state) {
+                MotionState.RUNNING, MotionState.TARGET_PACE -> runningMeters += deltaM
+                MotionState.JOGGING -> joggingMeters += deltaM
+                MotionState.WALKING, MotionState.STANDING -> walkingMeters += deltaM
+                MotionState.VEHICLE -> Unit
+            }
         }
 
-        // Record 400m splits
+        val tickStartSec = (activeDurationSec - lastTrialStepDtSec).coerceAtLeast(prevLapCumulativeSec)
+        var exactFinishSec: Double? = null
+
+        // Record 400m splits with linear boundary time interpolation
         while (distanceMeters >= nextLapBoundaryM) {
             val lapNum = lapSplits.size + 1
-            val lapDur = (activeDurationSec - prevLapCumulativeSec).coerceAtLeast(0.1)
-            prevLapCumulativeSec = activeDurationSec
+            val boundarySec = if (isManualSnap || deltaM <= 0.05) {
+                activeDurationSec
+            } else {
+                val frac = ((nextLapBoundaryM - prevDist) / deltaM).coerceIn(0.0, 1.0)
+                (tickStartSec + (activeDurationSec - tickStartSec) * frac)
+                    .coerceIn(prevLapCumulativeSec + 0.1, activeDurationSec)
+            }
+            val lapDur = (boundarySec - prevLapCumulativeSec).coerceAtLeast(0.1)
+            prevLapCumulativeSec = boundarySec
             lapSplits.add(
                 LapSplit(
                     lapNumber = lapNum,
                     distanceMeters = nextLapBoundaryM,
                     lapDurationSec = lapDur,
-                    cumulativeSec = activeDurationSec,
+                    cumulativeSec = boundarySec,
                     dominantState = state
                 )
             )
             if (nextLapBoundaryM == 1600.0 && first1600mSplitSec == null) {
-                first1600mSplitSec = activeDurationSec
+                first1600mSplitSec = boundarySec
+                exactFinishSec = boundarySec
             }
             onLapCrossed(lapNum, nextLapBoundaryM, lapDur)
             nextLapBoundaryM += TsPoliceBenchmark.LAP_DISTANCE_M
+            persistActiveWorkoutCheckpoint()
         }
 
         // Final-200m (1,400m) Kick Callout on the hardest stretch of the 1.6 km trial!
@@ -1807,6 +2152,9 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         // Auto-complete 1.6 km TS Police PT Trial at 1,600m!
         if (distanceMeters >= TsPoliceBenchmark.TARGET_DISTANCE_M) {
             distanceMeters = TsPoliceBenchmark.TARGET_DISTANCE_M
+            if (exactFinishSec != null) {
+                activeDurationSec = exactFinishSec
+            }
             val finalSec = activeDurationSec
             val targetSec = repository.targetTimeSec
             val merit = TsPoliceBenchmark.evaluateMerit1600m(finalSec, targetSec)
@@ -1815,7 +2163,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             val verdict = if (diff <= 0.0) {
                 "Qualified by ${(-diff).toInt()} seconds! ${merit.points} merit points!"
             } else {
-                "${diff.toInt()} seconds above target."
+                val secsOver = TsPoliceBenchmark.secondsAboveCutoff(finalSec, targetSec)
+                "$secsOver seconds above target."
             }
             lastFinishSpeechMs = SystemClock.elapsedRealtime()
             speakCoach(
@@ -1863,7 +2212,8 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
                 previousState = previousState,
                 newState = newState,
                 isRecording = isRecording,
-                targetTimeSec = repository.targetTimeSec
+                targetTimeSec = repository.targetTimeSec,
+                clockContinuesOnStop = (ptTrialPhase == PtTrialPhase.RUNNING_TRIAL)
             )
         }
         speakStateTransition(speech, nowMs)
@@ -1967,23 +2317,86 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         }
     }
 
+    private fun computeDesiredForegroundType(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        val hasLocationPerm =
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val hasActivityPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            var fgType = 0
+            if (hasActivityPerm) {
+                fgType = fgType or ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH
+            }
+            val allowInteractiveTypes = !startedFromBootBackground || uiForegroundVisible || isHighPrecisionSessionActive()
+            if (hasLocationPerm && allowInteractiveTypes && locationRegistered) {
+                fgType = fgType or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            }
+            if (allowInteractiveTypes && (uiForegroundVisible || isHighPrecisionSessionActive())) {
+                fgType = fgType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            }
+            return fgType
+        }
+
+        return if (hasLocationPerm) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        } else {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        }
+    }
+
     private fun promoteToForeground() {
-        val notification = buildForegroundNotification(gaitClassifier.currentState(), 0.0)
-        runCatching {
+        val desiredType = computeDesiredForegroundType()
+        if (isInForeground && desiredType == lastForegroundServiceType) {
+            return
+        }
+        val (title, subtitle, showMute) = computeForegroundNotificationCopy(gaitClassifier.currentState(), 0.0)
+        val notification = buildForegroundNotificationFromCopy(title, subtitle, showMute)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && desiredType == 0) {
+            isInForeground = false
+            lastForegroundServiceType = 0
+            stopSelf()
+            return
+        }
+
+        val promoted = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val hasLocationPerm =
-                    ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
-                        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-                val fgType = if (hasLocationPerm) {
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                } else {
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                }
-                startForeground(NOTIFICATION_ID, notification, fgType)
+                startForeground(NOTIFICATION_ID, notification, desiredType)
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
+            true
+        }.getOrElse {
+            // Fallback on Android 14+: retry with pure HEALTH FGS type ifACTIVITY_RECOGNITION is held
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+                (desiredType and ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH) != 0 &&
+                desiredType != ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH
+            ) {
+                runCatching {
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
+                    lastForegroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH
+                    isInForeground = true
+                    lastNotifiedSignature = "$title|$subtitle|$showMute"
+                    return
+                }
+            }
+            false
+        }
+
+        if (promoted) {
             isInForeground = true
+            lastForegroundServiceType = desiredType
+            lastNotifiedSignature = "$title|$subtitle|$showMute"
+        } else {
+            // Never swallow startForeground failure without stopSelf() — prevents ForegroundServiceDidNotStartInTimeException
+            isInForeground = false
+            lastForegroundServiceType = 0
+            stopSelf()
         }
     }
 
@@ -1991,22 +2404,14 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
         if (!isInForeground) return
         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         isInForeground = false
+        lastForegroundServiceType = 0
+        lastNotifiedSignature = ""
     }
 
-    private fun buildForegroundNotification(
+    private fun computeForegroundNotificationCopy(
         state: MotionState,
         speedMps: Double
-    ): Notification {
-        val openIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        val pending = PendingIntent.getActivity(
-            this,
-            0,
-            openIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
+    ): Triple<String, String, Boolean> {
         val daily = currentDailySnapshot()
         val title = when {
             ptTrialPhase == PtTrialPhase.RUNNING_TRIAL ->
@@ -2028,10 +2433,37 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             intervalPhase != IntervalPhase.IDLE ->
                 "Pace ${TsPoliceBenchmark.formatPacePerKm(speedMps)} • Target ${TsPoliceBenchmark.formatDuration(intervalTargetRepSec)}/400m"
             isLowPowerStandby ->
-                "${String.format("%.2f km", daily.totalDistanceMeters / 1000.0)} • ${daily.totalSteps} steps • Battery Saver Standby"
+                "${String.format(Locale.US, "%.2f km", daily.totalDistanceMeters / 1000.0)} • ${daily.totalSteps} steps • Battery Saver Standby"
             else ->
-                "${String.format("%.2f km", daily.totalDistanceMeters / 1000.0)} • ${daily.totalSteps} steps • ${state.label}"
+                "${String.format(Locale.US, "%.2f km", daily.totalDistanceMeters / 1000.0)} • ${daily.totalSteps} steps • ${state.label}"
         }
+        val showMute = !isRecording && repository.pocketAudioMode != PocketAudioMode.MUTED
+        return Triple(title, subtitle, showMute)
+    }
+
+    private fun updateForegroundNotificationIfChanged(state: MotionState, speedMps: Double) {
+        val (title, subtitle, showMute) = computeForegroundNotificationCopy(state, speedMps)
+        val sig = "$title|$subtitle|$showMute"
+        if (sig == lastNotifiedSignature) return
+        lastNotifiedSignature = sig
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIFICATION_ID, buildForegroundNotificationFromCopy(title, subtitle, showMute))
+    }
+
+    private fun buildForegroundNotificationFromCopy(
+        title: String,
+        subtitle: String,
+        showMute: Boolean
+    ): Notification {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pending = PendingIntent.getActivity(
+            this,
+            0,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
@@ -2042,7 +2474,7 @@ class RunTrackingService : Service(), SensorEventListener, LocationListener {
             .setOnlyAlertOnce(true)
             .setContentIntent(pending)
 
-        if (!isRecording && repository.pocketAudioMode != PocketAudioMode.MUTED) {
+        if (showMute) {
             val muteIntent = Intent(this, RunTrackingService::class.java).apply {
                 action = ACTION_MUTE_POCKET_AUDIO
             }

@@ -32,7 +32,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
 ) {
     companion object {
         private const val DB_NAME = "ts_police_1600m.db"
-        private const val DB_VERSION = 4
+        private const val DB_VERSION = 5
         private const val TABLE_RUNS = "run_sessions"
         private const val TABLE_DAILY = "daily_activity"
         private const val TABLE_HOURLY = "sensor_hourly_buckets"
@@ -68,11 +68,110 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         private const val KEY_EXPECTED_EXAM_BATCH = "expected_exam_batch"
         private const val KEY_COACH_LEG_FEEL_DATE = "coach_leg_feel_date_iso"
         private const val KEY_COACH_LEG_FEEL_VALUE = "coach_leg_feel_value"
+        private const val KEY_REMOTE_DIAG_OPT_IN = "remote_diagnostics_opt_in"
 
-        // Oct 31 evening jog exactly as the phone recorded it (v1.0.16 session row + 20:16 daily totals)
-        private const val OCT31_RECORDED_JOG_SEC = 512.72
-        private const val OCT31_RECORDED_SESSION_M = 789.68
-        private const val OCT31_RECORDED_DAILY_JOG_M = 867.51
+        private const val LEGACY_SYNTHETIC_OCT31_START_MS = 1793450653486L
+
+        @Volatile
+        private var INSTANCE: RunRepository? = null
+
+        fun getInstance(context: Context): RunRepository {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: RunRepository(context.applicationContext).also { INSTANCE = it }
+            }
+        }
+
+        fun encodeSplitsJson(splits: List<LapSplit>): String {
+            val arr = JSONArray()
+            for (sp in splits) {
+                arr.put(
+                    JSONObject().apply {
+                        put("lap", sp.lapNumber)
+                        put("dist", sp.distanceMeters)
+                        put("dur", sp.lapDurationSec)
+                        put("cum", sp.cumulativeSec)
+                        put("state", sp.dominantState.name)
+                    }
+                )
+            }
+            return arr.toString()
+        }
+
+        fun decodeSplitsJson(raw: String): List<LapSplit> {
+            if (raw.isBlank()) return emptyList()
+            return runCatching {
+                val arr = JSONArray(raw)
+                val list = ArrayList<LapSplit>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val st = runCatching { MotionState.valueOf(o.optString("state")) }
+                        .getOrDefault(MotionState.RUNNING)
+                    list.add(
+                        LapSplit(
+                            lapNumber = o.optInt("lap", i + 1),
+                            distanceMeters = o.optDouble("dist", (i + 1) * 400.0),
+                            lapDurationSec = o.optDouble("dur", 0.0),
+                            cumulativeSec = o.optDouble("cum", 0.0),
+                            dominantState = st
+                        )
+                    )
+                }
+                list
+            }.getOrDefault(emptyList())
+        }
+
+        fun serializeSessionJson(s: RunSessionRecord): JSONObject {
+            return JSONObject().apply {
+                put("startedAtEpochMs", s.startedAtEpochMs)
+                put("dateIso", s.dateIso)
+                put("mode", s.mode.name)
+                put("distanceMeters", s.distanceMeters)
+                put("activeDurationSec", s.activeDurationSec)
+                put("pausedDurationSec", s.pausedDurationSec)
+                if (s.first1600mSplitSec != null && !s.first1600mSplitSec.isNaN()) {
+                    put("first1600mSplitSec", s.first1600mSplitSec)
+                } else {
+                    put("first1600mSplitSec", JSONObject.NULL)
+                }
+                put("equiv1600mSec", s.equiv1600mSec)
+                put("avgCadenceSpm", s.avgCadenceSpm)
+                put("maxSpeedMps", s.maxSpeedMps)
+                put("runningSec", s.runningSec)
+                put("joggingSec", s.joggingSec)
+                put("walkingSec", s.walkingSec)
+                put("splitsJson", encodeSplitsJson(s.lapSplits))
+                put("notes", s.notes)
+            }
+        }
+
+        fun parseSessionJson(o: JSONObject, fallbackDateIso: String = LocalDate.now().toString()): RunSessionRecord? {
+            val startMs = o.optLong("startedAtEpochMs", 0L)
+            if (startMs <= 0L) return null
+            val mode = runCatching { RunMode.valueOf(o.optString("mode")) }.getOrDefault(RunMode.TIMED_1600M)
+            val f1600 = if (o.has("first1600mSplitSec") && !o.isNull("first1600mSplitSec")) {
+                o.optDouble("first1600mSplitSec").takeIf { !it.isNaN() && it > 0.0 }
+            } else {
+                null
+            }
+            return RunSessionRecord(
+                startedAtEpochMs = startMs,
+                dateIso = o.optString("dateIso", fallbackDateIso).ifBlank { fallbackDateIso },
+                mode = mode,
+                distanceMeters = o.optDouble("distanceMeters", 1600.0),
+                activeDurationSec = o.optDouble("activeDurationSec", 480.0),
+                pausedDurationSec = o.optDouble("pausedDurationSec", 0.0),
+                first1600mSplitSec = f1600,
+                equiv1600mSec = o.optDouble("equiv1600mSec", 480.0),
+                avgCadenceSpm = o.optDouble("avgCadenceSpm", 0.0),
+                maxSpeedMps = o.optDouble("maxSpeedMps", 3.5),
+                runningSec = o.optDouble("runningSec", 0.0),
+                joggingSec = o.optDouble("joggingSec", 0.0),
+                walkingSec = o.optDouble("walkingSec", 0.0),
+                lapSplits = decodeSplitsJson(o.optString("splitsJson", "")),
+                notes = o.optString("notes", "Restored backup"),
+                isDemo = false
+            )
+        }
     }
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -193,6 +292,13 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         }
     }
 
+    override fun onConfigure(db: SQLiteDatabase) {
+        super.onConfigure(db)
+        if (!db.isReadOnly) {
+            db.enableWriteAheadLogging()
+        }
+    }
+
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         // Non-destructive upgrade: preserve all existing user run_sessions & daily_activity!
         if (oldVersion < 2) {
@@ -205,12 +311,25 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             createTuningTablesIfNeeded(db)
             ensureTransitionP20Column(db)
         }
-    }
-
-    override fun onOpen(db: SQLiteDatabase) {
-        super.onOpen(db)
-        if (!db.isReadOnly) {
+        if (oldVersion < 5) {
+            createDailyTableIfNeeded(db)
             createTuningTablesIfNeeded(db)
+            // Remove synthetic Oct 31 session ONLY on devices that never recorded real Oct 31 daily activity
+            val hasRealOct31Daily = runCatching {
+                db.rawQuery(
+                    "SELECT 1 FROM $TABLE_DAILY WHERE date_iso = '2026-10-31' AND is_demo = 0 LIMIT 1",
+                    null
+                ).use { it.moveToFirst() }
+            }.getOrDefault(false)
+            if (!hasRealOct31Daily) {
+                runCatching {
+                    db.delete(
+                        TABLE_RUNS,
+                        "started_at_ms = ? AND is_demo = 0",
+                        arrayOf(LEGACY_SYNTHETIC_OCT31_START_MS.toString())
+                    )
+                }
+            }
         }
     }
 
@@ -336,6 +455,10 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     var autoImportSamsungRuns: Boolean
         get() = prefs.getBoolean(KEY_AUTO_IMPORT_SAMSUNG_RUNS, true)
         set(value) = prefs.edit().putBoolean(KEY_AUTO_IMPORT_SAMSUNG_RUNS, value).apply()
+
+    var remoteDiagnosticsOptIn: Boolean
+        get() = prefs.getBoolean(KEY_REMOTE_DIAG_OPT_IN, false)
+        set(value) = prefs.edit().putBoolean(KEY_REMOTE_DIAG_OPT_IN, value).apply()
 
     private fun encodeSamsungSnapshot(snapshot: SamsungDailySnapshot): JSONObject {
         val workoutsArr = JSONArray()
@@ -579,7 +702,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         val low = (startedAtMs - windowMs).toString()
         val high = (startedAtMs + windowMs).toString()
         readableDatabase.rawQuery(
-            "SELECT COUNT(*) FROM $TABLE_RUNS WHERE started_at_ms BETWEEN ? AND ?",
+            "SELECT COUNT(*) FROM $TABLE_RUNS WHERE is_demo = 0 AND started_at_ms BETWEEN ? AND ?",
             arrayOf(low, high)
         ).use { c ->
             return c.moveToFirst() && c.getInt(0) > 0
@@ -595,295 +718,6 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         val updated = LinkedHashSet(prefs.getStringSet(KEY_IMPORTED_EXT_WORKOUTS, emptySet()) ?: emptySet())
         updated.add(externalId)
         prefs.edit().putStringSet(KEY_IMPORTED_EXT_WORKOUTS, updated).apply()
-    }
-
-    private fun healOct31LoosePocketWalkIfNeeded() {
-        val flagKey = "healed_v16_oct31_walk_only"
-        if (prefs.getBoolean(flagKey, false)) return
-        prefs.edit().putBoolean(flagKey, true).apply()
-        runCatching {
-            val targetDate = "2026-10-31"
-            val hasManualRunOnOct31 = getAllSessions().any { !it.isDemo && it.dateIso == targetDate }
-            if (hasManualRunOnOct31) return@runCatching
-
-            readableDatabase.query(
-                TABLE_DAILY,
-                null,
-                "date_iso = ?",
-                arrayOf(targetDate),
-                null,
-                null,
-                null
-            ).use { c ->
-                if (c.moveToFirst()) {
-                    val walkSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec"))
-                    val jogSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec"))
-                    val runSec = c.getDouble(c.getColumnIndexOrThrow("running_sec"))
-                    val walkM = c.getDouble(c.getColumnIndexOrThrow("walking_m"))
-                    val jogM = c.getDouble(c.getColumnIndexOrThrow("jogging_m"))
-                    val runM = c.getDouble(c.getColumnIndexOrThrow("running_m"))
-                    val totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps"))
-                    val maxSpd = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps"))
-                    val maxCad = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm"))
-                    val isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
-                    if ((jogSec > 0.0 || jogM > 0.0 || maxCad > 135.0) && runSec == 0.0) {
-                        upsertDailyActivity(
-                            DailyActivitySummary(
-                                dateIso = targetDate,
-                                walkingSec = walkSec + jogSec,
-                                joggingSec = 0.0,
-                                runningSec = 0.0,
-                                walkingMeters = walkM + jogM,
-                                joggingMeters = 0.0,
-                                runningMeters = runM,
-                                totalSteps = totalSteps,
-                                maxSpeedMps = maxSpd,
-                                maxCadenceSpm = if (maxCad > 135.0) 120.0 else maxCad,
-                                isDemo = isDemo
-                            )
-                        )
-                    }
-                }
-            }
-
-            // Also clean Oct 31 morning hourly buckets (00..09) where loose-pocket walk was misclassified as jog
-            val oct31Buckets = getHourlySensorBucketsForDates(listOf(targetDate))
-            for ((_, hb) in oct31Buckets) {
-                if (hb.hourOfDay <= 9 && hb.runSec == 0.0 && (hb.jogSec > 0.0 || hb.jogRunMeters > 0.0 || hb.maxCadenceSpm > 135.0)) {
-                    upsertHourlySensorBucket(
-                        hb.copy(
-                            walkSec = hb.walkSec + hb.jogSec,
-                            jogSec = 0.0,
-                            walkMeters = hb.walkMeters + hb.jogRunMeters,
-                            jogRunMeters = 0.0,
-                            maxCadenceSpm = if (hb.maxCadenceSpm > 135.0) 120.0 else hb.maxCadenceSpm
-                        )
-                    )
-                }
-            }
-        }
-    }
-
-    private fun healOct31EveningVehicleTrapIfNeeded() {
-        val flagKey = "healed_v17_oct31_evening_walk"
-        if (prefs.getBoolean(flagKey, false)) return
-        prefs.edit().putBoolean(flagKey, true).apply()
-        runCatching {
-            val targetDate = "2026-10-31"
-            // Restore ONLY the 17:40–18:09 outdoor walk (2,241.38m / 29m / ~2,950 steps trapped in VEHICLE)
-            readableDatabase.query(
-                TABLE_DAILY,
-                null,
-                "date_iso = ?",
-                arrayOf(targetDate),
-                null,
-                null,
-                null
-            ).use { c ->
-                if (c.moveToFirst()) {
-                    val walkSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec"))
-                    val jogSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec"))
-                    val runSec = c.getDouble(c.getColumnIndexOrThrow("running_sec"))
-                    val walkM = c.getDouble(c.getColumnIndexOrThrow("walking_m"))
-                    val jogM = c.getDouble(c.getColumnIndexOrThrow("jogging_m"))
-                    val runM = c.getDouble(c.getColumnIndexOrThrow("running_m"))
-                    val totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps"))
-                    val maxSpd = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps"))
-                    val maxCad = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm"))
-                    val isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
-                    if (totalSteps in 4000..9199) {
-                        upsertDailyActivity(
-                            DailyActivitySummary(
-                                dateIso = targetDate,
-                                walkingSec = walkSec + 1740.0,
-                                joggingSec = jogSec,
-                                runningSec = runSec,
-                                walkingMeters = walkM + 2241.38,
-                                joggingMeters = jogM,
-                                runningMeters = runM,
-                                totalSteps = totalSteps + 2950,
-                                maxSpeedMps = maxSpd,
-                                maxCadenceSpm = maxCad,
-                                isDemo = isDemo
-                            )
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Restores the user's Oct 31 evening jog (started 18:14:13) that v1.0.17's migration wrongly deleted,
-     * using ONLY the values the phone originally recorded (v1.0.16 session row + daily totals in the 20:16 pull):
-     * session `512.72s` / `789.68m` / avg `129.1 spm` / max `2.042 m/s`; daily jog `512.72s` / `867.51m`.
-     */
-    private fun restoreOct31EveningJogSessionIfNeeded() {
-        val flagKey = "restored_v18_oct31_evening_jog"
-        if (prefs.getBoolean(flagKey, false)) return
-        prefs.edit().putBoolean(flagKey, true).apply()
-        runCatching {
-            val targetDate = "2026-10-31"
-            val eveningJogStartMs = 1793450653486L // 2026-10-31 18:14:13.486 IST
-            val jogSecToRestore = OCT31_RECORDED_JOG_SEC
-            val jogMetersToRestore = OCT31_RECORDED_DAILY_JOG_M
-
-            // 1. Re-insert the 18:14 evening jog session into TABLE_RUNS if absent
-            if (!hasSessionNear(eveningJogStartMs, windowMs = 10L * 60_000L)) {
-                insertSession(
-                    RunSessionRecord(
-                        startedAtEpochMs = eveningJogStartMs,
-                        dateIso = targetDate,
-                        mode = RunMode.OPEN_PRACTICE,
-                        distanceMeters = OCT31_RECORDED_SESSION_M,
-                        activeDurationSec = jogSecToRestore,
-                        pausedDurationSec = 0.0,
-                        first1600mSplitSec = null,
-                        equiv1600mSec = TsPoliceBenchmark.computeEquiv1600mSec(
-                            distanceMeters = OCT31_RECORDED_SESSION_M,
-                            activeDurationSec = jogSecToRestore,
-                            first1600mSplitSec = null
-                        ),
-                        avgCadenceSpm = 129.10,
-                        maxSpeedMps = 2.042,
-                        runningSec = 0.0,
-                        joggingSec = jogSecToRestore,
-                        walkingSec = 192.87,
-                        lapSplits = emptyList(),
-                        notes = "All-Day Auto-Detected Jog (789m)",
-                        isDemo = false
-                    )
-                )
-            }
-
-            // 2. Restore joggingSec & joggingMeters on 2026-10-31 TABLE_DAILY (moving back out of walking)
-            readableDatabase.query(
-                TABLE_DAILY,
-                null,
-                "date_iso = ?",
-                arrayOf(targetDate),
-                null,
-                null,
-                null
-            ).use { c ->
-                if (c.moveToFirst()) {
-                    val walkSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec"))
-                    val jogSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec"))
-                    val runSec = c.getDouble(c.getColumnIndexOrThrow("running_sec"))
-                    val walkM = c.getDouble(c.getColumnIndexOrThrow("walking_m"))
-                    val jogM = c.getDouble(c.getColumnIndexOrThrow("jogging_m"))
-                    val runM = c.getDouble(c.getColumnIndexOrThrow("running_m"))
-                    val totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps"))
-                    val maxSpd = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps"))
-                    val maxCad = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm"))
-                    val isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
-                    if (jogSec < 300.0 && walkSec >= jogSecToRestore) {
-                        val deltaJogSec = (jogSecToRestore - jogSec).coerceAtLeast(0.0)
-                        val deltaJogM = (jogMetersToRestore - jogM).coerceAtLeast(0.0)
-                        upsertDailyActivity(
-                            DailyActivitySummary(
-                                dateIso = targetDate,
-                                walkingSec = (walkSec - deltaJogSec).coerceAtLeast(0.0),
-                                joggingSec = jogSec + deltaJogSec,
-                                runningSec = runSec,
-                                walkingMeters = (walkM - deltaJogM).coerceAtLeast(0.0),
-                                joggingMeters = jogM + deltaJogM,
-                                runningMeters = runM,
-                                totalSteps = totalSteps,
-                                maxSpeedMps = maxOf(maxSpd, 2.042),
-                                maxCadenceSpm = maxOf(maxCad, 158.59),
-                                isDemo = isDemo
-                            )
-                        )
-                    }
-                }
-            }
-
-            // 3. Restore 2026-10-31T18 hourly bucket jogSec & jogRunMeters
-            val oct31Buckets = getHourlySensorBucketsForDates(listOf(targetDate))
-            oct31Buckets["2026-10-31T18"]?.let { hb18 ->
-                if (hb18.jogSec < 300.0 && hb18.walkSec >= jogSecToRestore) {
-                    val dSec = (jogSecToRestore - hb18.jogSec).coerceAtLeast(0.0)
-                    val dM = (jogMetersToRestore - hb18.jogRunMeters).coerceAtLeast(0.0)
-                    upsertHourlySensorBucket(
-                        hb18.copy(
-                            walkSec = (hb18.walkSec - dSec).coerceAtLeast(0.0),
-                            jogSec = hb18.jogSec + dSec,
-                            walkMeters = (hb18.walkMeters - dM).coerceAtLeast(0.0),
-                            jogRunMeters = hb18.jogRunMeters + dM,
-                            maxCadenceSpm = maxOf(hb18.maxCadenceSpm, 158.59),
-                            maxSpeedMps = maxOf(hb18.maxSpeedMps, 2.042)
-                        )
-                    )
-                }
-            }
-        }
-    }
-
-    /**
-     * v1.0.18 restored the Oct 31 evening jog with made-up figures (630.44s / 968.6m / 142.4 spm) that the
-     * phone never recorded. Puts the session, daily totals and 18:00 hourly bucket back to the real recorded
-     * values (512.72s / 789.68m session, 867.51m daily jog, 129.1 spm), returning the excess to walking.
-     */
-    private fun correctOct31JogToRecordedValuesIfNeeded() {
-        val flagKey = "corrected_v19_oct31_jog_recorded_values"
-        if (prefs.getBoolean(flagKey, false)) return
-        prefs.edit().putBoolean(flagKey, true).apply()
-        runCatching {
-            val targetDate = "2026-10-31"
-            val badJogSec = 630.44
-            val badJogM = 968.60
-            val excessSec = badJogSec - OCT31_RECORDED_JOG_SEC
-            val excessM = badJogM - OCT31_RECORDED_DAILY_JOG_M
-
-            // 1. Session row (only the one v1.0.18 inserted)
-            val sessionValues = ContentValues().apply {
-                put("distance_m", OCT31_RECORDED_SESSION_M)
-                put("active_sec", OCT31_RECORDED_JOG_SEC)
-                put("jogging_sec", OCT31_RECORDED_JOG_SEC)
-                put("walking_sec", 192.87)
-                put("avg_cadence_spm", 129.10)
-                put(
-                    "equiv_1600_sec",
-                    TsPoliceBenchmark.computeEquiv1600mSec(OCT31_RECORDED_SESSION_M, OCT31_RECORDED_JOG_SEC, null)
-                )
-                put("notes", "All-Day Auto-Detected Jog (789m)")
-            }
-            writableDatabase.update(
-                TABLE_RUNS,
-                sessionValues,
-                "date_iso = ? AND is_demo = 0 AND notes = ?",
-                arrayOf(targetDate, "All-Day Auto-Detected Jog (969m)")
-            )
-
-            // 2. Daily totals: only if they still hold the v1.0.18 numbers
-            val cur = readDailyRow(targetDate)
-            if (cur != null && kotlin.math.abs(cur.joggingSec - badJogSec) < 1.0) {
-                upsertDailyActivity(
-                    cur.copy(
-                        walkingSec = cur.walkingSec + excessSec,
-                        joggingSec = OCT31_RECORDED_JOG_SEC,
-                        walkingMeters = cur.walkingMeters +
-                            (cur.joggingMeters - OCT31_RECORDED_DAILY_JOG_M).coerceAtLeast(0.0),
-                        joggingMeters = OCT31_RECORDED_DAILY_JOG_M
-                    )
-                )
-            }
-
-            // 3. 18:00 hourly bucket
-            getHourlySensorBucketsForDates(listOf(targetDate))["2026-10-31T18"]?.let { hb18 ->
-                if (kotlin.math.abs(hb18.jogSec - badJogSec) < 1.0) {
-                    upsertHourlySensorBucket(
-                        hb18.copy(
-                            walkSec = hb18.walkSec + excessSec,
-                            jogSec = OCT31_RECORDED_JOG_SEC,
-                            walkMeters = hb18.walkMeters + if (kotlin.math.abs(hb18.jogRunMeters - badJogM) < 1.0) excessM else 0.0,
-                            jogRunMeters = if (kotlin.math.abs(hb18.jogRunMeters - badJogM) < 1.0) OCT31_RECORDED_DAILY_JOG_M else hb18.jogRunMeters
-                        )
-                    )
-                }
-            }
-        }
     }
 
     private fun readDailyRow(dateIso: String): DailyActivitySummary? {
@@ -906,36 +740,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     }
 
     fun getDailyActivity(dateIso: String): DailyActivitySummary {
-        healOct31LoosePocketWalkIfNeeded()
-        healOct31EveningVehicleTrapIfNeeded()
-        restoreOct31EveningJogSessionIfNeeded()
-        correctOct31JogToRecordedValuesIfNeeded()
-        readableDatabase.query(
-            TABLE_DAILY,
-            null,
-            "date_iso = ?",
-            arrayOf(dateIso),
-            null,
-            null,
-            null
-        ).use { c ->
-            if (c.moveToFirst()) {
-                return DailyActivitySummary(
-                    dateIso = c.getString(c.getColumnIndexOrThrow("date_iso")),
-                    walkingSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec")),
-                    joggingSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec")),
-                    runningSec = c.getDouble(c.getColumnIndexOrThrow("running_sec")),
-                    walkingMeters = c.getDouble(c.getColumnIndexOrThrow("walking_m")),
-                    joggingMeters = c.getDouble(c.getColumnIndexOrThrow("jogging_m")),
-                    runningMeters = c.getDouble(c.getColumnIndexOrThrow("running_m")),
-                    totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps")),
-                    maxSpeedMps = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps")),
-                    maxCadenceSpm = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm")),
-                    isDemo = c.getInt(c.getColumnIndexOrThrow("is_demo")) == 1
-                )
-            }
-        }
-        return DailyActivitySummary(dateIso = dateIso)
+        return readDailyRow(dateIso) ?: DailyActivitySummary(dateIso = dateIso)
     }
 
     fun upsertDailyActivity(summary: DailyActivitySummary) {
@@ -1021,9 +826,6 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     }
 
     fun getAllSessions(): List<RunSessionRecord> {
-        healOct31EveningVehicleTrapIfNeeded()
-        restoreOct31EveningJogSessionIfNeeded()
-        correctOct31JogToRecordedValuesIfNeeded()
         val out = mutableListOf<RunSessionRecord>()
         readableDatabase.query(
             TABLE_RUNS,
@@ -1083,6 +885,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     /**
      * Seeds realistic 12-day Telangana Police 1600m practice progression so the user can preview
      * the trend chart & Days-to-7:15 ETA engine immediately (removable in 1 tap).
+     * Never overwrites real non-demo (`is_demo = 0`) daily activity rows.
      */
     fun seedSampleProgressionIfRequested() {
         clearDemoSessions()
@@ -1102,6 +905,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
 
         for (s in samples) {
             val date = today.minusDays(s.daysAgo.toLong())
+            val dateIso = date.toString()
             val startMs = date.atTime(6, 15).atZone(zone).toInstant().toEpochMilli()
             val runSec = s.durationSec * s.runShare
             val jogSec = s.durationSec * (1.0 - s.runShare)
@@ -1119,7 +923,7 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             insertSession(
                 RunSessionRecord(
                     startedAtEpochMs = startMs,
-                    dateIso = date.toString(),
+                    dateIso = dateIso,
                     mode = s.mode,
                     distanceMeters = s.distanceM,
                     activeDurationSec = s.durationSec,
@@ -1141,24 +945,27 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
                 )
             )
 
-            // Also seed whole-day automatic walk + jog/run activity for those past days
-            val walkSec = 1950.0 + (s.daysAgo * 85.0)
-            val walkM = walkSec * 1.28
-            upsertDailyActivity(
-                DailyActivitySummary(
-                    dateIso = date.toString(),
-                    walkingSec = walkSec,
-                    joggingSec = jogSec,
-                    runningSec = runSec,
-                    walkingMeters = walkM,
-                    joggingMeters = s.distanceM * (1.0 - s.runShare),
-                    runningMeters = s.distanceM * s.runShare,
-                    totalSteps = ((walkM / 0.76) + (s.distanceM / 1.18)).toInt(),
-                    maxSpeedMps = (s.distanceM / s.durationSec) * 1.14,
-                    maxCadenceSpm = if (s.runShare > 0.7) 176.0 else 164.0,
-                    isDemo = true
+            // Seed whole-day sample activity ONLY if the user has no real non-demo daily row on this date!
+            val existingDaily = readDailyRow(dateIso)
+            if (existingDaily == null || existingDaily.isDemo) {
+                val walkSec = 1950.0 + (s.daysAgo * 85.0)
+                val walkM = walkSec * 1.28
+                upsertDailyActivity(
+                    DailyActivitySummary(
+                        dateIso = dateIso,
+                        walkingSec = walkSec,
+                        joggingSec = jogSec,
+                        runningSec = runSec,
+                        walkingMeters = walkM,
+                        joggingMeters = s.distanceM * (1.0 - s.runShare),
+                        runningMeters = s.distanceM * s.runShare,
+                        totalSteps = ((walkM / 0.76) + (s.distanceM / 1.18)).toInt(),
+                        maxSpeedMps = (s.distanceM / s.durationSec) * 1.14,
+                        maxCadenceSpm = if (s.runShare > 0.7) 176.0 else 164.0,
+                        isDemo = true
+                    )
                 )
-            )
+            }
         }
     }
 
@@ -1171,82 +978,91 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         val note: String
     )
 
-    private fun encodeSplits(splits: List<LapSplit>): String {
-        val arr = JSONArray()
-        for (sp in splits) {
-            arr.put(
-                JSONObject().apply {
-                    put("lap", sp.lapNumber)
-                    put("dist", sp.distanceMeters)
-                    put("dur", sp.lapDurationSec)
-                    put("cum", sp.cumulativeSec)
-                    put("state", sp.dominantState.name)
-                }
-            )
-        }
-        return arr.toString()
-    }
+    private fun encodeSplits(splits: List<LapSplit>): String = encodeSplitsJson(splits)
 
-    private fun decodeSplits(raw: String): List<LapSplit> {
-        if (raw.isBlank()) return emptyList()
-        return runCatching {
-            val arr = JSONArray(raw)
-            val list = ArrayList<LapSplit>(arr.length())
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val st = runCatching { MotionState.valueOf(o.optString("state")) }
-                    .getOrDefault(MotionState.RUNNING)
-                list.add(
-                    LapSplit(
-                        lapNumber = o.optInt("lap", i + 1),
-                        distanceMeters = o.optDouble("dist", (i + 1) * 400.0),
-                        lapDurationSec = o.optDouble("dur", 0.0),
-                        cumulativeSec = o.optDouble("cum", 0.0),
-                        dominantState = st
+    private fun decodeSplits(raw: String): List<LapSplit> = decodeSplitsJson(raw)
+
+    private fun getAllNonDemoDailyActivities(): List<DailyActivitySummary> {
+        val out = mutableListOf<DailyActivitySummary>()
+        readableDatabase.query(
+            TABLE_DAILY,
+            null,
+            "is_demo = 0",
+            null,
+            null,
+            null,
+            "date_iso ASC"
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(
+                    DailyActivitySummary(
+                        dateIso = c.getString(c.getColumnIndexOrThrow("date_iso")),
+                        walkingSec = c.getDouble(c.getColumnIndexOrThrow("walking_sec")),
+                        joggingSec = c.getDouble(c.getColumnIndexOrThrow("jogging_sec")),
+                        runningSec = c.getDouble(c.getColumnIndexOrThrow("running_sec")),
+                        walkingMeters = c.getDouble(c.getColumnIndexOrThrow("walking_m")),
+                        joggingMeters = c.getDouble(c.getColumnIndexOrThrow("jogging_m")),
+                        runningMeters = c.getDouble(c.getColumnIndexOrThrow("running_m")),
+                        totalSteps = c.getInt(c.getColumnIndexOrThrow("total_steps")),
+                        maxSpeedMps = c.getDouble(c.getColumnIndexOrThrow("max_speed_mps")),
+                        maxCadenceSpm = c.getDouble(c.getColumnIndexOrThrow("max_cadence_spm")),
+                        isDemo = false
                     )
                 )
             }
-            list
-        }.getOrDefault(emptyList())
+        }
+        return out
+    }
+
+    private fun getAllHourlyBuckets(): List<HourlySensorBucket> {
+        val out = mutableListOf<HourlySensorBucket>()
+        readableDatabase.query(
+            TABLE_HOURLY,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "date_iso ASC, hour_of_day ASC"
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(readHourlyRow(c))
+            }
+        }
+        return out
     }
 
     /**
-     * Exports all non-demo run sessions, daily activity history, and runner profile into portable JSON.
+     * Exports all non-demo run sessions, uncapped daily activity history, hourly sensor buckets,
+     * Samsung Health snapshots, and full runner profile settings into portable JSON (`schemaVersion = 2`).
      */
     fun exportBackupJson(): String {
         val root = JSONObject()
-        root.put("schemaVersion", 1)
+        root.put("schemaVersion", 2)
         root.put("exportedAtIso", LocalDate.now().toString())
         root.put("targetTimeSec", targetTimeSec)
+        root.put("goalDeadlineIso", goalDeadlineIso)
         root.put("runnerHeightCm", runnerHeightCm)
+        root.put("runnerWeightKg", runnerWeightKg)
+        root.put("expectedExamBatch", expectedExamBatch.name)
         root.put("strideCalibrationScale", strideCalibrationScale)
+        root.put("hasSamsungStrideCalibration", hasSamsungStrideCalibration)
+        root.put("runningThresholdMps", runningThresholdMps)
+        root.put("voiceCoachEnabled", voiceCoachEnabled)
+        root.put("pocketAudioMode", pocketAudioMode.name)
+        root.put("allDayTrackingEnabled", allDayTrackingEnabled)
+        root.put("indoorStepFallbackEnabled", indoorStepFallbackEnabled)
+        root.put("autoCalibrateFromSamsung", autoCalibrateFromSamsung)
+        root.put("autoImportSamsungRuns", autoImportSamsungRuns)
 
         val runsArr = JSONArray()
         for (s in getAllSessions().filter { !it.isDemo }) {
-            runsArr.put(
-                JSONObject().apply {
-                    put("startedAtEpochMs", s.startedAtEpochMs)
-                    put("dateIso", s.dateIso)
-                    put("mode", s.mode.name)
-                    put("distanceMeters", s.distanceMeters)
-                    put("activeDurationSec", s.activeDurationSec)
-                    put("pausedDurationSec", s.pausedDurationSec)
-                    if (s.first1600mSplitSec != null) put("first1600mSplitSec", s.first1600mSplitSec)
-                    put("equiv1600mSec", s.equiv1600mSec)
-                    put("avgCadenceSpm", s.avgCadenceSpm)
-                    put("maxSpeedMps", s.maxSpeedMps)
-                    put("runningSec", s.runningSec)
-                    put("joggingSec", s.joggingSec)
-                    put("walkingSec", s.walkingSec)
-                    put("splitsJson", encodeSplits(s.lapSplits))
-                    put("notes", s.notes)
-                }
-            )
+            runsArr.put(serializeSessionJson(s))
         }
         root.put("sessions", runsArr)
 
         val dailyArr = JSONArray()
-        for (d in getRecentDailyActivities(60).filter { !it.isDemo }) {
+        for (d in getAllNonDemoDailyActivities()) {
             dailyArr.put(
                 JSONObject().apply {
                     put("dateIso", d.dateIso)
@@ -1263,6 +1079,35 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
             )
         }
         root.put("dailyActivity", dailyArr)
+
+        val hourlyArr = JSONArray()
+        for (hb in getAllHourlyBuckets()) {
+            hourlyArr.put(
+                JSONObject().apply {
+                    put("bucketKey", hb.bucketKey)
+                    put("dateIso", hb.dateIso)
+                    put("hourOfDay", hb.hourOfDay)
+                    put("hwSteps", hb.hwSteps)
+                    put("fallbackSteps", hb.fallbackSteps)
+                    put("walkSec", hb.walkSec)
+                    put("jogSec", hb.jogSec)
+                    put("runSec", hb.runSec)
+                    put("vehicleSec", hb.vehicleSec)
+                    put("lowPowerSec", hb.lowPowerSec)
+                    put("walkMeters", hb.walkMeters)
+                    put("jogRunMeters", hb.jogRunMeters)
+                    put("gpsMeters", hb.gpsMeters)
+                    put("strideMeters", hb.strideMeters)
+                    put("maxSpeedMps", hb.maxSpeedMps)
+                    put("maxCadenceSpm", hb.maxCadenceSpm)
+                    put("maxAccelRms", hb.maxAccelRms)
+                    put("gpsFixCount", hb.gpsFixCount)
+                    put("gpsAccSumMeters", hb.gpsAccSumMeters)
+                }
+            )
+        }
+        root.put("hourlySensorBuckets", hourlyArr)
+
         val samArr = JSONArray()
         for ((_, snap) in getAllCachedSamsungSnapshots()) {
             samArr.put(encodeSamsungSnapshot(snap))
@@ -1272,41 +1117,162 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
     }
 
     /**
-     * Restores non-duplicate sessions from an exported JSON backup string. Returns count imported.
+     * Transactionally restores sessions, daily activity, hourly buckets, Samsung Health snapshots,
+     * and runner profile settings from an exported JSON backup (`schemaVersion` 1 or 2).
+     * Returns count of restored items (sessions + daily activity days when sessions == 0).
      */
     fun importBackupJson(rawJson: String): Int {
         val root = JSONObject(rawJson)
+
+        if (root.has("targetTimeSec") && !root.isNull("targetTimeSec")) {
+            targetTimeSec = root.optDouble("targetTimeSec", targetTimeSec).coerceIn(300.0, 900.0)
+        }
+        if (root.has("goalDeadlineIso") && !root.isNull("goalDeadlineIso")) {
+            val dl = root.optString("goalDeadlineIso", "").trim()
+            if (dl.isNotBlank() && runCatching { LocalDate.parse(dl) }.isSuccess) {
+                goalDeadlineIso = dl
+            }
+        }
+        if (root.has("runnerHeightCm") && !root.isNull("runnerHeightCm")) {
+            runnerHeightCm = root.optInt("runnerHeightCm", runnerHeightCm)
+        }
+        if (root.has("runnerWeightKg") && !root.isNull("runnerWeightKg")) {
+            runnerWeightKg = root.optInt("runnerWeightKg", runnerWeightKg)
+        }
+        if (root.has("expectedExamBatch") && !root.isNull("expectedExamBatch")) {
+            runCatching { ExamTimeBatch.valueOf(root.optString("expectedExamBatch")) }
+                .onSuccess { expectedExamBatch = it }
+        }
+        if (root.has("strideCalibrationScale") && !root.isNull("strideCalibrationScale")) {
+            strideCalibrationScale = root.optDouble("strideCalibrationScale", strideCalibrationScale)
+        }
+        if (root.has("hasSamsungStrideCalibration") && !root.isNull("hasSamsungStrideCalibration")) {
+            hasSamsungStrideCalibration = root.optBoolean("hasSamsungStrideCalibration", hasSamsungStrideCalibration)
+        }
+        if (root.has("runningThresholdMps") && !root.isNull("runningThresholdMps")) {
+            runningThresholdMps = root.optDouble("runningThresholdMps", runningThresholdMps)
+        }
+        if (root.has("voiceCoachEnabled") && !root.isNull("voiceCoachEnabled")) {
+            voiceCoachEnabled = root.optBoolean("voiceCoachEnabled", voiceCoachEnabled)
+        }
+        if (root.has("pocketAudioMode") && !root.isNull("pocketAudioMode")) {
+            runCatching { PocketAudioMode.valueOf(root.optString("pocketAudioMode")) }
+                .onSuccess { pocketAudioMode = it }
+        }
+        if (root.has("allDayTrackingEnabled") && !root.isNull("allDayTrackingEnabled")) {
+            allDayTrackingEnabled = root.optBoolean("allDayTrackingEnabled", allDayTrackingEnabled)
+        }
+        if (root.has("indoorStepFallbackEnabled") && !root.isNull("indoorStepFallbackEnabled")) {
+            indoorStepFallbackEnabled = root.optBoolean("indoorStepFallbackEnabled", indoorStepFallbackEnabled)
+        }
+        if (root.has("autoCalibrateFromSamsung") && !root.isNull("autoCalibrateFromSamsung")) {
+            autoCalibrateFromSamsung = root.optBoolean("autoCalibrateFromSamsung", autoCalibrateFromSamsung)
+        }
+        if (root.has("autoImportSamsungRuns") && !root.isNull("autoImportSamsungRuns")) {
+            autoImportSamsungRuns = root.optBoolean("autoImportSamsungRuns", autoImportSamsungRuns)
+        }
+
         val sessionsArr = root.optJSONArray("sessions") ?: JSONArray()
-        var imported = 0
-        for (i in 0 until sessionsArr.length()) {
-            val o = sessionsArr.getJSONObject(i)
-            val startMs = o.optLong("startedAtEpochMs", 0L)
-            if (startMs <= 0L || hasSessionNear(startMs, windowMs = 60_000L)) continue
-            val mode = runCatching { RunMode.valueOf(o.optString("mode")) }.getOrDefault(RunMode.TIMED_1600M)
-            val f1600 = if (o.has("first1600mSplitSec")) o.optDouble("first1600mSplitSec") else null
-            insertSession(
-                RunSessionRecord(
-                    startedAtEpochMs = startMs,
-                    dateIso = o.optString("dateIso", LocalDate.now().toString()),
-                    mode = mode,
-                    distanceMeters = o.optDouble("distanceMeters", 1600.0),
-                    activeDurationSec = o.optDouble("activeDurationSec", 480.0),
-                    pausedDurationSec = o.optDouble("pausedDurationSec", 0.0),
-                    first1600mSplitSec = f1600,
-                    equiv1600mSec = o.optDouble("equiv1600mSec", 480.0),
-                    avgCadenceSpm = o.optDouble("avgCadenceSpm", 165.0),
-                    maxSpeedMps = o.optDouble("maxSpeedMps", 3.5),
-                    runningSec = o.optDouble("runningSec", 0.0),
-                    joggingSec = o.optDouble("joggingSec", 0.0),
-                    walkingSec = o.optDouble("walkingSec", 0.0),
-                    lapSplits = decodeSplits(o.optString("splitsJson", "")),
-                    notes = o.optString("notes", "Restored backup"),
+        val dailyArr = root.optJSONArray("dailyActivity") ?: JSONArray()
+        val hourlyArr = root.optJSONArray("hourlySensorBuckets") ?: JSONArray()
+        val samArr = root.optJSONArray("samsungSnapshots") ?: JSONArray()
+
+        var importedSessions = 0
+        var importedDaily = 0
+
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            for (i in 0 until sessionsArr.length()) {
+                val o = sessionsArr.optJSONObject(i) ?: continue
+                val parsed = parseSessionJson(o) ?: continue
+                if (hasSessionNear(parsed.startedAtEpochMs, windowMs = 60_000L)) continue
+                insertSession(parsed)
+                importedSessions++
+            }
+
+            for (i in 0 until dailyArr.length()) {
+                val d = dailyArr.optJSONObject(i) ?: continue
+                val dateIso = d.optString("dateIso", "").trim()
+                if (dateIso.isBlank()) continue
+                val incoming = DailyActivitySummary(
+                    dateIso = dateIso,
+                    walkingSec = d.optDouble("walkingSec", 0.0),
+                    joggingSec = d.optDouble("joggingSec", 0.0),
+                    runningSec = d.optDouble("runningSec", 0.0),
+                    walkingMeters = d.optDouble("walkingMeters", 0.0),
+                    joggingMeters = d.optDouble("joggingMeters", 0.0),
+                    runningMeters = d.optDouble("runningMeters", 0.0),
+                    totalSteps = d.optInt("totalSteps", 0),
+                    maxSpeedMps = d.optDouble("maxSpeedMps", 0.0),
+                    maxCadenceSpm = d.optDouble("maxCadenceSpm", 0.0),
                     isDemo = false
                 )
-            )
-            imported++
+                val existing = readDailyRow(dateIso)
+                val merged = if (existing != null && !existing.isDemo) {
+                    DailyActivitySummary(
+                        dateIso = dateIso,
+                        walkingSec = maxOf(existing.walkingSec, incoming.walkingSec),
+                        joggingSec = maxOf(existing.joggingSec, incoming.joggingSec),
+                        runningSec = maxOf(existing.runningSec, incoming.runningSec),
+                        walkingMeters = maxOf(existing.walkingMeters, incoming.walkingMeters),
+                        joggingMeters = maxOf(existing.joggingMeters, incoming.joggingMeters),
+                        runningMeters = maxOf(existing.runningMeters, incoming.runningMeters),
+                        totalSteps = maxOf(existing.totalSteps, incoming.totalSteps),
+                        maxSpeedMps = maxOf(existing.maxSpeedMps, incoming.maxSpeedMps),
+                        maxCadenceSpm = maxOf(existing.maxCadenceSpm, incoming.maxCadenceSpm),
+                        isDemo = false
+                    )
+                } else {
+                    incoming
+                }
+                upsertDailyActivity(merged)
+                importedDaily++
+            }
+
+            for (i in 0 until hourlyArr.length()) {
+                val h = hourlyArr.optJSONObject(i) ?: continue
+                val bKey = h.optString("bucketKey", "").trim()
+                val dateIso = h.optString("dateIso", "").trim()
+                if (bKey.isBlank() || dateIso.isBlank()) continue
+                val hour = h.optInt("hourOfDay", 0).coerceIn(0, 23)
+                val cur = getHourlySensorBucket(bKey, dateIso, hour)
+                upsertHourlySensorBucket(
+                    HourlySensorBucket(
+                        bucketKey = bKey,
+                        dateIso = dateIso,
+                        hourOfDay = hour,
+                        hwSteps = maxOf(cur.hwSteps, h.optInt("hwSteps", 0)),
+                        fallbackSteps = maxOf(cur.fallbackSteps, h.optInt("fallbackSteps", 0)),
+                        walkSec = maxOf(cur.walkSec, h.optDouble("walkSec", 0.0)),
+                        jogSec = maxOf(cur.jogSec, h.optDouble("jogSec", 0.0)),
+                        runSec = maxOf(cur.runSec, h.optDouble("runSec", 0.0)),
+                        vehicleSec = maxOf(cur.vehicleSec, h.optDouble("vehicleSec", 0.0)),
+                        lowPowerSec = maxOf(cur.lowPowerSec, h.optDouble("lowPowerSec", 0.0)),
+                        walkMeters = maxOf(cur.walkMeters, h.optDouble("walkMeters", 0.0)),
+                        jogRunMeters = maxOf(cur.jogRunMeters, h.optDouble("jogRunMeters", 0.0)),
+                        gpsMeters = maxOf(cur.gpsMeters, h.optDouble("gpsMeters", 0.0)),
+                        strideMeters = maxOf(cur.strideMeters, h.optDouble("strideMeters", 0.0)),
+                        maxSpeedMps = maxOf(cur.maxSpeedMps, h.optDouble("maxSpeedMps", 0.0)),
+                        maxCadenceSpm = maxOf(cur.maxCadenceSpm, h.optDouble("maxCadenceSpm", 0.0)),
+                        maxAccelRms = maxOf(cur.maxAccelRms, h.optDouble("maxAccelRms", 0.0)),
+                        gpsFixCount = maxOf(cur.gpsFixCount, h.optInt("gpsFixCount", 0)),
+                        gpsAccSumMeters = maxOf(cur.gpsAccSumMeters, h.optDouble("gpsAccSumMeters", 0.0))
+                    )
+                )
+            }
+
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
         }
-        return imported
+
+        for (i in 0 until samArr.length()) {
+            val snapObj = samArr.optJSONObject(i) ?: continue
+            runCatching { decodeSamsungSnapshot(snapObj) }.onSuccess { saveSamsungSnapshot(it) }
+        }
+
+        return if (importedSessions > 0) importedSessions else importedDaily
     }
 
     var lastTuningSyncSummary: String
@@ -1338,7 +1304,6 @@ class RunRepository(context: Context) : SQLiteOpenHelper(
         set(value) = prefs.edit().putString(KEY_CACHED_DEEP_SAMSUNG_48H_JSON, value).apply()
 
     fun getHourlySensorBucket(bucketKey: String, dateIso: String, hourOfDay: Int): HourlySensorBucket {
-        restoreOct31EveningJogSessionIfNeeded()
         readableDatabase.query(
             TABLE_HOURLY,
             null,

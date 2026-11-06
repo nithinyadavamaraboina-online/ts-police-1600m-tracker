@@ -1,5 +1,6 @@
 package com.tspolice.runtracker.domain
 
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -275,11 +276,11 @@ object SamsungHealthComparator {
             samsung.steps == 0 && samsung.distanceMeters < 5.0 ->
                 "No ${samsung.sourceLabel} steps recorded for $dayLabel"
             overallPct != null && overallPct >= 92.0 ->
-                String.format("%.1f%% Accuracy Match vs %s (%s)", overallPct, samsung.sourceLabel, dayLabel)
+                String.format(Locale.US, "%.1f%% Accuracy Match vs %s (%s)", overallPct, samsung.sourceLabel, dayLabel)
             samsung.steps - tracker.totalSteps >= 350 ->
                 "${samsung.sourceLabel} has +${samsung.steps - tracker.totalSteps} extra steps ($dayLabel)"
             overallPct != null ->
-                String.format("%.1f%% Match vs %s (%s)", overallPct, samsung.sourceLabel, dayLabel)
+                String.format(Locale.US, "%.1f%% Match vs %s (%s)", overallPct, samsung.sourceLabel, dayLabel)
             else ->
                 "Synced with ${samsung.sourceLabel} ($dayLabel)"
         }
@@ -291,6 +292,7 @@ object SamsungHealthComparator {
                 "Pre-update bike/vibration drift detected on $dayLabel — tap 'Align' below to clean $dayLabel to ${samsung.sourceLabel} ground truth."
             samsungStrideM != null ->
                 String.format(
+                    Locale.US,
                     "%s stride %.2f m/step → Personal stride scale %.2fx (%s). Use 'Align' if you wore a Watch or walked without the app.",
                     samsung.sourceLabel,
                     samsungStrideM,
@@ -331,36 +333,38 @@ object SamsungHealthComparator {
     ): String {
         val sb = StringBuilder()
         sb.appendLine("TS POLICE 1.6K vs SAMSUNG HEALTH — YESTERDAY & TODAY REPORT")
-        sb.appendLine("Personal Stride Calibration: ${String.format("%.2fx", effectiveStrideScale)}")
+        sb.appendLine("Personal Stride Calibration: ${String.format(Locale.US, "%.2fx", effectiveStrideScale)}")
         sb.appendLine("===========================================================")
 
         fun appendDayBlock(title: String, trk: DailyActivitySummary, sam: SamsungDailySnapshot?) {
             sb.appendLine()
             sb.appendLine("[$title • ${trk.dateIso}]")
             if (sam == null) {
-                sb.appendLine("  Tracker : ${trk.totalSteps} steps | ${String.format("%.2f km", trk.totalDistanceMeters / 1000.0)} | Walk ${TsPoliceBenchmark.formatDuration(trk.walkingSec)} | Jog+Run ${TsPoliceBenchmark.formatDuration(trk.jogRunCombinedSec)}")
+                sb.appendLine("  Tracker : ${trk.totalSteps} steps | ${String.format(Locale.US, "%.2f km", trk.totalDistanceMeters / 1000.0)} | Walk ${TsPoliceBenchmark.formatDuration(trk.walkingSec)} | Jog+Run ${TsPoliceBenchmark.formatDuration(trk.jogRunCombinedSec)}")
                 sb.appendLine("  Samsung : Not synced yet for ${trk.dateIso}")
                 return
             }
-            val rep = compare(trk, sam, effectiveStrideScale, title.lowercase())
-            val matchStr = rep.overallMatchPercent?.let { String.format("%.1f%% Overall Match", it) } ?: "Synced"
+            val rep = compare(trk, sam, effectiveStrideScale, title.lowercase(Locale.US))
+            val matchStr = rep.overallMatchPercent?.let { String.format(Locale.US, "%.1f%% Overall Match", it) } ?: "Synced"
             sb.appendLine("  Verdict : $matchStr")
             sb.appendLine(
                 String.format(
+                    Locale.US,
                     "  Steps   : Tracker %,d  vs  Samsung %,d  (%+d%s)",
                     trk.totalSteps,
                     sam.steps,
                     rep.stepsDelta,
-                    rep.stepsMatchPercent?.let { String.format(", %.0f%%", it) } ?: ""
+                    rep.stepsMatchPercent?.let { String.format(Locale.US, ", %.0f%%", it) } ?: ""
                 )
             )
             sb.appendLine(
                 String.format(
+                    Locale.US,
                     "  Distance: Tracker %.2f km  vs  Samsung %.2f km  (%+d m%s)",
                     trk.totalDistanceMeters / 1000.0,
                     sam.distanceMeters / 1000.0,
                     rep.distanceDeltaMeters.roundToInt(),
-                    rep.distanceMatchPercent?.let { String.format(", %.0f%%", it) } ?: ""
+                    rep.distanceMatchPercent?.let { String.format(Locale.US, ", %.0f%%", it) } ?: ""
                 )
             )
             sb.appendLine(
@@ -375,13 +379,13 @@ object SamsungHealthComparator {
             sb.appendLine(
                 "  MaxCad  : Tracker ${trk.maxCadenceSpm.roundToInt()} spm  vs  Samsung ${sam.maxCadenceSpm.roundToInt()} spm"
             )
-            val trkSt = rep.trackerStrideM?.let { String.format("%.2f m", it) } ?: "--"
-            val samSt = rep.samsungStrideM?.let { String.format("%.2f m", it) } ?: "--"
+            val trkSt = rep.trackerStrideM?.let { String.format(Locale.US, "%.2f m", it) } ?: "--"
+            val samSt = rep.samsungStrideM?.let { String.format(Locale.US, "%.2f m", it) } ?: "--"
             sb.appendLine("  Stride  : Tracker $trkSt  vs  Samsung $samSt")
             if (sam.workouts.isNotEmpty()) {
                 sb.appendLine("  Samsung Runs (${sam.workouts.size}):")
                 for (w in sam.workouts) {
-                    sb.appendLine("    • ${w.title}: ${String.format("%.2f km", w.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(w.durationSec)}")
+                    sb.appendLine("    • ${w.title}: ${String.format(Locale.US, "%.2f km", w.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(w.durationSec)}")
                 }
             }
         }

@@ -19,6 +19,7 @@ import com.tspolice.runtracker.domain.IntervalWorkoutState
 import com.tspolice.runtracker.domain.MotionState
 import com.tspolice.runtracker.domain.TargetForecast
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
+import java.util.Locale
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
@@ -126,7 +127,7 @@ class DailyActivityRingsView(context: Context) : View(context) {
 
         // Center steps readout
         val stepsLabel = if (totalSteps >= 1000) {
-            String.format("%.1fk", totalSteps / 1000.0)
+            String.format(Locale.US, "%.1fk", totalSteps / 1000.0)
         } else {
             "$totalSteps"
         }
@@ -436,9 +437,9 @@ class IntervalDialView(context: Context) : View(context) {
                 canvas.drawArc(rect, -90f, 360f * 0.02f, false, arcPaint)
                 badgePaint.color = AthleticColors.AMBER_BRIGHT
                 canvas.drawText("SPEED ENDURANCE COACH", cx, cy - dp(38f), badgePaint)
-                canvas.drawText("6 × 400m", cx, cy + dp(6f), mainPaint)
+                canvas.drawText("${state.totalReps} × 400m", cx, cy + dp(6f), mainPaint)
                 canvas.drawText(
-                    "Target ${TsPoliceBenchmark.formatDuration(state.targetRepSec)} / 400m  •  90s Rest",
+                    "Target ${TsPoliceBenchmark.formatDuration(state.targetRepSec)} / 400m  •  ${state.restDurationSec.roundToInt()}s Rest",
                     cx,
                     cy + dp(32f),
                     subPaint

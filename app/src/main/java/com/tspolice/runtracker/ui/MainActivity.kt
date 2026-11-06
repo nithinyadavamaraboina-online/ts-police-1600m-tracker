@@ -70,6 +70,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -106,9 +107,15 @@ class MainActivity : AppCompatActivity() {
     private var pendingTabRefreshIndex = -1
     private var activeTrackerSubTab = 0
     private var selectedIntervalReps = 6
+    private var selectedIntervalTargetRepSec: Double? = null
     private var lastRenderedPtPhase: PtTrialPhase = PtTrialPhase.IDLE
     private var lastRenderedIntervalPhase: IntervalPhase = IntervalPhase.IDLE
+    private var lastRenderedTrialSplitsSignature = ""
+    private var lastRenderedIntervalSplitsKey = ""
     private var cachedPastDailyLogs: List<DailyActivitySummary> = emptyList()
+    private var cachedYesterdaySummary: DailyActivitySummary = DailyActivitySummary()
+    private var cachedYesterdaySummaryIso = ""
+    private var latestGoalReadinessPercent: Int? = null
     private var lastDailyHistoryRenderMs = -60_000L
     private var lastDailyHistoryKey = ""
     private var lastGoalCoachRenderMs = -60_000L
@@ -283,6 +290,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stepFallbackRow: ModernSettingRow
     private lateinit var autoCalSamsungRow: ModernSettingRow
     private lateinit var autoImportSamsungRow: ModernSettingRow
+    private lateinit var remoteDiagnosticsOptInRow: ModernSettingRow
     private lateinit var diagGpsText: TextView
     private lateinit var diagStepText: TextView
     private lateinit var diagStrideCalText: TextView
@@ -332,7 +340,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        repository = RunRepository(this)
+        repository = RunRepository.getInstance(this)
         appUpdater = AppUpdater(this)
         healthSyncManager = SamsungHealthSyncManager(this, repository)
         tuningTelemetryManager = TuningTelemetryManager(this, repository, healthSyncManager)
@@ -1743,7 +1751,7 @@ class MainActivity : AppCompatActivity() {
                 if (!snapped) {
                     Toast.makeText(
                         this@MainActivity,
-                        "Snap Lap works within 90m of the next 400m line.",
+                        "Snap Lap works within 30m of the 400m chalk line.",
                         Toast.LENGTH_SHORT
                     ).show()
                 }
@@ -1897,10 +1905,9 @@ class MainActivity : AppCompatActivity() {
             repRow.addView(tv)
         }
         dialCard.addView(repRow)
-        refreshIntervalRepPresets()
-
         intervalDialView = IntervalDialView(this)
         dialCard.addView(intervalDialView)
+        refreshIntervalRepPresets()
 
         intervalPrimaryBtn = AthleticTheme.createButton(
             this,
@@ -1912,7 +1919,7 @@ class MainActivity : AppCompatActivity() {
                 .apply { topMargin = dp(8) }
             setOnClickListener {
                 requestNeededPermissionsIfMissing(silentCheckOnly = false)
-                trackingService?.startIntervalWorkout(selectedIntervalReps, 90.0)
+                trackingService?.startIntervalWorkout(selectedIntervalReps, 90.0, selectedIntervalTargetRepSec)
             }
         }
         dialCard.addView(intervalPrimaryBtn)
@@ -1955,6 +1962,17 @@ class MainActivity : AppCompatActivity() {
         }
         if (::intervalPrimaryBtn.isInitialized && lastRenderedIntervalPhase == IntervalPhase.IDLE) {
             intervalPrimaryBtn.text = "Start $selectedIntervalReps × 400m Interval Session"
+        }
+        if (::intervalDialView.isInitialized && lastRenderedIntervalPhase == IntervalPhase.IDLE) {
+            val targetLap = selectedIntervalTargetRepSec ?: TsPoliceBenchmark.targetLap400mSec(repository.targetTimeSec)
+            intervalDialView.update(
+                com.tspolice.runtracker.domain.IntervalWorkoutState(
+                    phase = IntervalPhase.IDLE,
+                    totalReps = selectedIntervalReps,
+                    targetRepSec = targetLap,
+                    restDurationSec = 90.0
+                )
+            )
         }
     }
 
@@ -2202,7 +2220,7 @@ class MainActivity : AppCompatActivity() {
         }
         chartCard.addView(trendChartView)
         chartCard.addView(TextView(this).apply {
-            text = "Cyan = 1.6K Trials  •  Amber = Auto/Intervals  •  Green = Qualified  •  Dashed = ETA"
+            text = "Purple = 1.6K Trials  •  Orange = Auto/Intervals  •  Lime = Qualified  •  Dashed = ETA"
             textSize = 11f
             setTextColor(AthleticColors.TEXT_MUTED)
             setPadding(0, dp(4), 0, 0)
@@ -2405,7 +2423,9 @@ class MainActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) }
                 setOnClickListener {
                     repository.targetTimeSec = sec
+                    selectedIntervalTargetRepSec = null
                     trackingService?.syncThresholdsFromPrefs()
+                    refreshIntervalRepPresets()
                     refreshSettingsHighlights()
                     refreshProgressDashboard()
                 }
@@ -2700,30 +2720,42 @@ class MainActivity : AppCompatActivity() {
         tableCard.addView(tableWrap)
         col.addView(tableCard)
 
-        // 5. App Fine-Tuning Telemetry Pull & Cloud Sync Card
+        // 5. App Fine-Tuning Telemetry Pull & Local/Opt-In Cloud Diagnostics Card
         val tuningCard = cardContainer(
             topColor = AthleticColors.HERO_EMERALD_TOP,
             bottomColor = AthleticColors.HERO_EMERALD_BOTTOM,
             borderColor = AthleticColors.HERO_EMERALD_BORDER
         )
-        tuningCard.addView(AthleticTheme.sectionLabel(this, "FINE-TUNING DATA PULL  •  SAMSUNG + DSP LOGS", AthleticColors.EMERALD_BRIGHT))
+        tuningCard.addView(AthleticTheme.sectionLabel(this, "DIAGNOSTICS & FINE-TUNING  •  SAMSUNG + DSP LOGS", AthleticColors.EMERALD_BRIGHT))
         tuningCard.addView(TextView(this).apply {
-            text = "Pulls 7-day Samsung Health totals, 48h Yesterday & Today hourly step/distance buckets, hardware sensor FIFO specs & last 300 DSP gait transitions so thresholds & stride scale can be fine-tuned."
+            text = "Exports 7-day Samsung Health totals, 48h hourly step/distance buckets, hardware sensor FIFO specs & last 300 DSP gait transitions locally on your phone (or uploads only if Developer Remote Diagnostics is enabled below)."
             textSize = 12f
             setTextColor(AthleticColors.TEXT_SECONDARY)
-            setPadding(0, dp(6), 0, dp(8))
+            setPadding(0, dp(6), 0, dp(6))
         })
+        remoteDiagnosticsOptInRow = ModernSettingRow(
+            this,
+            "Developer Remote Diagnostics (Cloud Sync)",
+            "Off by default. Enable only to share anonymized sensor diagnostics via cloud relay",
+            repository.remoteDiagnosticsOptIn
+        ) { checked ->
+            repository.remoteDiagnosticsOptIn = checked
+            trackingService?.syncRemoteDiagnosticsSetting()
+            refreshTuningStatusLabels()
+        }
+        tuningCard.addView(remoteDiagnosticsOptInRow)
+        tuningCard.addView(AthleticTheme.hairlineDivider(this, 6f))
         labTuningStatusText = TextView(this).apply {
-            text = "Ready to pull & upload fine-tuning telemetry."
+            text = "Ready to export local diagnostics bundle."
             textSize = 11.5f
             typeface = AthleticTheme.FONT_SANS_MEDIUM
             setTextColor(AthleticColors.CYAN_BRIGHT)
-            setPadding(0, 0, 0, dp(9))
+            setPadding(0, dp(4), 0, dp(9))
         }
         tuningCard.addView(labTuningStatusText)
         labSendTuningBtn = AthleticTheme.createButton(
             this,
-            "Pull & Send Fine-Tuning Bundle",
+            "Export Local Diagnostics JSON",
             AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
             46f
         ).apply {
@@ -2749,7 +2781,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, dp(2), 0, dp(3))
         }
         diagStrideCalText = TextView(this).apply {
-            text = String.format("Effective Stride Scale: %.2fx", repository.effectiveStrideScale())
+            text = String.format(Locale.US, "Effective Stride Scale: %.2fx", repository.effectiveStrideScale())
             textSize = 12f
             setTextColor(AthleticColors.CYAN_BRIGHT)
             setPadding(0, dp(2), 0, dp(3))
@@ -2915,11 +2947,16 @@ class MainActivity : AppCompatActivity() {
     // LIVE TELEMETRY RENDERING
     // =========================================================================
     private fun formatDistanceShort(meters: Double): String =
-        if (meters >= 1000.0) String.format("%.2f km", meters / 1000.0) else "${meters.toInt()} m"
+        if (meters >= 1000.0) String.format(Locale.US, "%.2f km", meters / 1000.0) else "${meters.toInt()} m"
 
     private fun refreshCachedDailyHistory(forceRender: Boolean = false) {
-        val today = LocalDate.now().toString()
+        val nowDate = LocalDate.now()
+        val today = nowDate.toString()
+        val yesterdayIso = nowDate.minusDays(1).toString()
         cachedPastDailyLogs = repository.getRecentDailyActivities(10).filter { it.dateIso != today }
+        cachedYesterdaySummary = cachedPastDailyLogs.firstOrNull { it.dateIso == yesterdayIso }
+            ?: repository.getDailyActivity(yesterdayIso)
+        cachedYesterdaySummaryIso = yesterdayIso
         if (forceRender) {
             lastDailyHistoryRenderMs = -60_000L
             lastDailyHistoryKey = ""
@@ -2994,7 +3031,7 @@ class MainActivity : AppCompatActivity() {
         })
         if (samSnap != null) {
             val rep = SamsungHealthComparator.compare(day, samSnap, repository.effectiveStrideScale())
-            val matchTxt = rep.overallMatchPercent?.let { String.format("%.0f%% Match", it) } ?: "Synced"
+            val matchTxt = rep.overallMatchPercent?.let { String.format(Locale.US, "%.0f%% Match", it) } ?: "Synced"
             card.addView(TextView(this).apply {
                 text = "${samSnap.sourceLabel}: ${samSnap.steps} steps (${formatDistanceShort(samSnap.distanceMeters)})  •  $matchTxt"
                 textSize = 11f
@@ -3029,9 +3066,13 @@ class MainActivity : AppCompatActivity() {
                 openTodayRunCard.visibility = View.VISIBLE
                 openTodaySummaryContainer.removeAllViews()
                 val targetSec = repository.targetTimeSec
-                val allTimeBest = allSessions.minOfOrNull { it.equiv1600mSec }
+                val allTimeBest = allSessions
+                    .filter { it.mode != RunMode.INTERVAL_400M }
+                    .minOfOrNull { it.equiv1600mSec }
                 val primary = pickPrimaryRunForSpotlight(todaySessions)
-                val isPb = allTimeBest != null && abs(primary.equiv1600mSec - allTimeBest) < 0.05
+                val isPb = primary.mode != RunMode.INTERVAL_400M &&
+                    allTimeBest != null &&
+                    abs(primary.equiv1600mSec - allTimeBest) < 0.05
                 openTodaySummaryContainer.addView(
                     buildHero1600mSpotlightView(primary, targetSec, isAllTimePb = isPb, compact = true)
                 )
@@ -3140,7 +3181,7 @@ class MainActivity : AppCompatActivity() {
                 "Standing (Auto-Paused)  •  Step-Stride Ready"
             else -> {
                 val stridePart = if (snap.liveStrideLengthMeters >= 0.35) {
-                    String.format(" • %.2fm/step", snap.liveStrideLengthMeters)
+                    String.format(Locale.US, " • %.2fm/step", snap.liveStrideLengthMeters)
                 } else ""
                 "${snap.motionState.label}  •  ${TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)} (${snap.cadenceSpm.roundToInt()} spm$stridePart)"
             }
@@ -3156,12 +3197,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         dailyMaxPaceVal.text = TsPoliceBenchmark.formatPacePerKm(daily.maxSpeedMps)
-        dailyMaxPaceSub.text = String.format("Max %.1f km/h today", daily.maxSpeedMps * 3.6)
+        dailyMaxPaceSub.text = String.format(Locale.US, "Max %.1f km/h today", daily.maxSpeedMps * 3.6)
         dailyMaxCadenceVal.text = "${daily.maxCadenceSpm.roundToInt()} spm"
         dailyMaxCadenceSub.text = if (daily.maxCadenceSpm >= 168.0) "Target stride hit!" else "Peak stride rate"
         openLivePaceVal.text = TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)
         openLivePaceSub.text = if (snap.liveStrideLengthMeters >= 0.35) {
-            String.format("%d spm • %.2fm stride", snap.cadenceSpm.roundToInt(), snap.liveStrideLengthMeters)
+            String.format(Locale.US, "%d spm • %.2fm stride", snap.cadenceSpm.roundToInt(), snap.liveStrideLengthMeters)
         } else {
             "${snap.cadenceSpm.roundToInt()} spm live cadence"
         }
@@ -3169,7 +3210,7 @@ class MainActivity : AppCompatActivity() {
         dailyTotalDistSub.text = if (snap.isGpsLocked) {
             "GPS ±${snap.gpsAccuracyMeters?.toInt() ?: 0}m + Stride"
         } else {
-            "Calibrated Stride (${String.format("%.2fx", repository.effectiveStrideScale())})"
+            "Calibrated Stride (${String.format(Locale.US, "%.2fx", repository.effectiveStrideScale())})"
         }
 
         dailyGaitBar.setDurations(daily.runningSec, daily.joggingSec, daily.walkingSec, 0.0)
@@ -3216,10 +3257,10 @@ class MainActivity : AppCompatActivity() {
         )
 
         metricPaceVal.text = TsPoliceBenchmark.formatPacePerKm(snap.currentSpeedMps)
-        metricPaceSub.text = String.format("%.1f km/h ground speed", snap.currentSpeedMps * 3.6)
+        metricPaceSub.text = String.format(Locale.US, "%.1f km/h ground speed", snap.currentSpeedMps * 3.6)
         metricCadenceVal.text = "${snap.cadenceSpm.roundToInt()} spm"
         metricCadenceSub.text = if (snap.liveStrideLengthMeters >= 0.35) {
-            String.format("Stride %.2f m/step • %d steps", snap.liveStrideLengthMeters, snap.totalSteps)
+            String.format(Locale.US, "Stride %.2f m/step • %d steps", snap.liveStrideLengthMeters, snap.totalSteps)
         } else {
             "${snap.totalSteps} steps today"
         }
@@ -3237,7 +3278,7 @@ class MainActivity : AppCompatActivity() {
         )
         metricProjSub.text = "Cutoff < ${TsPoliceBenchmark.formatDuration(targetSec)}"
 
-        metricSensorVal.text = String.format("%.1f m/s²", snap.dynamicAccelRms)
+        metricSensorVal.text = String.format(Locale.US, "%.1f m/s²", snap.dynamicAccelRms)
         metricSensorSub.text = if (snap.isGpsLocked && acc != null) {
             "Curve-Adjusted GPS (±${acc.toInt()}m)"
         } else {
@@ -3322,48 +3363,52 @@ class MainActivity : AppCompatActivity() {
             selectTab(1)
         }
 
-        // Render Live 400m Lap Splits
-        splitsListLayout.removeAllViews()
-        if (snap.lapSplits.isEmpty()) {
-            splitsListLayout.addView(TextView(this).apply {
-                text = "Splits record automatically at 400m • 800m • 1,200m • 1,600m (or tap '+ Snap 400m Lap' at the chalk line)."
-                textSize = 12f
-                setTextColor(AthleticColors.TEXT_MUTED)
-            })
-        } else {
-            val targetLap = TsPoliceBenchmark.targetLap400mSec(targetSec)
-            for (sp in snap.lapSplits) {
-                val fast = sp.lapDurationSec <= targetLap
-                val row = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    setPadding(dp(10), dp(7), dp(10), dp(7))
-                    background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 9f)
-                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                        .apply { bottomMargin = dp(5) }
+        // Render Live 400m Lap Splits (memoized so 5 Hz ticks never rebuild unchanged views)
+        val splitsSig = "${targetSec.toInt()}:${snap.lapSplits.size}:${snap.lapSplits.lastOrNull()?.cumulativeSec ?: -1.0}"
+        if (splitsSig != lastRenderedTrialSplitsSignature) {
+            lastRenderedTrialSplitsSignature = splitsSig
+            splitsListLayout.removeAllViews()
+            if (snap.lapSplits.isEmpty()) {
+                splitsListLayout.addView(TextView(this).apply {
+                    text = "Splits record automatically at 400m • 800m • 1,200m • 1,600m (or tap '+ Snap 400m Lap' at the chalk line)."
+                    textSize = 12f
+                    setTextColor(AthleticColors.TEXT_MUTED)
+                })
+            } else {
+                val targetLap = TsPoliceBenchmark.targetLap400mSec(targetSec)
+                for (sp in snap.lapSplits) {
+                    val fast = sp.lapDurationSec <= targetLap
+                    val row = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(10), dp(7), dp(10), dp(7))
+                        background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 9f)
+                        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                            .apply { bottomMargin = dp(5) }
+                    }
+                    row.addView(TextView(this).apply {
+                        text = "Lap ${sp.lapNumber} (${sp.distanceMeters.toInt()}m)"
+                        textSize = 12.5f
+                        typeface = AthleticTheme.FONT_SANS_MEDIUM
+                        setTextColor(AthleticColors.TEXT_PRIMARY)
+                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.1f)
+                    })
+                    row.addView(TextView(this).apply {
+                        text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec)
+                        textSize = 13f
+                        typeface = AthleticTheme.FONT_TABULAR_BOLD
+                        setTextColor(if (fast) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
+                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.8f)
+                    })
+                    row.addView(TextView(this).apply {
+                        text = "Cum ${TsPoliceBenchmark.formatDuration(sp.cumulativeSec)}"
+                        textSize = 11.5f
+                        gravity = Gravity.END
+                        setTextColor(AthleticColors.TEXT_SECONDARY)
+                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f)
+                    })
+                    splitsListLayout.addView(row)
                 }
-                row.addView(TextView(this).apply {
-                    text = "Lap ${sp.lapNumber} (${sp.distanceMeters.toInt()}m)"
-                    textSize = 12.5f
-                    typeface = AthleticTheme.FONT_SANS_MEDIUM
-                    setTextColor(AthleticColors.TEXT_PRIMARY)
-                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.1f)
-                })
-                row.addView(TextView(this).apply {
-                    text = TsPoliceBenchmark.formatDuration(sp.lapDurationSec)
-                    textSize = 13f
-                    typeface = AthleticTheme.FONT_TABULAR_BOLD
-                    setTextColor(if (fast) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
-                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.8f)
-                })
-                row.addView(TextView(this).apply {
-                    text = "Cum ${TsPoliceBenchmark.formatDuration(sp.cumulativeSec)}"
-                    textSize = 11.5f
-                    gravity = Gravity.END
-                    setTextColor(AthleticColors.TEXT_SECONDARY)
-                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f)
-                })
-                splitsListLayout.addView(row)
             }
         }
 
@@ -3371,14 +3416,20 @@ class MainActivity : AppCompatActivity() {
         // C. RENDER 400M INTERVAL COACH (SUB-VIEW 2)
         // =====================================================================
         val iv = snap.intervalState
-        intervalDialView.update(iv)
+        val displayIv = if (iv.phase == IntervalPhase.IDLE || iv.phase == IntervalPhase.COMPLETED) {
+            iv.copy(
+                totalReps = selectedIntervalReps,
+                targetRepSec = selectedIntervalTargetRepSec ?: iv.targetRepSec
+            )
+        } else iv
+        intervalDialView.update(displayIv)
         when (iv.phase) {
             IntervalPhase.IDLE, IntervalPhase.COMPLETED -> {
                 intervalPrimaryBtn.text = "Start $selectedIntervalReps × 400m Interval Session"
                 AthleticTheme.applyButtonStyle(this, intervalPrimaryBtn, AthleticTheme.ButtonStyle.WARNING_AMBER)
                 intervalPrimaryBtn.setOnClickListener {
                     requestNeededPermissionsIfMissing(silentCheckOnly = false)
-                    trackingService?.startIntervalWorkout(selectedIntervalReps, 90.0)
+                    trackingService?.startIntervalWorkout(selectedIntervalReps, 90.0, selectedIntervalTargetRepSec)
                 }
                 intervalSecondaryBtn.visibility = View.GONE
             }
@@ -3406,36 +3457,40 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        intervalSplitsLayout.removeAllViews()
-        if (iv.completedRepSplitsSec.isEmpty()) {
-            intervalSplitsLayout.addView(TextView(this).apply {
-                text = "Completed 400m rep times appear here (target ${TsPoliceBenchmark.formatDuration(iv.targetRepSec)} / 400m)."
-                textSize = 12f
-                setTextColor(AthleticColors.TEXT_MUTED)
-            })
-        } else {
-            iv.completedRepSplitsSec.forEachIndexed { idx, sec ->
-                val fast = sec <= iv.targetRepSec + 2.0
-                val r = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    setPadding(dp(10), dp(7), dp(10), dp(7))
-                    background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 9f)
-                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                        .apply { bottomMargin = dp(5) }
+        val ivSplitsKey = "${displayIv.targetRepSec.toInt()}:${iv.completedRepSplitsSec.size}:${iv.completedRepSplitsSec.lastOrNull() ?: -1.0}"
+        if (ivSplitsKey != lastRenderedIntervalSplitsKey) {
+            lastRenderedIntervalSplitsKey = ivSplitsKey
+            intervalSplitsLayout.removeAllViews()
+            if (iv.completedRepSplitsSec.isEmpty()) {
+                intervalSplitsLayout.addView(TextView(this).apply {
+                    text = "Completed 400m rep times appear here (target ${TsPoliceBenchmark.formatDuration(displayIv.targetRepSec)} / 400m)."
+                    textSize = 12f
+                    setTextColor(AthleticColors.TEXT_MUTED)
+                })
+            } else {
+                iv.completedRepSplitsSec.forEachIndexed { idx, sec ->
+                    val fast = sec <= iv.targetRepSec + 2.0
+                    val r = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        setPadding(dp(10), dp(7), dp(10), dp(7))
+                        background = AthleticTheme.solidPill(this@MainActivity, AthleticColors.SURFACE_RECESSED, AthleticColors.BORDER_SUBTLE, 9f)
+                        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                            .apply { bottomMargin = dp(5) }
+                    }
+                    r.addView(TextView(this).apply {
+                        text = "Rep ${idx + 1} (400m)"
+                        textSize = 12.5f
+                        setTextColor(AthleticColors.TEXT_PRIMARY)
+                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    })
+                    r.addView(TextView(this).apply {
+                        text = TsPoliceBenchmark.formatDuration(sec)
+                        textSize = 13f
+                        typeface = AthleticTheme.FONT_TABULAR_BOLD
+                        setTextColor(if (fast) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
+                    })
+                    intervalSplitsLayout.addView(r)
                 }
-                r.addView(TextView(this).apply {
-                    text = "Rep ${idx + 1} (400m)"
-                    textSize = 12.5f
-                    setTextColor(AthleticColors.TEXT_PRIMARY)
-                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                })
-                r.addView(TextView(this).apply {
-                    text = TsPoliceBenchmark.formatDuration(sec)
-                    textSize = 13f
-                    typeface = AthleticTheme.FONT_TABULAR_BOLD
-                    setTextColor(if (fast) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT)
-                })
-                intervalSplitsLayout.addView(r)
             }
         }
 
@@ -3453,6 +3508,7 @@ class MainActivity : AppCompatActivity() {
             "Step Engine: dt-Normalized Bipolar Gait Peak Detector (${snap.cadenceSpm.roundToInt()} spm)"
         }
         diagStrideCalText.text = String.format(
+            Locale.US,
             "Effective Stride Scale: %.2fx (%s)",
             repository.effectiveStrideScale(),
             if (repository.hasSamsungStrideCalibration && repository.autoCalibrateFromSamsung) {
@@ -3473,7 +3529,7 @@ class MainActivity : AppCompatActivity() {
         if (abs(rounded) <= 3) return "Exact"
         val sign = if (rounded > 0) "+" else "-"
         val a = abs(rounded)
-        return String.format("%s%d:%02d", sign, a / 60, a % 60)
+        return String.format(Locale.US, "%s%d:%02d", sign, a / 60, a % 60)
     }
 
     private fun openTwoDaySamsungReportModal() {
@@ -3494,7 +3550,11 @@ class MainActivity : AppCompatActivity() {
         if (!::samsungHeadlineText.isInitialized) return
         val todayTrk = latestDailySummaryForCompare
         val yesterdayIso = LocalDate.now().minusDays(1).toString()
-        val yesterdayTrk = repository.getDailyActivity(yesterdayIso)
+        if (force || cachedYesterdaySummaryIso != yesterdayIso) {
+            cachedYesterdaySummary = repository.getDailyActivity(yesterdayIso)
+            cachedYesterdaySummaryIso = yesterdayIso
+        }
+        val yesterdayTrk = cachedYesterdaySummary
         val todaySam = latestSamsungSnapshot
         val yesterdaySam = yesterdaySamsungSnapshot
         val scale = repository.effectiveStrideScale()
@@ -3502,7 +3562,7 @@ class MainActivity : AppCompatActivity() {
         val key = "${healthSyncStatus}:${isHealthSyncInFlight}:${activeComparisonScope}:" +
             "${todayTrk.totalSteps}:${todayTrk.totalDistanceMeters.toInt()}:${yesterdayTrk.totalSteps}:" +
             "${todaySam?.steps}:${todaySam?.distanceMeters?.toInt()}:" +
-            "${yesterdaySam?.steps}:${yesterdaySam?.distanceMeters?.toInt()}:${String.format("%.3f", scale)}"
+            "${yesterdaySam?.steps}:${yesterdaySam?.distanceMeters?.toInt()}:${String.format(Locale.US, "%.3f", scale)}"
         if (!force && key == lastSamsungRenderKey) return
         lastSamsungRenderKey = key
 
@@ -3614,12 +3674,12 @@ class MainActivity : AppCompatActivity() {
                 // Render the 2-Day Quick Summary Strip so both Yesterday & Today match % are always visible
                 val yestMatchStr = yesterdaySam?.let {
                     val r = SamsungHealthComparator.compare(yesterdayTrk, it, scale, "yesterday")
-                    r.overallMatchPercent?.let { p -> String.format("Yesterday %.0f%% (%d/%d)", p, yesterdayTrk.totalSteps, it.steps) }
+                    r.overallMatchPercent?.let { p -> String.format(Locale.US, "Yesterday %.0f%% (%d/%d)", p, yesterdayTrk.totalSteps, it.steps) }
                         ?: "Yesterday: ${it.steps} steps"
                 } ?: "Yesterday: --"
                 val todayMatchStr = todaySam?.let {
                     val r = SamsungHealthComparator.compare(todayTrk, it, scale, "today")
-                    r.overallMatchPercent?.let { p -> String.format("Today %.0f%% (%d/%d)", p, todayTrk.totalSteps, it.steps) }
+                    r.overallMatchPercent?.let { p -> String.format(Locale.US, "Today %.0f%% (%d/%d)", p, todayTrk.totalSteps, it.steps) }
                         ?: "Today: ${it.steps} steps"
                 } ?: "Today: --"
                 samsungTwoDaySummaryStrip.visibility = View.VISIBLE
@@ -3647,8 +3707,8 @@ class MainActivity : AppCompatActivity() {
                 val report = SamsungHealthComparator.compare(selectedTrk, selectedSam, scale, dayLabel)
                 samsungCompareTable.visibility = View.VISIBLE
 
-                val matchBadge = report.overallMatchPercent?.let { String.format("%.0f%% MATCH", it) }
-                    ?: String.format("STRIDE %.2fx", scale)
+                val matchBadge = report.overallMatchPercent?.let { String.format(Locale.US, "%.0f%% MATCH", it) }
+                    ?: String.format(Locale.US, "STRIDE %.2fx", scale)
                 val highMatch = (report.overallMatchPercent ?: 100.0) >= 88.0
                 val badgeCol = if (highMatch) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
                 samsungSyncBadge.text = matchBadge
@@ -3661,7 +3721,7 @@ class MainActivity : AppCompatActivity() {
                 samRowStepsSamsung.text = "${selectedSam.steps}"
                 val stSign = if (report.stepsDelta > 0) "+${report.stepsDelta}" else "${report.stepsDelta}"
                 samRowStepsDelta.text = report.stepsMatchPercent?.let {
-                    String.format("%.0f%% (%s)", it, if (report.stepsDelta == 0) "0" else stSign)
+                    String.format(Locale.US, "%.0f%% (%s)", it, if (report.stepsDelta == 0) "0" else stSign)
                 } ?: stSign
                 samRowStepsDelta.setTextColor(
                     if ((report.stepsMatchPercent ?: 100.0) >= 88.0) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
@@ -3672,7 +3732,7 @@ class MainActivity : AppCompatActivity() {
                 val dMeters = report.distanceDeltaMeters.roundToInt()
                 val dSign = if (dMeters > 0) "+${dMeters}m" else "${dMeters}m"
                 samRowDistDelta.text = report.distanceMatchPercent?.let {
-                    String.format("%.0f%% (%s)", it, if (abs(dMeters) <= 3) "0m" else dSign)
+                    String.format(Locale.US, "%.0f%% (%s)", it, if (abs(dMeters) <= 3) "0m" else dSign)
                 } ?: dSign
                 samRowDistDelta.setTextColor(
                     if ((report.distanceMatchPercent ?: 100.0) >= 88.0) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
@@ -3692,19 +3752,19 @@ class MainActivity : AppCompatActivity() {
                     val trkSecKm = 1000.0 / selectedTrk.maxSpeedMps
                     val samSecKm = 1000.0 / selectedSam.maxSpeedMps
                     val pDiff = (trkSecKm - samSecKm).roundToInt()
-                    if (abs(pDiff) <= 3) "Exact" else String.format("%+ds/km", pDiff)
+                    if (abs(pDiff) <= 3) "Exact" else String.format(Locale.US, "%+ds/km", pDiff)
                 } else "--"
 
                 samRowCadTracker.text = if (selectedTrk.maxCadenceSpm > 0) "${selectedTrk.maxCadenceSpm.roundToInt()} spm" else "--"
                 samRowCadSamsung.text = if (selectedSam.maxCadenceSpm > 0) "${selectedSam.maxCadenceSpm.roundToInt()} spm" else "--"
                 samRowCadDelta.text = report.maxCadenceDeltaSpm?.let {
                     val cDiff = it.roundToInt()
-                    if (abs(cDiff) <= 2) "Exact" else String.format("%+d spm", cDiff)
+                    if (abs(cDiff) <= 2) "Exact" else String.format(Locale.US, "%+d spm", cDiff)
                 } ?: "--"
 
-                samRowStrideTracker.text = report.trackerStrideM?.let { String.format("%.2f m", it) } ?: "--"
-                samRowStrideSamsung.text = report.samsungStrideM?.let { String.format("%.2f m", it) } ?: "--"
-                samRowStrideDelta.text = String.format("Cal %.2fx", scale)
+                samRowStrideTracker.text = report.trackerStrideM?.let { String.format(Locale.US, "%.2f m", it) } ?: "--"
+                samRowStrideSamsung.text = report.samsungStrideM?.let { String.format(Locale.US, "%.2f m", it) } ?: "--"
+                samRowStrideDelta.text = String.format(Locale.US, "Cal %.2fx", scale)
                 samRowStrideDelta.setTextColor(AthleticColors.CYAN_BRIGHT)
 
                 samsungPrimaryBtn.text = "Pull Yesterday & Today"
@@ -3816,8 +3876,8 @@ class MainActivity : AppCompatActivity() {
             renderSamsungComparisonCard(force = true)
             renderDailyHistoryCards(latestDailySummaryForCompare)
 
-            // Hands-free automatic background telemetry + Samsung 48h upload (no manual button tap needed!)
-            if (::tuningTelemetryManager.isInitialized && !isTuningUploadInFlight) {
+            // Optional developer remote diagnostics upload (strictly opt-in; OFF by default)
+            if (repository.remoteDiagnosticsOptIn && ::tuningTelemetryManager.isInitialized && !isTuningUploadInFlight) {
                 trackingService?.flushTuningBuffersNow()
                 withContext(Dispatchers.IO) {
                     runCatching {
@@ -3839,12 +3899,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshTuningStatusLabels() {
         val lastSummary = repository.lastTuningSyncSummary
+        val cloudOptIn = repository.remoteDiagnosticsOptIn
         if (::samsungSendTuningBtn.isInitialized) {
             samsungSendTuningBtn.isEnabled = !isTuningUploadInFlight
-            samsungSendTuningBtn.text = if (isTuningUploadInFlight) {
-                "Pulling 7-Day + Hourly Logs & Uploading..."
-            } else {
-                "Pull & Send Fine-Tuning Data (7-Day + Hourly Logs)"
+            samsungSendTuningBtn.text = when {
+                isTuningUploadInFlight && cloudOptIn -> "Pulling 7-Day + Hourly Logs & Uploading..."
+                isTuningUploadInFlight -> "Building Local Diagnostics JSON..."
+                cloudOptIn -> "Pull & Upload Fine-Tuning Data (Cloud Opt-In ON)"
+                else -> "Export Local Diagnostics JSON (7-Day + Hourly)"
             }
             samsungSendTuningBtn.setTextColor(
                 if (isTuningUploadInFlight) AthleticColors.TEXT_SECONDARY else AthleticColors.EMERALD_BRIGHT
@@ -3853,24 +3915,25 @@ class MainActivity : AppCompatActivity() {
         if (::samsungTuningStatusText.isInitialized) {
             if (lastSummary.isNotBlank()) {
                 samsungTuningStatusText.visibility = View.VISIBLE
-                samsungTuningStatusText.text = "Last Fine-Tuning Pull: $lastSummary"
+                samsungTuningStatusText.text = "Last Diagnostics Snapshot: $lastSummary"
             } else {
                 samsungTuningStatusText.visibility = View.GONE
             }
         }
         if (::labSendTuningBtn.isInitialized) {
             labSendTuningBtn.isEnabled = !isTuningUploadInFlight
-            labSendTuningBtn.text = if (isTuningUploadInFlight) {
-                "Pulling & Uploading Tuning Bundle..."
-            } else {
-                "Pull & Send Fine-Tuning Bundle"
+            labSendTuningBtn.text = when {
+                isTuningUploadInFlight && cloudOptIn -> "Pulling & Uploading Tuning Bundle..."
+                isTuningUploadInFlight -> "Building Local Diagnostics JSON..."
+                cloudOptIn -> "Pull & Upload Fine-Tuning Bundle"
+                else -> "Export Local Diagnostics JSON"
             }
         }
         if (::labTuningStatusText.isInitialized) {
-            labTuningStatusText.text = if (lastSummary.isNotBlank()) {
-                "Last Sync: $lastSummary"
-            } else {
-                "Not sent yet — tap below to pull 7-day Samsung + 48h hourly sensor logs."
+            labTuningStatusText.text = when {
+                lastSummary.isNotBlank() -> "Last Snapshot: $lastSummary"
+                cloudOptIn -> "Cloud sync enabled — tap below to upload 7-day Samsung + 48h sensor diagnostics."
+                else -> "Cloud sync is OFF (on-device privacy default) — tap below to save/share local JSON."
             }
         }
     }
@@ -3884,7 +3947,11 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
-                tuningTelemetryManager.pullBuildAndUploadTuningBundle(latestDailySummaryForCompare)
+                tuningTelemetryManager.pullBuildAndUploadTuningBundle(
+                    liveTodayOverride = latestDailySummaryForCompare,
+                    triggerReason = "manual_button",
+                    allowCloudUpload = repository.remoteDiagnosticsOptIn
+                )
             }
             isTuningUploadInFlight = false
             healthSyncStatus = result.deepSamsung.syncOutcome.status
@@ -3912,10 +3979,10 @@ class MainActivity : AppCompatActivity() {
             AlertDialog.Builder(this)
                 .setTitle("Samsung Health & Health Connect Privacy")
                 .setMessage(
-                    "TS Police 1.6K reads Steps, Distance, Exercise Sessions, Speed, and Cadence locally on-device to:\n\n" +
+                    "TS Police 1.6K reads Steps, Distance, Exercise Sessions, Speed, and Cadence from Health Connect to:\n\n" +
                         "1. Compare daily steps, distance, walk & run time side-by-side with Samsung Health.\n" +
                         "2. Auto-calibrate your personal stride length and backfill 14-day run history.\n\n" +
-                        "100% of your health data stays strictly on your phone."
+                        "By default, 100% of your health & run data stays locally on your phone. Data only leaves your device if you manually export/share a backup or report, or explicitly turn ON 'Developer Remote Diagnostics (Cloud Sync)' in Coach & Lab."
                 )
                 .setPositiveButton("Got It", null)
                 .show()
@@ -3965,7 +4032,10 @@ class MainActivity : AppCompatActivity() {
                 etaHeadlineText.setTextColor(AthleticColors.EMERALD_BRIGHT)
             }
             ForecastStatus.PLATEAU_OR_SLOWER -> {
-                etaHeadlineText.text = "${String.format("%.0fs", forecast.gapToTargetSec ?: 0.0)} Above $targetFmt"
+                val secsAbove = forecast.currentCapabilitySec?.let {
+                    TsPoliceBenchmark.secondsAboveCutoff(it, targetSec)
+                } ?: (forecast.gapToTargetSec ?: 0.0).roundToInt()
+                etaHeadlineText.text = "${secsAbove}s Above $targetFmt"
                 etaHeadlineText.setTextColor(AthleticColors.AMBER_BRIGHT)
             }
         }
@@ -3975,15 +4045,17 @@ class MainActivity : AppCompatActivity() {
         } ?: "")
         coachPrescriptionText.text = "Coach Plan: ${forecast.workoutPrescription}"
 
-        kpiPbVal.text = forecast.personalBestSec?.let { TsPoliceBenchmark.formatDuration(it) } ?: "--:--"
+        kpiPbVal.text = forecast.personalBestSec?.let {
+            TsPoliceBenchmark.formatDurationAgainstCutoff(it, targetSec)
+        } ?: "--:--"
         kpiGapVal.text = forecast.gapToTargetSec?.let {
-            if (it <= 0.0) "0s (Met!)" else String.format("-%.0fs", it)
+            if (it <= 0.0) "0s (Met!)" else "-${TsPoliceBenchmark.secondsAboveCutoff(targetSec + it, targetSec)}s"
         } ?: "--"
         kpiRateVal.text = forecast.improvementSecPerWeek?.let {
-            if (it >= 0.0) String.format("-%.0fs /wk", it) else String.format("+%.0fs /wk", -it)
+            if (it >= 0.0) String.format(Locale.US, "-%.0fs /wk", it) else String.format(Locale.US, "+%.0fs /wk", -it)
         } ?: "--"
         kpiImprovedVal.text = forecast.totalImprovementSec?.let {
-            if (it >= 0.0) String.format("%.0fs faster", it) else String.format("%.0fs", it)
+            if (it >= 0.0) String.format(Locale.US, "%.0fs faster", it) else String.format(Locale.US, "%.0fs", it)
         } ?: "--"
 
         trendChartView.setForecast(forecast)
@@ -4023,7 +4095,7 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 val pbHint = forecast.personalBestSec?.let {
-                    "Current PB: ${TsPoliceBenchmark.formatDuration(it)}  •  Target: $targetFmt"
+                    "Current PB: ${TsPoliceBenchmark.formatDurationAgainstCutoff(it, targetSec)}  •  Target: $targetFmt"
                 } ?: "Target Cutoff: $targetFmt (${TsPoliceBenchmark.formatDuration(TsPoliceBenchmark.targetLap400mSec(targetSec))} /400m lap)"
                 todaySessionsListLayout.addView(TextView(this).apply {
                     text = "No 1.6 km run recorded yet today. $pbHint"
@@ -4079,7 +4151,9 @@ class MainActivity : AppCompatActivity() {
                 val primary = pickPrimaryRunForSpotlight(todaySessions)
                 val primaryMerit = TsPoliceBenchmark.evaluateMerit1600m(primary.equiv1600mSec, targetSec)
                 val allTimeBest = forecast.personalBestSec
-                val isPb = allTimeBest != null && abs(primary.equiv1600mSec - allTimeBest) < 0.05
+                val isPb = primary.mode != RunMode.INTERVAL_400M &&
+                    allTimeBest != null &&
+                    abs(primary.equiv1600mSec - allTimeBest) < 0.05
 
                 progressTodayLogsCard.background = AthleticTheme.gradientCard(
                     this,
@@ -4088,19 +4162,19 @@ class MainActivity : AppCompatActivity() {
                     AthleticColors.HERO_EMERALD_BORDER,
                     18f
                 )
-                progressTodayHeaderLabel.text = if (abs(primary.distanceMeters - 1600.0) <= 60.0) {
+                progressTodayHeaderLabel.text = if (primary.isOfficial1600mTrial()) {
                     "TODAY'S 1.6 KM RUN"
                 } else {
                     "TODAY'S RUN (1.6K PACE)"
                 }
 
                 val badgeLabel = when {
-                    primaryMerit.qualified -> "QUALIFIED ✓"
+                    primary.mode != RunMode.INTERVAL_400M && primaryMerit.qualified -> "QUALIFIED ✓"
                     isPb -> "NEW PB ★"
                     todaySessions.size > 1 -> "${todaySessions.size} RUNS TODAY"
                     else -> sessionModeLabel(primary)
                 }
-                val badgeCol = if (primaryMerit.qualified || isPb) {
+                val badgeCol = if ((primary.mode != RunMode.INTERVAL_400M && primaryMerit.qualified) || isPb) {
                     AthleticColors.EMERALD_BRIGHT
                 } else {
                     AthleticColors.CYAN_BRIGHT
@@ -4157,12 +4231,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun pickPrimaryRunForSpotlight(runs: List<RunSessionRecord>): RunSessionRecord {
-        val official1600 = runs.filter {
-            it.mode == RunMode.TIMED_1600M ||
-                it.mode == RunMode.MANUAL_LOG ||
-                abs(it.distanceMeters - 1600.0) <= 80.0
-        }
-        return (official1600.ifEmpty { runs }).minBy { it.equiv1600mSec }
+        val official1600 = runs.filter { it.isOfficial1600mTrial() }
+        val nonInterval = runs.filter { it.mode != RunMode.INTERVAL_400M }
+        return (official1600.ifEmpty { nonInterval.ifEmpty { runs } }).minBy { it.equiv1600mSec }
     }
 
     private fun sessionModeLabel(s: RunSessionRecord): String = when (s.mode) {
@@ -4174,7 +4245,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun formatShortRunDate(dateIso: String): String {
         val parsed = runCatching { LocalDate.parse(dateIso) }.getOrNull() ?: return dateIso
-        val mon = parsed.month.name.take(3).lowercase().replaceFirstChar { it.uppercase() }
+        val mon = parsed.month.name.take(3).lowercase(Locale.US).replaceFirstChar { it.uppercase(Locale.US) }
         return if (parsed.year == LocalDate.now().year) {
             "$mon ${parsed.dayOfMonth}"
         } else {
@@ -4193,9 +4264,10 @@ class MainActivity : AppCompatActivity() {
         compact: Boolean
     ): LinearLayout {
         val merit = TsPoliceBenchmark.evaluateMerit1600m(s.equiv1600mSec, targetSec)
-        val isExact1600 = abs(s.distanceMeters - 1600.0) <= 60.0
+        val isExact1600 = s.isOfficial1600mTrial()
+        val isQualNonInterval = merit.qualified && s.mode != RunMode.INTERVAL_400M
         val heroTimeColor = when {
-            merit.qualified || isAllTimePb -> AthleticColors.EMERALD_BRIGHT
+            isQualNonInterval || isAllTimePb -> AthleticColors.EMERALD_BRIGHT
             else -> AthleticColors.TEXT_PRIMARY
         }
 
@@ -4208,7 +4280,7 @@ class MainActivity : AppCompatActivity() {
                 this@MainActivity,
                 0x36000000,
                 0x4A000000,
-                if (merit.qualified || isAllTimePb) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.BORDER_STRONG,
+                if (isQualNonInterval || isAllTimePb) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.BORDER_STRONG,
                 14f
             )
             layoutParams = LinearLayout.LayoutParams(
@@ -4223,7 +4295,8 @@ class MainActivity : AppCompatActivity() {
                     session = s,
                     targetSec = targetSec,
                     deadlineIso = repository.goalDeadlineIso,
-                    isPersonalBest = isAllTimePb
+                    isPersonalBest = isAllTimePb,
+                    readinessPercent = latestGoalReadinessPercent
                 ) {
                     repository.deleteSession(s.id)
                     refreshCachedDailyHistory(forceRender = true)
@@ -4245,7 +4318,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         leftTimeCol.addView(TextView(this).apply {
-            text = TsPoliceBenchmark.formatDuration(s.equiv1600mSec)
+            text = TsPoliceBenchmark.formatDurationAgainstCutoff(s.equiv1600mSec, targetSec)
             textSize = if (compact) 36f else 42f
             typeface = AthleticTheme.FONT_TABULAR_BOLD
             setTextColor(heroTimeColor)
@@ -4257,7 +4330,7 @@ class MainActivity : AppCompatActivity() {
             text = if (isExact1600) {
                 "1.60 KM TIME  •  $modeTxt"
             } else {
-                "1.6K PACE (${String.format("%.2f km", s.distanceMeters / 1000.0)} $modeTxt)"
+                "1.6K PACE (${String.format(Locale.US, "%.2f km", s.distanceMeters / 1000.0)} $modeTxt)"
             }
             textSize = 10.5f
             typeface = AthleticTheme.FONT_SANS_BOLD
@@ -4281,9 +4354,10 @@ class MainActivity : AppCompatActivity() {
         val targetFmt = TsPoliceBenchmark.formatDuration(targetSec)
         val gapCol = if (gapSec <= 0.0) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
         val gapTxt = if (gapSec <= 0.0) {
-            "-${String.format("%.0fs", abs(gapSec))} < $targetFmt ✓"
+            val under = abs(gapSec).roundToInt()
+            if (under == 0) "On $targetFmt ✓" else "-${under}s < $targetFmt ✓"
         } else {
-            "+${String.format("%.0fs", gapSec)} to $targetFmt"
+            "+${TsPoliceBenchmark.secondsAboveCutoff(s.equiv1600mSec, targetSec)}s to $targetFmt"
         }
         rightMetaCol.addView(TextView(this).apply {
             text = gapTxt
@@ -4307,7 +4381,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, dp(5), 0, dp(1))
             maxLines = 1
         })
-        if (s.avgCadenceSpm > 0.0) {
+        if (s.avgCadenceSpm > 1.0) {
             rightMetaCol.addView(TextView(this).apply {
                 text = "${s.avgCadenceSpm.roundToInt()} spm cadence"
                 textSize = 11f
@@ -4408,7 +4482,8 @@ class MainActivity : AppCompatActivity() {
                     session = s,
                     targetSec = targetSec,
                     deadlineIso = repository.goalDeadlineIso,
-                    isPersonalBest = isAllTimePb
+                    isPersonalBest = isAllTimePb,
+                    readinessPercent = latestGoalReadinessPercent
                 )
             }
         }
@@ -4436,9 +4511,10 @@ class MainActivity : AppCompatActivity() {
         highlightToday: Boolean
     ): LinearLayout {
         val merit = TsPoliceBenchmark.evaluateMerit1600m(s.equiv1600mSec, targetSec)
-        val isExact1600 = abs(s.distanceMeters - 1600.0) <= 60.0
+        val isExact1600 = s.isOfficial1600mTrial()
+        val isQualNonInterval = merit.qualified && s.mode != RunMode.INTERVAL_400M
         val borderColor = when {
-            merit.qualified -> AthleticColors.HERO_EMERALD_BORDER
+            isQualNonInterval -> AthleticColors.HERO_EMERALD_BORDER
             highlightToday -> AthleticColors.HERO_CYAN_BORDER
             else -> AthleticColors.BORDER_SUBTLE
         }
@@ -4462,14 +4538,18 @@ class MainActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = dp(8) }
             setOnClickListener {
-                val isPb = repository.getAllSessions().minOfOrNull { it.equiv1600mSec }
-                    ?.let { abs(s.equiv1600mSec - it) < 0.05 } == true
+                val isPb = s.mode != RunMode.INTERVAL_400M &&
+                    repository.getAllSessions()
+                        .filter { it.mode != RunMode.INTERVAL_400M }
+                        .minOfOrNull { it.equiv1600mSec }
+                        ?.let { abs(s.equiv1600mSec - it) < 0.05 } == true
                 SessionDialogs.showSessionDetailDialog(
                     ctx = this@MainActivity,
                     session = s,
                     targetSec = targetSec,
                     deadlineIso = repository.goalDeadlineIso,
-                    isPersonalBest = isPb
+                    isPersonalBest = isPb,
+                    readinessPercent = latestGoalReadinessPercent
                 ) {
                     repository.deleteSession(s.id)
                     refreshCachedDailyHistory(forceRender = true)
@@ -4497,7 +4577,7 @@ class MainActivity : AppCompatActivity() {
         })
         val splitsHint = if (s.lapSplits.isNotEmpty()) " • ${s.lapSplits.size} splits" else ""
         leftCol.addView(TextView(this).apply {
-            text = "${String.format("%.2f km", s.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(s.activeDurationSec)}$splitsHint"
+            text = "${String.format(Locale.US, "%.2f km", s.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(s.activeDurationSec)}$splitsHint"
             textSize = 11.5f
             setTextColor(AthleticColors.TEXT_SECONDARY)
             setPadding(0, dp(3), 0, 0)
@@ -4516,13 +4596,13 @@ class MainActivity : AppCompatActivity() {
             )
         }
         rightTimeCol.addView(TextView(this).apply {
-            text = TsPoliceBenchmark.formatDuration(s.equiv1600mSec)
+            text = TsPoliceBenchmark.formatDurationAgainstCutoff(s.equiv1600mSec, targetSec)
             textSize = 22.5f
             typeface = AthleticTheme.FONT_TABULAR_BOLD
             includeFontPadding = false
             setTextColor(
                 when {
-                    merit.qualified -> AthleticColors.EMERALD_BRIGHT
+                    isQualNonInterval -> AthleticColors.EMERALD_BRIGHT
                     isExact1600 -> AthleticColors.TEXT_PRIMARY
                     else -> AthleticColors.CYAN_BRIGHT
                 }
@@ -4609,12 +4689,20 @@ class MainActivity : AppCompatActivity() {
         val curTarget = repository.targetTimeSec
         val deadlineDate = runCatching { LocalDate.parse(repository.goalDeadlineIso) }
             .getOrElse { LocalDate.of(2026, 11, 30) }
-        val shortDeadline = "${deadlineDate.month.name.take(3).lowercase().replaceFirstChar { it.uppercase() }} ${deadlineDate.dayOfMonth}"
-        headerSubtitleText.text = "PET Coach  •  < ${TsPoliceBenchmark.formatDuration(curTarget)} by $shortDeadline"
+        val shortDeadline = "${deadlineDate.month.name.take(3).lowercase(Locale.US).replaceFirstChar { it.uppercase(Locale.US) }} ${deadlineDate.dayOfMonth}"
+        val rawDaysLeft = (deadlineDate.toEpochDay() - LocalDate.now().toEpochDay()).toInt()
+        headerSubtitleText.text = if (rawDaysLeft < 0) {
+            "PET Coach  •  < ${TsPoliceBenchmark.formatDuration(curTarget)} Target"
+        } else {
+            "PET Coach  •  < ${TsPoliceBenchmark.formatDuration(curTarget)} by $shortDeadline"
+        }
 
         if (::goalDeadlineBtn.isInitialized) {
-            val daysLeft = (deadlineDate.toEpochDay() - LocalDate.now().toEpochDay()).toInt().coerceAtLeast(0)
-            goalDeadlineBtn.text = "$shortDeadline, ${deadlineDate.year} (${daysLeft}d)  ✎"
+            goalDeadlineBtn.text = if (rawDaysLeft < 0) {
+                "$shortDeadline, ${deadlineDate.year} (Passed)  ✎"
+            } else {
+                "$shortDeadline, ${deadlineDate.year} (${rawDaysLeft}d)  ✎"
+            }
         }
 
         if (::targetPresetButtons.isInitialized) {
@@ -5102,6 +5190,7 @@ class MainActivity : AppCompatActivity() {
                             "Verifying SHA-256 signature..."
                         } else {
                             String.format(
+                                Locale.US,
                                 "Downloading APK  •  %.1f / %.1f MB",
                                 downloaded / (1024.0 * 1024.0),
                                 total / (1024.0 * 1024.0)
@@ -5110,7 +5199,7 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         neonProgressBar.isIndeterminateMode = true
                         dlPercentTv.text = ""
-                        dlStatusTv.text = String.format("Downloading APK  •  %.1f MB", downloaded / (1024.0 * 1024.0))
+                        dlStatusTv.text = String.format(Locale.US, "Downloading APK  •  %.1f MB", downloaded / (1024.0 * 1024.0))
                     }
                 },
                 onNeedsInstallPermission = {
@@ -5300,6 +5389,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyGoalPlanToTodayCard(plan: DeadlineGoalPlan, brain: CoachBrainReport) {
+        latestGoalReadinessPercent = plan.readinessPercent
         if (!::goalCoachCard.isInitialized) return
 
         val (topGrad, botGrad, borderCol, accentCol, btnStyle) = when (brain.accentKind) {
@@ -5328,10 +5418,11 @@ class MainActivity : AppCompatActivity() {
 
         goalCoachCard.background = AthleticTheme.gradientCard(this, topGrad, botGrad, borderCol, 18f)
 
-        val daysTxt = if (plan.daysRemaining == 0) {
-            "COACH BRAIN  •  EXAM DAY (${plan.deadlineLabel.uppercase()})"
-        } else {
-            "COACH BRAIN  •  ${plan.deadlineLabel.uppercase()} (${plan.daysRemaining}D)  ✎"
+        val deadlinePassed = plan.deadlineLabel.contains("Passed", ignoreCase = true)
+        val daysTxt = when {
+            deadlinePassed -> "COACH BRAIN  •  SET NEXT GOAL DATE  ✎"
+            plan.daysRemaining == 0 -> "COACH BRAIN  •  EXAM DAY (${plan.deadlineLabel.uppercase(Locale.US)})"
+            else -> "COACH BRAIN  •  ${plan.deadlineLabel.uppercase(Locale.US)} (${plan.daysRemaining}D)  ✎"
         }
         goalHeaderLabel.text = daysTxt
         goalHeaderLabel.setTextColor(accentCol)
@@ -5396,7 +5487,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             chip.addView(TextView(this).apply {
-                text = cp.label.uppercase()
+                text = cp.label.uppercase(Locale.US)
                 textSize = 9.5f
                 typeface = AthleticTheme.FONT_SANS_BOLD
                 setTextColor(if (isGoalDay) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_SECONDARY)
@@ -5432,6 +5523,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 RecommendedWorkoutAction.START_400M_INTERVALS -> {
                     selectedIntervalReps = brain.recommendedIntervalReps.coerceIn(4, 8)
+                    selectedIntervalTargetRepSec = brain.recommendedIntervalLapSec
                     refreshIntervalRepPresets()
                     selectTrackerSubTab(2, animate = true)
                 }
@@ -5451,13 +5543,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderProgressGoalRoadmap(plan: DeadlineGoalPlan) {
+        latestGoalReadinessPercent = plan.readinessPercent
         if (!::progressMilestonesLayout.isInitialized) return
 
         val targetFmt = TsPoliceBenchmark.formatDuration(plan.targetTimeSec)
-        progressGoalHeaderLabel.text = if (plan.daysRemaining == 0) {
-            "EXAM DAY (${plan.deadlineLabel.uppercase()})  •  <$targetFmt  ✎"
-        } else {
-            "${plan.deadlineLabel.uppercase()} ROADMAP  •  ${plan.daysRemaining}D LEFT  ✎"
+        val deadlinePassed = plan.deadlineLabel.contains("Passed", ignoreCase = true)
+        progressGoalHeaderLabel.text = when {
+            deadlinePassed -> "${plan.deadlineLabel.uppercase(Locale.US)}  •  <$targetFmt"
+            plan.daysRemaining == 0 -> "EXAM DAY (${plan.deadlineLabel.uppercase(Locale.US)})  •  <$targetFmt  ✎"
+            else -> "${plan.deadlineLabel.uppercase(Locale.US)} ROADMAP  •  ${plan.daysRemaining}D LEFT  ✎"
         }
 
         val qualified = plan.readinessPercent >= 100
@@ -5472,7 +5566,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         val cutHint = plan.requiredCutPerWeekSec?.let {
-            "Required pace gain: -${String.format("%.0f", it)}s/wk from moving capability. "
+            "Required pace gain: -${String.format(Locale.US, "%.0f", it)}s/wk from moving capability. "
         } ?: ""
         progressGoalWeeklyMixText.text = cutHint + plan.weeklyStructureHint
 
@@ -5494,7 +5588,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             card.addView(TextView(this).apply {
-                text = cp.label.uppercase()
+                text = cp.label.uppercase(Locale.US)
                 textSize = 9.5f
                 typeface = AthleticTheme.FONT_SANS_BOLD
                 setTextColor(if (isFinal) AthleticColors.EMERALD_BRIGHT else AthleticColors.CYAN_BRIGHT)
@@ -5525,8 +5619,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showGoalDeadlinePicker() {
+        val today = LocalDate.now()
         val current = runCatching { LocalDate.parse(repository.goalDeadlineIso) }
             .getOrElse { LocalDate.of(2026, 11, 30) }
+        val initDate = if (current.isBefore(today)) today else current
         val picker = DatePickerDialog(
             this,
             { _, year, monthZeroBased, dayOfMonth ->
@@ -5542,9 +5638,9 @@ class MainActivity : AppCompatActivity() {
                     Toast.LENGTH_SHORT
                 ).show()
             },
-            current.year,
-            current.monthValue - 1,
-            current.dayOfMonth
+            initDate.year,
+            initDate.monthValue - 1,
+            initDate.dayOfMonth
         )
         picker.datePicker.minDate = System.currentTimeMillis() - 86_400_000L
         picker.show()

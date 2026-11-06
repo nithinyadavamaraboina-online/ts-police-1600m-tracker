@@ -1,5 +1,6 @@
 package com.tspolice.runtracker
 
+import com.tspolice.runtracker.data.RunRepository
 import com.tspolice.runtracker.domain.CoachBrainEngine
 import com.tspolice.runtracker.domain.CoachWorkoutKind
 import com.tspolice.runtracker.domain.DailyActivitySummary
@@ -29,13 +30,16 @@ import java.time.ZoneId
 import java.time.ZonedDateTime
 import com.tspolice.runtracker.telemetry.TuningTelemetryManager
 import com.tspolice.runtracker.ui.RunShareHelper
+import com.tspolice.runtracker.update.AppUpdater
 import com.tspolice.runtracker.update.VersionComparator
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Locale
 import kotlin.math.sin
 
 class TrackerDomainTest {
@@ -1524,6 +1528,365 @@ class TrackerDomainTest {
             expectedExamBatch = ExamTimeBatch.MORNING_GROUND
         )
         assertEquals(DailySessionScheduleMode.ONE_MORNING_EXAM_REHEARSAL, sundayMorningRehearsal.scheduleMode)
+    }
+
+    @Test
+    fun `interval 400m workouts never double subtract rest or false qualify 1600m forecast`() {
+        val ist = ZoneId.of("Asia/Kolkata")
+        val baselineTrial = RunSessionRecord(
+            id = 1L,
+            startedAtEpochMs = ZonedDateTime.of(2026, 11, 1, 18, 0, 0, 0, ist).toInstant().toEpochMilli(),
+            dateIso = "2026-11-01",
+            mode = RunMode.TIMED_1600M,
+            distanceMeters = 1600.0,
+            activeDurationSec = 510.0, // 8:30 trial
+            pausedDurationSec = 0.0,
+            first1600mSplitSec = 510.0,
+            equiv1600mSec = 510.0,
+            avgCadenceSpm = 164.0,
+            maxSpeedMps = 3.45,
+            runningSec = 420.0,
+            joggingSec = 90.0,
+            walkingSec = 0.0
+        )
+
+        // 4 x 400m @ 1:45/rep (420s moving) with 3 x 90s standing rest (270s paused):
+        // Distance is 1600m and moving sum is < 435s, but because it had 270s of rest, it is NOT a continuous 1.6K qualification!
+        val fourBy400 = RunSessionRecord(
+            id = 2L,
+            startedAtEpochMs = ZonedDateTime.of(2026, 11, 3, 18, 0, 0, 0, ist).toInstant().toEpochMilli(),
+            dateIso = "2026-11-03",
+            mode = RunMode.INTERVAL_400M,
+            distanceMeters = 1600.0,
+            activeDurationSec = 420.0,
+            pausedDurationSec = 270.0,
+            first1600mSplitSec = null,
+            equiv1600mSec = 420.0,
+            avgCadenceSpm = 172.0,
+            maxSpeedMps = 4.05,
+            runningSec = 420.0,
+            joggingSec = 0.0,
+            walkingSec = 0.0
+        )
+
+        // 6 x 400m @ 2:00/rep (720s moving) with 5 x 90s rest (450s paused)
+        val sixBy400 = RunSessionRecord(
+            id = 3L,
+            startedAtEpochMs = ZonedDateTime.of(2026, 11, 5, 18, 0, 0, 0, ist).toInstant().toEpochMilli(),
+            dateIso = "2026-11-05",
+            mode = RunMode.INTERVAL_400M,
+            distanceMeters = 2400.0,
+            activeDurationSec = 720.0,
+            pausedDurationSec = 450.0,
+            first1600mSplitSec = null,
+            equiv1600mSec = TsPoliceBenchmark.computeEquiv1600mSec(2400.0, 720.0, null),
+            avgCadenceSpm = 168.0,
+            maxSpeedMps = 3.60,
+            runningSec = 720.0,
+            joggingSec = 0.0,
+            walkingSec = 0.0
+        )
+
+        assertFalse("4x400m interval must never count as an official continuous 1600m trial", fourBy400.isOfficial1600mTrial())
+        assertEquals("INTERVAL_400M activeDurationSec is already net moving time", 420.0, fourBy400.netMovingDurationSec(), 0.001)
+        assertEquals("INTERVAL_400M 6x400m must never double-subtract 450s rest", 720.0, sixBy400.netMovingDurationSec(), 0.001)
+
+        val forecast = ProgressionForecaster.analyze(
+            sessions = listOf(baselineTrial, fourBy400, sixBy400),
+            targetTimeSec = 435.0,
+            todayIso = "2026-11-06"
+        )
+        assertNotEquals("Fragmented 4x400m intervals must never mark runner QUALIFIED", ForecastStatus.QUALIFIED, forecast.status)
+        assertEquals(510.0, forecast.personalBestSec ?: 0.0, 0.1)
+
+        val brain = CoachBrainEngine.analyze(
+            sessions = listOf(baselineTrial, sixBy400),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-06",
+            zoneId = ist
+        )
+        assertTrue(
+            "Interval target lap must reflect ~8:00-8:30 reality (>=112s), never a double-subtracted ~92s sprint",
+            brain.recommendedIntervalLapSec >= 112.0
+        )
+        val goalPlan = DeadlineGoalCoach.buildPlan(
+            sessions = listOf(baselineTrial, sixBy400),
+            todaySummary = DailyActivitySummary(dateIso = "2026-11-06"),
+            yesterdaySummary = DailyActivitySummary(dateIso = "2026-11-05"),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-06"
+        )
+        assertTrue(
+            "Moving capability must reflect ~8:00-8:30 reality, never a double-subtracted ~4:17 sprint",
+            (goalPlan.movingCapabilitySec ?: 0.0) >= 465.0
+        )
+    }
+
+    @Test
+    fun `2 km easy talk pace recovery jog unlocks 400m speed reps next day and badges slot easy jogs only`() {
+        val ist = ZoneId.of("Asia/Kolkata")
+        val hardSixPmTrial = RunSessionRecord(
+            id = 10L,
+            startedAtEpochMs = ZonedDateTime.of(2026, 11, 2, 18, 15, 0, 0, ist).toInstant().toEpochMilli(),
+            dateIso = "2026-11-02",
+            mode = RunMode.TIMED_1600M,
+            distanceMeters = 1600.0,
+            activeDurationSec = 505.0,
+            pausedDurationSec = 0.0,
+            first1600mSplitSec = 505.0,
+            equiv1600mSec = 505.0,
+            avgCadenceSpm = 166.0,
+            maxSpeedMps = 3.50,
+            runningSec = 430.0,
+            joggingSec = 75.0,
+            walkingSec = 0.0
+        )
+
+        // Yesterday (Nov 4 at 6:20 AM): Runner followed Coach Brain's prescribed 2.3 km slow talk-test recovery jog (~6:05/km)
+        val easyMorningRecoveryJog = RunSessionRecord(
+            id = 11L,
+            startedAtEpochMs = ZonedDateTime.of(2026, 11, 4, 6, 20, 0, 0, ist).toInstant().toEpochMilli(),
+            dateIso = "2026-11-04",
+            mode = RunMode.OPEN_PRACTICE,
+            distanceMeters = 2300.0,
+            activeDurationSec = 840.0, // ~2.74 m/s easy aerobic jog
+            pausedDurationSec = 10.0,
+            first1600mSplitSec = null,
+            equiv1600mSec = TsPoliceBenchmark.computeEquiv1600mSec(2300.0, 840.0, null),
+            avgCadenceSpm = 148.0,
+            maxSpeedMps = 2.90,
+            runningSec = 0.0,
+            joggingSec = 840.0,
+            walkingSec = 0.0
+        )
+
+        val nextDayBrain = CoachBrainEngine.analyze(
+            sessions = listOf(hardSixPmTrial, easyMorningRecoveryJog),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-05",
+            zoneId = ist
+        )
+        assertEquals(
+            "2.3 km easy jog yesterday must unlock 400m speed reps today instead of looping easy days",
+            CoachWorkoutKind.SPEED_400M_REPS,
+            nextDayBrain.workoutKind
+        )
+        assertEquals(RecommendedWorkoutAction.START_400M_INTERVALS, nextDayBrain.recommendedAction)
+
+        val earlyMorningCard = nextDayBrain.slotStats.first { it.slot == TimeOfDaySlot.EARLY_MORNING }
+        assertEquals("EASY JOGS ONLY", earlyMorningCard.badgeLabel)
+
+        val goalPlan = DeadlineGoalCoach.buildPlan(
+            sessions = listOf(hardSixPmTrial, easyMorningRecoveryJog),
+            todaySummary = DailyActivitySummary(dateIso = "2026-11-05"),
+            yesterdaySummary = DailyActivitySummary(
+                dateIso = "2026-11-04",
+                joggingSec = 840.0,
+                joggingMeters = 2300.0,
+                totalSteps = 3200
+            ),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-11-05"
+        )
+        assertEquals(RecommendedWorkoutAction.START_400M_INTERVALS, goalPlan.recommendedAction)
+    }
+
+    @Test
+    fun `post deadline date rolls over to normal coaching without permanent exam day lock`() {
+        val ist = ZoneId.of("Asia/Kolkata")
+        val trial = RunSessionRecord(
+            id = 20L,
+            startedAtEpochMs = ZonedDateTime.of(2026, 11, 25, 18, 0, 0, 0, ist).toInstant().toEpochMilli(),
+            dateIso = "2026-11-25",
+            mode = RunMode.TIMED_1600M,
+            distanceMeters = 1600.0,
+            activeDurationSec = 465.0,
+            pausedDurationSec = 0.0,
+            first1600mSplitSec = 465.0,
+            equiv1600mSec = 465.0,
+            avgCadenceSpm = 168.0,
+            maxSpeedMps = 3.65,
+            runningSec = 420.0,
+            joggingSec = 45.0,
+            walkingSec = 0.0
+        )
+
+        val dec5Plan = DeadlineGoalCoach.buildPlan(
+            sessions = listOf(trial),
+            todaySummary = DailyActivitySummary(dateIso = "2026-12-05"),
+            yesterdaySummary = DailyActivitySummary(dateIso = "2026-12-04"),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-12-05"
+        )
+        assertTrue("Post-deadline label must indicate Goal Date Passed", dec5Plan.deadlineLabel.contains("Passed"))
+        assertTrue("Post-deadline pushRpeScore must not stay locked at 10.0 Exam Day", dec5Plan.pushRpeScore < 10.0)
+
+        val dec5Brain = CoachBrainEngine.analyze(
+            sessions = listOf(trial),
+            targetTimeSec = 435.0,
+            deadlineIso = "2026-11-30",
+            todayIso = "2026-12-05",
+            zoneId = ist
+        )
+        assertNotEquals(
+            "December 5 must not stay locked in EXAM_DAY_RACE after Nov 30 passes",
+            CoachWorkoutKind.EXAM_DAY_RACE,
+            dec5Brain.workoutKind
+        )
+
+        val dec5Caption = RunShareHelper.buildShareCaption(
+            session = trial.copy(dateIso = "2026-12-05"),
+            targetSec = 435.0,
+            deadlineIso = "2026-11-30",
+            isPersonalBest = false,
+            todayIso = "2026-12-05"
+        )
+        assertFalse("Post-deadline share caption must not claim 0d left or GOAL DAY", dec5Caption.contains("0d left"))
+        assertFalse(dec5Caption.contains("GOAL DAY"))
+    }
+
+    @Test
+    fun `cutoff boundary rounding and non us locale formatting stay exact`() {
+        // 435.3s is strictly slower than 435.0s (7:15): must NOT display "7:15" or "+0s"
+        val merit = TsPoliceBenchmark.evaluateMerit1600m(435.3, 435.0)
+        assertFalse(merit.qualified)
+        assertEquals("7:16", TsPoliceBenchmark.formatDurationAgainstCutoff(435.3, 435.0))
+        assertEquals("7:15", TsPoliceBenchmark.formatDurationAgainstCutoff(435.0, 435.0))
+        assertEquals(1, TsPoliceBenchmark.secondsAboveCutoff(435.3, 435.0))
+        assertEquals("+1s", TsPoliceBenchmark.formatSignedDelta(0.3))
+        assertEquals("0s", TsPoliceBenchmark.formatSignedDelta(0.0))
+
+        val origLocale = Locale.getDefault()
+        try {
+            Locale.setDefault(Locale("ar"))
+            assertEquals("7:15", TsPoliceBenchmark.formatDuration(435.0))
+            assertEquals("1:48.8", TsPoliceBenchmark.formatDuration(108.75, includeTenths = true))
+            assertEquals("4:32 /km", TsPoliceBenchmark.formatPacePerKm(1600.0 / 435.0))
+
+            Locale.setDefault(Locale.FRANCE)
+            assertEquals("1:48.8", TsPoliceBenchmark.formatDuration(108.75, includeTenths = true))
+        } finally {
+            Locale.setDefault(origLocale)
+        }
+    }
+
+    @Test
+    fun `scooter park and smooth pocket jog dismount unlocks jogging without infinite vehicle relatch`() {
+        val classifier = GaitClassifier()
+        var nowMs = 1_000L
+
+        // 1. Ride scooter at 6.8 m/s (~24.5 km/h) with engine buzz & zero flight troughs -> latches VEHICLE
+        var currentState = MotionState.STANDING
+        repeat(8) {
+            nowMs += 500L
+            currentState = classifier.update(
+                nowMs = nowMs,
+                gpsSpeedMps = 6.8,
+                cadenceSpm = 0.0,
+                dynamicAccelRms = 1.6,
+                minRawNorm = 8.7,
+                peakToTroughNorm = 2.2,
+                p20RawNorm = 9.1,
+                hfVibrationRms = 1.9,
+                isManualWorkoutActive = false
+            )
+        }
+        assertEquals(MotionState.VEHICLE, currentState)
+
+        // 2. Park scooter completely still for 6.0 seconds -> completes parkedStopCompleted
+        repeat(12) {
+            nowMs += 500L
+            currentState = classifier.update(
+                nowMs = nowMs,
+                gpsSpeedMps = 0.0,
+                cadenceSpm = 0.0,
+                dynamicAccelRms = 0.08,
+                minRawNorm = 9.75,
+                peakToTroughNorm = 0.3,
+                p20RawNorm = 9.78,
+                hfVibrationRms = 0.05,
+                isManualWorkoutActive = false
+            )
+        }
+
+        // 3. Dismount directly into a smooth loose-pocket jog (2.30 m/s, 148 spm, damped pocket minRawNorm = 7.4 > 6.8)
+        var unlockedState = currentState
+        repeat(10) {
+            nowMs += 500L
+            unlockedState = classifier.update(
+                nowMs = nowMs,
+                gpsSpeedMps = 2.30,
+                cadenceSpm = 148.0,
+                dynamicAccelRms = 3.8,
+                minRawNorm = 7.4,
+                peakToTroughNorm = 7.2,
+                p20RawNorm = 8.4,
+                hfVibrationRms = 0.8,
+                isManualWorkoutActive = false
+            )
+        }
+        assertEquals("Smooth jog after parking must unlock JOGGING instead of relatching VEHICLE", MotionState.JOGGING, unlockedState)
+    }
+
+    @Test
+    fun `backup session json round trip preserves null split and ota url validator enforces https github allowlist`() {
+        val openRun = RunSessionRecord(
+            id = 42L,
+            startedAtEpochMs = 1_762_000_000_000L,
+            dateIso = "2026-11-06",
+            mode = RunMode.OPEN_PRACTICE,
+            distanceMeters = 1200.0,
+            activeDurationSec = 360.0,
+            pausedDurationSec = 15.0,
+            first1600mSplitSec = null,
+            equiv1600mSec = TsPoliceBenchmark.computeEquiv1600mSec(1200.0, 360.0, null),
+            avgCadenceSpm = 160.0,
+            maxSpeedMps = 3.55,
+            runningSec = 300.0,
+            joggingSec = 60.0,
+            walkingSec = 0.0,
+            lapSplits = listOf(LapSplit(1, 400.0, 118.0, 118.0, MotionState.RUNNING)),
+            notes = "Evening progression"
+        )
+        val json = RunRepository.serializeSessionJson(openRun)
+        val restored = RunRepository.parseSessionJson(json, "2026-11-06")
+        assertNotNull(restored)
+        assertNull("Null first1600mSplitSec must round-trip as null, never NaN or 0.0", restored!!.first1600mSplitSec)
+        assertEquals(1200.0, restored.distanceMeters, 0.001)
+        assertEquals(1, restored.lapSplits.size)
+
+        // OTA URL security allowlist checks
+        AppUpdater.validateUpdateUrl("https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk")
+        AppUpdater.validateUpdateUrl("https://objects.githubusercontent.com/github-production-release-asset-2e65be/12345/app.apk")
+
+        val httpBlocked = runCatching {
+            AppUpdater.validateUpdateUrl("http://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/app.apk")
+        }.isFailure
+        assertTrue("Cleartext HTTP update URLs must be rejected", httpBlocked)
+
+        val untrustedHostBlocked = runCatching {
+            AppUpdater.validateUpdateUrl("https://evil-mirror.example.com/ts-police-1600m-tracker.apk")
+        }.isFailure
+        assertTrue("Non-GitHub update hosts must be rejected", untrustedHostBlocked)
+
+        val validSha = "a".repeat(64)
+        val parsedManifest = AppUpdater.parseVersionManifestJson(
+            """{"versionCode":30,"versionName":"1.0.29","apkUrl":"https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk","sha256":"$validSha","changelog":"Security & Coach Brain fixes"}"""
+        )
+        assertEquals(30, parsedManifest.versionCode)
+        assertEquals("1.0.29", parsedManifest.versionName)
+        assertEquals(validSha, parsedManifest.sha256)
+
+        val parsedApi = AppUpdater.parseGithubApiReleaseJson(
+            """{"tag_name":"v1.0.29","body":"Fixes\n\n[versionCode:30]\nSHA-256: `$validSha`","assets":[{"name":"ts-police-1600m-tracker.apk","browser_download_url":"https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/download/v1.0.29/ts-police-1600m-tracker.apk"}]}"""
+        )
+        assertEquals(30, parsedApi.versionCode)
+        assertEquals(validSha, parsedApi.sha256)
     }
 
     private fun session(date: String, distM: Double, sec: Double, mode: RunMode): RunSessionRecord {

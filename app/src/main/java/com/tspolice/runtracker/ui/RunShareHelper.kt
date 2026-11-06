@@ -17,6 +17,8 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -34,24 +36,33 @@ import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import java.io.File
 import java.io.FileOutputStream
 import java.time.LocalDate
+import java.util.Locale
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
  * Generates a high-resolution (1080x1350) AMOLED athletic poster card for 1,600m runs
- * and launches Android's native Share Sheet with both the visual poster PNG and formatted stats.
+ * off the UI thread and launches Android's native Share Sheet with both the visual poster PNG
+ * and formatted stats.
  */
 object RunShareHelper {
+
+    private const val SHARE_CACHE_RETENTION_MS = 24L * 3_600_000L // 24 hours so share recipients never hit deleted URIs
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val renderExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "RunSharePosterWorker").apply { isDaemon = true }
+    }
 
     fun buildShareCaption(
         session: RunSessionRecord,
         targetSec: Double = TsPoliceBenchmark.DEFAULT_TARGET_TIME_SEC,
         deadlineIso: String = "2026-11-30",
         isPersonalBest: Boolean = false,
-        todayIso: String = LocalDate.now().toString()
+        todayIso: String = ""
     ): String {
-        val isExact1600 = abs(session.distanceMeters - 1600.0) <= 60.0
-        val timeFmt = TsPoliceBenchmark.formatDuration(session.equiv1600mSec)
+        val isExact1600 = session.isOfficial1600mTrial()
+        val timeFmt = TsPoliceBenchmark.formatDurationAgainstCutoff(session.equiv1600mSec, targetSec)
         val targetFmt = TsPoliceBenchmark.formatDuration(targetSec)
         val merit = TsPoliceBenchmark.evaluateMerit1600m(session.equiv1600mSec, targetSec)
         val badge = when {
@@ -64,15 +75,27 @@ object RunShareHelper {
         val avgSpd = if (session.activeDurationSec > 1.0) session.distanceMeters / session.activeDurationSec else 0.0
         val paceFmt = TsPoliceBenchmark.formatPacePerKm(avgSpd)
 
-        val todayDate = runCatching { LocalDate.parse(todayIso) }.getOrElse { LocalDate.now() }
+        val effectiveRefIso = todayIso.ifBlank { session.dateIso }
+        val refDate = runCatching { LocalDate.parse(effectiveRefIso) }.getOrElse { LocalDate.now() }
         val deadlineDate = runCatching { LocalDate.parse(deadlineIso) }.getOrElse { LocalDate.of(2026, 11, 30) }
-        val daysLeft = (deadlineDate.toEpochDay() - todayDate.toEpochDay()).toInt().coerceAtLeast(0)
+        val rawDaysLeft = (deadlineDate.toEpochDay() - refDate.toEpochDay()).toInt()
         val deadlinePretty = formatShortMonthDay(deadlineDate)
         val gapSec = session.equiv1600mSec - targetSec
-        val goalLine = if (gapSec <= 0.0) {
-            "Goal (< $targetFmt): Beat cutoff by ${String.format("%.0fs", abs(gapSec))}!"
-        } else {
-            "Goal (< $targetFmt by $deadlinePretty): ${String.format("%.0fs", gapSec)} to shave (${daysLeft}d left)"
+        val goalLine = when {
+            gapSec <= 0.0 ->
+                "Goal (< $targetFmt): Beat cutoff by ${String.format(Locale.US, "%.0fs", abs(gapSec))}!"
+            rawDaysLeft < 0 -> {
+                val secsOver = TsPoliceBenchmark.secondsAboveCutoff(session.equiv1600mSec, targetSec)
+                "Goal (< $targetFmt): ${secsOver}s to shave"
+            }
+            rawDaysLeft == 0 -> {
+                val secsOver = TsPoliceBenchmark.secondsAboveCutoff(session.equiv1600mSec, targetSec)
+                "Goal (< $targetFmt • Exam Day $deadlinePretty): ${secsOver}s to shave"
+            }
+            else -> {
+                val secsOver = TsPoliceBenchmark.secondsAboveCutoff(session.equiv1600mSec, targetSec)
+                "Goal (< $targetFmt by $deadlinePretty): ${secsOver}s to shave (${rawDaysLeft}d left)"
+            }
         }
 
         return buildString {
@@ -80,7 +103,7 @@ object RunShareHelper {
                 appendLine("TS Police 1.6 km Run — $timeFmt  $badge")
             } else {
                 appendLine(
-                    "TS Police Run (${String.format("%.2f km", session.distanceMeters / 1000.0)}) — $timeFmt 1.6K pace  $badge"
+                    "TS Police Run (${String.format(Locale.US, "%.2f km", session.distanceMeters / 1000.0)}) — $timeFmt 1.6K pace  $badge"
                 )
             }
             appendLine("$datePretty  •  Avg 400m: $avgLapFmt  •  Pace: $paceFmt")
@@ -102,13 +125,6 @@ object RunShareHelper {
         isPersonalBest: Boolean,
         readinessPercent: Int? = null
     ) {
-        val posterBitmap = renderSharePosterBitmap(
-            session = session,
-            targetSec = targetSec,
-            deadlineIso = deadlineIso,
-            isPersonalBest = isPersonalBest,
-            readinessPercentOverride = readinessPercent
-        )
         val caption = buildShareCaption(
             session = session,
             targetSec = targetSec,
@@ -154,8 +170,17 @@ object RunShareHelper {
         })
         sheet.addView(topHeader)
 
+        val loadingHint = TextView(ctx).apply {
+            text = "Rendering HD Poster..."
+            gravity = Gravity.CENTER
+            textSize = 12f
+            setTextColor(AthleticColors.TEXT_SECONDARY)
+            setPadding(dp(12f), dp(32f), dp(12f), dp(32f))
+        }
+        sheet.addView(loadingHint)
+
         val previewImage = ImageView(ctx).apply {
-            setImageBitmap(posterBitmap)
+            visibility = View.GONE
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
             val cornerPx = dp(16f).toFloat()
@@ -176,12 +201,17 @@ object RunShareHelper {
         }
         sheet.addView(previewImage)
 
+        var readyPosterFile: File? = null
+        var readyBitmap: Bitmap? = null
+
         val shareCardBtn = AthleticTheme.createButton(
             ctx,
-            "Share Run Card & Splits  ↗",
+            "Preparing Run Card...",
             AthleticTheme.ButtonStyle.PRIMARY_EMERALD,
             48f
         ).apply {
+            isEnabled = false
+            alpha = 0.65f
             textSize = 13.5f
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -190,7 +220,7 @@ object RunShareHelper {
                 bottomMargin = dp(8f)
             }
             setOnClickListener {
-                sharePosterAndText(ctx, posterBitmap, session, caption)
+                sharePosterAndText(ctx, readyPosterFile, readyBitmap, session, caption)
                 dialog.dismiss()
             }
         }
@@ -252,43 +282,88 @@ object RunShareHelper {
             .setDuration(220L)
             .setInterpolator(DecelerateInterpolator(1.7f))
             .start()
+
+        val appCacheDir = ctx.cacheDir
+        renderExecutor.execute {
+            val bmp = renderSharePosterBitmap(
+                session = session,
+                targetSec = targetSec,
+                deadlineIso = deadlineIso,
+                isPersonalBest = isPersonalBest,
+                readinessPercentOverride = readinessPercent
+            )
+            val writtenFile = runCatching {
+                writePosterPngToCache(appCacheDir, bmp, session)
+            }.getOrNull()
+
+            mainHandler.post {
+                if (!dialog.isShowing) return@post
+                readyBitmap = bmp
+                readyPosterFile = writtenFile
+                loadingHint.visibility = View.GONE
+                previewImage.setImageBitmap(bmp)
+                previewImage.visibility = View.VISIBLE
+                shareCardBtn.isEnabled = true
+                shareCardBtn.alpha = 1f
+                shareCardBtn.text = "Share Run Card & Splits  ↗"
+            }
+        }
+    }
+
+    private fun writePosterPngToCache(cacheDir: File, bitmap: Bitmap, session: RunSessionRecord): File {
+        val shareDir = File(cacheDir, "shares").apply { mkdirs() }
+        val now = System.currentTimeMillis()
+        shareDir.listFiles()?.forEach { old ->
+            if (now - old.lastModified() > SHARE_CACHE_RETENTION_MS) {
+                old.delete()
+            }
+        }
+        val outFile = File(shareDir, "ts_police_1600m_${session.dateIso}_${session.id}.png")
+        FileOutputStream(outFile).use { fos ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
+            fos.flush()
+        }
+        return outFile
     }
 
     private fun sharePosterAndText(
         ctx: Context,
-        bitmap: Bitmap,
+        preRenderedFile: File?,
+        bitmap: Bitmap?,
         session: RunSessionRecord,
         caption: String
     ) {
-        runCatching {
-            val shareDir = File(ctx.cacheDir, "shares").apply { mkdirs() }
-            // Clean up older temporary share PNGs
-            shareDir.listFiles()?.forEach { old ->
-                if (System.currentTimeMillis() - old.lastModified() > 3_600_000L) {
-                    old.delete()
+        val appCtx = ctx.applicationContext
+        fun launchShareWithFile(file: File?) {
+            runCatching {
+                val targetFile = file ?: throw IllegalStateException("No poster file")
+                val uri = FileProvider.getUriForFile(appCtx, "${appCtx.packageName}.fileprovider", targetFile)
+                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "image/png"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_TEXT, caption)
+                    clipData = ClipData.newRawUri("TS Police 1.6K Run", uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
+                ctx.startActivity(Intent.createChooser(sendIntent, "Share 1.6 km Run"))
+            }.onFailure {
+                val textIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, caption)
+                }
+                ctx.startActivity(Intent.createChooser(textIntent, "Share 1.6 km Run"))
             }
-            val outFile = File(shareDir, "ts_police_1600m_${session.dateIso}_${session.id}.png")
-            FileOutputStream(outFile).use { fos ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
-                fos.flush()
+        }
+
+        if (preRenderedFile != null && preRenderedFile.exists()) {
+            launchShareWithFile(preRenderedFile)
+        } else if (bitmap != null) {
+            renderExecutor.execute {
+                val file = runCatching { writePosterPngToCache(appCtx.cacheDir, bitmap, session) }.getOrNull()
+                mainHandler.post { launchShareWithFile(file) }
             }
-            val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", outFile)
-            val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "image/png"
-                putExtra(Intent.EXTRA_STREAM, uri)
-                putExtra(Intent.EXTRA_TEXT, caption)
-                clipData = ClipData.newRawUri("TS Police 1.6K Run", uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            ctx.startActivity(Intent.createChooser(sendIntent, "Share 1.6 km Run"))
-        }.onFailure {
-            // Fallback to plain-text share if external chooser fails
-            val textIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "text/plain"
-                putExtra(Intent.EXTRA_TEXT, caption)
-            }
-            ctx.startActivity(Intent.createChooser(textIntent, "Share 1.6 km Run"))
+        } else {
+            launchShareWithFile(null)
         }
     }
 
@@ -372,7 +447,7 @@ object RunShareHelper {
         }
         c.drawText("1,600M PET TRACK COACH", 176f, 142f, subHeaderPaint)
 
-        val dateStr = formatPrettyDate(session.dateIso).uppercase()
+        val dateStr = formatPrettyDate(session.dateIso).uppercase(Locale.US)
         val dateTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             typeface = boldSans
             textSize = 21f
@@ -391,9 +466,9 @@ object RunShareHelper {
         })
         c.drawText(dateStr, dateRect.left + 22f, 124f, dateTextPaint)
 
-        // 3. Achievement Badge + Giant 186px Finish Time
+        // 3. Achievement Badge + Giant 188px Finish Time
         val merit = TsPoliceBenchmark.evaluateMerit1600m(session.equiv1600mSec, targetSec)
-        val isExact1600 = abs(session.distanceMeters - 1600.0) <= 60.0
+        val isExact1600 = session.isOfficial1600mTrial()
         val targetFmt = TsPoliceBenchmark.formatDuration(targetSec)
         val (statusText, statusCol, statusBg) = when {
             merit.qualified -> Triple(
@@ -407,7 +482,7 @@ object RunShareHelper {
                 0x28C6F432
             )
             else -> Triple(
-                "${sessionModeTitle(session).uppercase()}  •  TRACK LOG",
+                "${sessionModeTitle(session).uppercase(Locale.US)}  •  TRACK LOG",
                 AthleticColors.CYAN_BRIGHT,
                 0x289D6BFF
             )
@@ -428,7 +503,7 @@ object RunShareHelper {
         })
         c.drawText(statusText, badgeRect.left + 26f, 235f, badgeTextPaint)
 
-        val heroTimeStr = TsPoliceBenchmark.formatDuration(session.equiv1600mSec)
+        val heroTimeStr = TsPoliceBenchmark.formatDurationAgainstCutoff(session.equiv1600mSec, targetSec)
         val heroTimePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             typeface = boldSans
             textSize = 188f
@@ -446,7 +521,7 @@ object RunShareHelper {
         val subCaption = if (isExact1600) {
             "OFFICIAL 1.60 KM FINISH TIME"
         } else {
-            "1.60 KM PACE EQUIVALENT  •  ${String.format("%.2f KM", session.distanceMeters / 1000.0)} LOGGED"
+            "1.60 KM PACE EQUIVALENT  •  ${String.format(Locale.US, "%.2f KM", session.distanceMeters / 1000.0)} LOGGED"
         }
         c.drawText(subCaption, 78f, 492f, captionPaint)
 
@@ -461,14 +536,14 @@ object RunShareHelper {
         val avgPaceStr = TsPoliceBenchmark.formatPacePerKm(avgSpd)
         val diffSec = session.equiv1600mSec - targetSec
         val diffStr = if (diffSec <= 0.0) {
-            "-${String.format("%.0fs", abs(diffSec))}"
+            "-${String.format(Locale.US, "%.0fs", abs(diffSec))}"
         } else {
-            "+${String.format("%.0fs", diffSec)}"
+            "+${TsPoliceBenchmark.secondsAboveCutoff(session.equiv1600mSec, targetSec)}s"
         }
 
         val tiles = listOf(
             Triple("AVG 400M LAP", avgLapStr, "Target ≤ ${TsPoliceBenchmark.formatDuration(targetSec / 4.0)}"),
-            Triple("AVG PACE", avgPaceStr, String.format("%.1f km/h avg", avgSpd * 3.6)),
+            Triple("AVG PACE", avgPaceStr, String.format(Locale.US, "%.1f km/h avg", avgSpd * 3.6)),
             Triple("VS $targetFmt GOAL", diffStr, if (diffSec <= 0.0) "Target Met ✓" else "Seconds to shave")
         )
 
@@ -540,7 +615,6 @@ object RunShareHelper {
                 c.drawRoundRect(rowRect, 18f, 18f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF191922.toInt() })
 
                 val hitTarget = sp.lapDurationSec <= targetLapSec
-                // Faster lap -> wider energy bar
                 val norm = 1f - ((sp.lapDurationSec - fastest) / (slowest - fastest + 12.0)).toFloat().coerceIn(0f, 0.45f)
                 val maxBarW = rowRect.width() * 0.56f
                 val fillW = (maxBarW * norm).coerceAtLeast(140f)
@@ -577,11 +651,16 @@ object RunShareHelper {
                 color = AthleticColors.CYAN_BRIGHT
                 letterSpacing = 0.07f
             })
+            val cadDisplay = if (session.avgCadenceSpm > 1.0) {
+                "${session.avgCadenceSpm.roundToInt()} spm"
+            } else {
+                "— (Stopwatch)"
+            }
             val rows = listOf(
-                "Total Distance" to String.format("%.2f km (%d m)", session.distanceMeters / 1000.0, session.distanceMeters.toInt()),
+                "Total Distance" to String.format(Locale.US, "%.2f km (%d m)", session.distanceMeters / 1000.0, session.distanceMeters.toInt()),
                 "Active Duration" to TsPoliceBenchmark.formatDuration(session.activeDurationSec),
-                "Average Cadence" to "${session.avgCadenceSpm.roundToInt()} spm",
-                "Peak Speed" to String.format("%.1f km/h (%s)", session.maxSpeedMps * 3.6, TsPoliceBenchmark.formatPacePerKm(session.maxSpeedMps))
+                "Average Cadence" to cadDisplay,
+                "Peak Speed" to String.format(Locale.US, "%.1f km/h (%s)", session.maxSpeedMps * 3.6, TsPoliceBenchmark.formatPacePerKm(session.maxSpeedMps))
             )
             for ((idx, pair) in rows.withIndex()) {
                 val y = 858f + idx * 70f
@@ -599,10 +678,11 @@ object RunShareHelper {
             }
         }
 
-        // 6. Goal Countdown & Readiness Footer Strip
+        // 6. Goal Countdown & Readiness Footer Strip (anchored to session.dateIso)
+        val refDate = runCatching { LocalDate.parse(session.dateIso) }.getOrElse { LocalDate.now() }
         val deadlineDate = runCatching { LocalDate.parse(deadlineIso) }.getOrElse { LocalDate.of(2026, 11, 30) }
-        val daysLeft = (deadlineDate.toEpochDay() - LocalDate.now().toEpochDay()).toInt().coerceAtLeast(0)
-        val deadlineLabel = formatShortMonthDay(deadlineDate).uppercase()
+        val rawDaysLeft = (deadlineDate.toEpochDay() - refDate.toEpochDay()).toInt()
+        val deadlineLabel = formatShortMonthDay(deadlineDate).uppercase(Locale.US)
         val readiness = readinessPercentOverride ?: when {
             merit.qualified -> 100
             else -> ((1080.0 - session.equiv1600mSec) / (1080.0 - targetSec) * 86.0 + 14.0).roundToInt().coerceIn(15, 97)
@@ -616,10 +696,10 @@ object RunShareHelper {
             color = 0xFF334418.toInt()
         })
 
-        val footerTitle = if (daysLeft == 0) {
-            "GOAL DAY ($deadlineLabel)  •  <$targetFmt TARGET"
-        } else {
-            "$deadlineLabel GOAL (<$targetFmt)  •  $daysLeft DAYS LEFT"
+        val footerTitle = when {
+            rawDaysLeft < 0 -> "TARGET <$targetFmt  •  TSLPRB 1,600M PET"
+            rawDaysLeft == 0 -> "GOAL DAY ($deadlineLabel)  •  <$targetFmt TARGET"
+            else -> "$deadlineLabel GOAL (<$targetFmt)  •  $rawDaysLeft DAYS LEFT"
         }
         c.drawText(footerTitle, 108f, 1214f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
             typeface = boldSans
@@ -701,12 +781,12 @@ object RunShareHelper {
 
     private fun formatPrettyDate(dateIso: String): String {
         val d = runCatching { LocalDate.parse(dateIso) }.getOrNull() ?: return dateIso
-        val mon = d.month.name.take(3).lowercase().replaceFirstChar { it.uppercase() }
+        val mon = d.month.name.take(3).lowercase(Locale.US).replaceFirstChar { it.uppercase(Locale.US) }
         return "$mon ${d.dayOfMonth}, ${d.year}"
     }
 
     private fun formatShortMonthDay(d: LocalDate): String {
-        val mon = d.month.name.take(3).lowercase().replaceFirstChar { it.uppercase() }
+        val mon = d.month.name.take(3).lowercase(Locale.US).replaceFirstChar { it.uppercase(Locale.US) }
         return "$mon ${d.dayOfMonth}"
     }
 }

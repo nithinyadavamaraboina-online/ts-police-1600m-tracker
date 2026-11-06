@@ -1,8 +1,8 @@
 {
-    "versionCode":  29,
-    "versionName":  "1.0.28",
+    "versionCode":  30,
+    "versionName":  "1.0.29",
     "apkUrl":  "https://github.com/nithinyadavamaraboina-online/ts-police-1600m-tracker/releases/latest/download/ts-police-1600m-tracker.apk",
-    "sha256":  "7ed5c1d5db1a2cde04f534fe7c7c3ade4286e55528933f3b5ed6ca87f53e895a",
-    "changelog":  "Add Expert Running Coach Brain: plain-English What To Do \u0026 What NOT To Do, personalized Carbs/Protein/Calories fuel math, 1 vs 2 sessions planner, and 5 PM vs 6 PM vs Morning timing analyzer.",
-    "publishedAt":  "2026-11-01T15:41:21Z"
+    "sha256":  "26a10f011117ed55bd90ed69e46e87b99732c7c2bde0ac0473af2235f5f7b04c",
+    "changelog":  "Coach Brain \u0026 PET Accuracy Hardening: fixed 400m interval rest math \u0026 easy-jog speed unlock, manual run time-slot selector, post-deadline rollover, single-provider GPS curve accuracy, scooter-to-jog dismount, standby battery saver, full v2 backup/restore, on-device privacy default, and SHA-256 OTA verification.",
+    "publishedAt":  "2026-11-06T14:40:58Z"
 }

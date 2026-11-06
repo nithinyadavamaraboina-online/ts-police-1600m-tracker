@@ -3,6 +3,7 @@ package com.tspolice.runtracker.domain
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -135,16 +136,19 @@ object CoachBrainEngine {
         hourlyBuckets: List<HourlySensorBucket> = emptyList(),
         targetTimeSec: Double = TsPoliceBenchmark.DEFAULT_TARGET_TIME_SEC,
         deadlineIso: String = "2026-11-30",
-        todayIso: String = LocalDate.now().toString(),
+        todayIso: String = "",
         zoneId: ZoneId = ZoneId.systemDefault(),
-        runnerHeightCm: Int = 174,
+        runnerHeightCm: Int = 172,
         runnerWeightKg: Int = 68,
         legFeel: LegFeelCheckIn = LegFeelCheckIn.AUTO,
         expectedExamBatch: ExamTimeBatch = ExamTimeBatch.MORNING_GROUND
     ): CoachBrainReport {
-        val todayDate = runCatching { LocalDate.parse(todayIso) }.getOrElse { LocalDate.now(zoneId) }
+        val effectiveTodayIso = todayIso.ifBlank { LocalDate.now(zoneId).toString() }
+        val todayDate = runCatching { LocalDate.parse(effectiveTodayIso) }.getOrElse { LocalDate.now(zoneId) }
         val deadlineDate = runCatching { LocalDate.parse(deadlineIso) }.getOrElse { LocalDate.of(2026, 11, 30) }
-        val daysRemaining = (deadlineDate.toEpochDay() - todayDate.toEpochDay()).toInt().coerceAtLeast(0)
+        val rawDaysToDeadline = (deadlineDate.toEpochDay() - todayDate.toEpochDay()).toInt()
+        val isPastDeadline = rawDaysToDeadline < 0
+        val daysRemaining = rawDaysToDeadline.coerceAtLeast(0)
         val weightKg = runnerWeightKg.coerceIn(42, 125)
         val targetFmt = TsPoliceBenchmark.formatDuration(targetTimeSec)
         val targetLapSec = TsPoliceBenchmark.targetLap400mSec(targetTimeSec)
@@ -162,8 +166,15 @@ object CoachBrainEngine {
 
         // Enrich all meaningful runs (>= 400m) with local clock time, slot, and pre-run step load
         val validRuns = sessions
-            .filter { it.distanceMeters >= 400.0 && it.equiv1600mSec in 180.0..2400.0 }
+            .filter { it.distanceMeters >= TsPoliceBenchmark.MIN_SESSION_DISTANCE_M && it.equiv1600mSec in 180.0..2400.0 }
             .sortedBy { it.startedAtEpochMs }
+
+        val totalRunStepsByDate = validRuns.groupBy { it.dateIso }.mapValues { (_, dayRuns) ->
+            dayRuns.sumOf { r ->
+                val cad = if (r.avgCadenceSpm > 80.0) r.avgCadenceSpm.coerceIn(120.0, 190.0) else 152.0
+                ((r.netMovingDurationSec() / 60.0) * cad).roundToInt()
+            }
+        }
 
         val enrichedRuns = validRuns.map { r ->
             val zdt = Instant.ofEpochMilli(r.startedAtEpochMs).atZone(zoneId)
@@ -172,14 +183,30 @@ object CoachBrainEngine {
             val minOfDay = hr * 60 + min
             val slot = TimeOfDaySlot.fromMinuteOfDay(minOfDay)
             val dayBuckets = hourlyByDate[r.dateIso].orEmpty()
-            val preStepsFromBuckets = dayBuckets
+            val priorHourSteps = dayBuckets
                 .filter { it.hourOfDay < hr }
                 .sumOf { it.totalSteps }
+            val sameHourBucket = dayBuckets.firstOrNull { it.hourOfDay == hr }
+            val sameHourPreSteps = if (sameHourBucket != null && min > 0) {
+                val durInHourSec = minOf(r.netMovingDurationSec(), ((60 - min) * 60).toDouble()).coerceAtLeast(0.0)
+                val cad = if (r.avgCadenceSpm > 80.0) r.avgCadenceSpm.coerceIn(120.0, 190.0) else 152.0
+                val estThisRunStepsInHour = ((durInHourSec / 60.0) * cad).roundToInt()
+                val nonRunStepsInHour = (sameHourBucket.totalSteps - estThisRunStepsInHour).coerceAtLeast(0)
+                (nonRunStepsInHour * (min / 60.0)).roundToInt()
+            } else 0
+            val preStepsFromBuckets = priorHourSteps + sameHourPreSteps
             val daySteps = effectiveDaySteps(r.dateIso)
-            val estimatedRunSteps = ((r.activeDurationSec / 60.0) * r.avgCadenceSpm.coerceIn(120.0, 185.0)).roundToInt()
+            val allDayRunSteps = totalRunStepsByDate[r.dateIso] ?: 0
+            val netNonRunDaySteps = daySteps?.let { (it - allDayRunSteps).coerceAtLeast(0) }
             val preSteps = when {
-                preStepsFromBuckets >= 250 -> preStepsFromBuckets
-                daySteps != null && hr >= 16 -> (daySteps - estimatedRunSteps).coerceAtLeast(0)
+                preStepsFromBuckets >= 250 && (netNonRunDaySteps == null || preStepsFromBuckets >= netNonRunDaySteps * 0.45) ->
+                    preStepsFromBuckets
+                dayBuckets.isNotEmpty() && hr <= 10 ->
+                    preStepsFromBuckets
+                netNonRunDaySteps != null && hr >= 15 ->
+                    (netNonRunDaySteps * ((hr + min / 60.0 - 6.0) / 16.0).coerceIn(0.55, 1.0)).roundToInt()
+                netNonRunDaySteps != null && hr < 10 ->
+                    (netNonRunDaySteps * 0.12).roundToInt()
                 else -> null
             }
             EnrichedRun(
@@ -203,8 +230,43 @@ object CoachBrainEngine {
             wakeHours.sorted()[wakeHours.size / 2]
         } else null
 
-        // 1. TIME-OF-DAY PERFORMANCE & VARIATION ENGINE
-        val timingResult = analyzeTimeOfDayWindows(enrichedRuns, typicalWakeHour, expectedExamBatch)
+        // 1. CAPABILITY, SPLITS & BIOMECHANICS ENGINE (computed first so physiological effort informs slot & load logic)
+        val trials1600 = validRuns.filter { it.isOfficial1600mTrial() }
+        val continuousRuns = validRuns.filter { it.mode != RunMode.INTERVAL_400M }
+        val bestTrial = trials1600.minByOrNull { it.equiv1600mSec }
+        val latestTrial = trials1600.maxByOrNull { it.startedAtEpochMs }
+        val officialPbSec = bestTrial?.equiv1600mSec
+        val continuousMovingPbSec = continuousRuns.minOfOrNull { r ->
+            TsPoliceBenchmark.computeEquiv1600mSec(r.distanceMeters, r.netMovingDurationSec(), null)
+        }
+        val intervalMovingEstSec = validRuns
+            .filter { it.mode == RunMode.INTERVAL_400M }
+            .minOfOrNull { it.equiv1600mSec * 1.07 }
+            ?.let { intEst ->
+                if (continuousMovingPbSec != null) max(intEst, continuousMovingPbSec - 18.0) else intEst
+            }
+        val movingPbSec = listOfNotNull(continuousMovingPbSec, intervalMovingEstSec).minOrNull()
+        val capabilitySec = listOfNotNull(officialPbSec, movingPbSec).minOrNull()
+        val qualified = officialPbSec != null && officialPbSec <= targetTimeSec
+        val hasNonstop1600 = trials1600.any { it.pausedDurationSec < 25.0 && it.walkingSec < 30.0 }
+
+        fun isHardRun(r: RunSessionRecord): Boolean {
+            if (r.mode == RunMode.TIMED_1600M || r.mode == RunMode.INTERVAL_400M) return true
+            val movSec = r.netMovingDurationSec()
+            if (r.runningSec >= 120.0 && (movSec <= 0.0 || r.runningSec >= movSec * 0.25)) return true
+            if (r.distanceMeters >= 4500.0) return true
+            if (capabilitySec != null && movSec > 0.0) {
+                val sessionSpeed = r.distanceMeters / movSec
+                val capSpeed = TsPoliceBenchmark.TARGET_DISTANCE_M / capabilitySec
+                if (sessionSpeed >= maxOf(capSpeed * 0.90, 3.05)) return true
+            } else if (r.avgCadenceSpm >= 160.0 && r.mode != RunMode.MANUAL_LOG) {
+                return true
+            }
+            return false
+        }
+
+        // 2. TIME-OF-DAY PERFORMANCE & VARIATION ENGINE
+        val timingResult = analyzeTimeOfDayWindows(enrichedRuns, typicalWakeHour, expectedExamBatch, ::isHardRun)
         val bestSlot = timingResult.bestSlot
         val bestWindowText = when (bestSlot) {
             TimeOfDaySlot.SIX_PM -> "6:00 – 6:40 PM (Your Fastest & Steadiest Slot)"
@@ -215,21 +277,6 @@ object CoachBrainEngine {
             TimeOfDaySlot.AFTERNOON -> "5:30 – 6:30 PM Recommended (Avoid Afternoon Heat)"
             null -> "5:30 – 6:30 PM (Peak Body Warmth & Lung Capacity)"
         }
-
-        // 2. CAPABILITY, SPLITS & BIOMECHANICS ENGINE
-        val trials1600 = validRuns.filter {
-            it.mode == RunMode.TIMED_1600M || it.mode == RunMode.MANUAL_LOG || abs(it.distanceMeters - 1600.0) <= 80.0
-        }
-        val bestTrial = trials1600.minByOrNull { it.equiv1600mSec }
-        val latestTrial = trials1600.maxByOrNull { it.startedAtEpochMs }
-        val officialPbSec = bestTrial?.equiv1600mSec
-        val movingPbSec = validRuns.minOfOrNull { r ->
-            val pureMoveSec = (r.activeDurationSec - r.pausedDurationSec).coerceAtLeast(r.activeDurationSec * 0.55)
-            TsPoliceBenchmark.computeEquiv1600mSec(r.distanceMeters, pureMoveSec, null)
-        }
-        val capabilitySec = listOfNotNull(officialPbSec, movingPbSec).minOrNull()
-        val qualified = officialPbSec != null && officialPbSec <= targetTimeSec
-        val hasNonstop1600 = trials1600.any { it.pausedDurationSec < 25.0 && it.walkingSec < 30.0 }
 
         val curLapSec = (capabilitySec ?: 600.0) / 4.0
         val recommendedIntervalLapSec = when {
@@ -249,11 +296,11 @@ object CoachBrainEngine {
         val easyPaceRangeStr = "${formatMinSecPlain(easyPaceLowSecKm)}–${formatMinSecPlain(easyPaceHighSecKm)} /km"
 
         // 3. WORKLOAD, CONSECUTIVE DAYS & RECOVERY DETECTION
-        val todaySummary = dailyMap[todayIso] ?: DailyActivitySummary(dateIso = todayIso)
+        val todaySummary = dailyMap[effectiveTodayIso] ?: DailyActivitySummary(dateIso = effectiveTodayIso)
         val yesterdayIso = todayDate.minusDays(1).toString()
         val twoDaysAgoIso = todayDate.minusDays(2).toString()
 
-        val todayRuns = validRuns.filter { it.dateIso == todayIso }
+        val todayRuns = validRuns.filter { it.dateIso == effectiveTodayIso }
         val yesterdayRuns = validRuns.filter { it.dateIso == yesterdayIso }
         val twoDaysAgoRuns = validRuns.filter { it.dateIso == twoDaysAgoIso }
 
@@ -276,20 +323,26 @@ object CoachBrainEngine {
             if (hadRun) consecutiveDaysBeforeToday++ else break
         }
 
-        fun isHardRun(r: RunSessionRecord): Boolean =
-            r.mode == RunMode.TIMED_1600M ||
-                r.mode == RunMode.INTERVAL_400M ||
-                r.distanceMeters >= 1400.0 ||
-                r.runningSec >= 120.0
-
-        val todayQualityDone = todayRuns.any { it.distanceMeters >= 600.0 } ||
-            todaySummary.jogRunCombinedMeters >= 1100.0
+        val todayQualityDone = todayRuns.any {
+            it.distanceMeters >= TsPoliceBenchmark.MIN_FORECAST_DISTANCE_M ||
+                it.mode == RunMode.TIMED_1600M ||
+                it.mode == RunMode.INTERVAL_400M
+        } || todaySummary.jogRunCombinedMeters >= 1100.0
         val yesterdayWasHard = yesterdayRuns.any { isHardRun(it) } ||
             ((dailyMap[yesterdayIso]?.runningSec ?: 0.0) >= 150.0)
         val twoHardInLast3Days = (yesterdayRuns.count { isHardRun(it) } + twoDaysAgoRuns.count { isHardRun(it) }) >= 2
 
-        val todayStepsNow = max(todaySummary.totalSteps, samsungMap[todayIso]?.steps ?: 0)
-        val highFootFatigueToday = todayStepsNow >= 8500 && !todayQualityDone
+        val recentStepCounts = (1..14).mapNotNull { back ->
+            effectiveDaySteps(todayDate.minusDays(back.toLong()).toString())?.takeIf { it >= 1000 }
+        }.sorted()
+        val adaptiveStepCeiling = if (recentStepCounts.size >= 4) {
+            val med = recentStepCounts[recentStepCounts.size / 2]
+            max(8500, (med * 1.30).roundToInt())
+        } else {
+            8500
+        }
+        val todayStepsNow = max(todaySummary.totalSteps, samsungMap[effectiveTodayIso]?.steps ?: 0)
+        val highFootFatigueToday = todayStepsNow >= adaptiveStepCeiling && !todayQualityDone
 
         // Effective leg state combining manual 1-tap check-in + automatic sensor fatigue
         val needsFullRest = legFeel == LegFeelCheckIn.SORE_SHINS || consecutiveDaysBeforeToday >= 4
@@ -302,9 +355,9 @@ object CoachBrainEngine {
         // 4. DECIDE TODAY'S WORKOUT KIND (Plain, Smart Periodization)
         val workoutKind = when {
             legFeel == LegFeelCheckIn.SORE_SHINS -> CoachWorkoutKind.REST_AND_REPAIR
-            daysRemaining == 0 && !todayQualityDone -> CoachWorkoutKind.EXAM_DAY_RACE
+            rawDaysToDeadline == 0 && !todayQualityDone -> CoachWorkoutKind.EXAM_DAY_RACE
             todayQualityDone -> CoachWorkoutKind.TODAY_DONE_RECOVER_TONIGHT
-            daysRemaining in 1..2 -> CoachWorkoutKind.SHARPENER_TAPER
+            rawDaysToDeadline in 1..2 -> CoachWorkoutKind.SHARPENER_TAPER
             needsFullRest -> CoachWorkoutKind.REST_AND_REPAIR
             needsEasyDay -> CoachWorkoutKind.EASY_TALK_PACE_JOG
             !hasNonstop1600 -> CoachWorkoutKind.NONSTOP_1600M_TEST
@@ -314,7 +367,7 @@ object CoachBrainEngine {
                     val ld = runCatching { LocalDate.parse(it.dateIso) }.getOrNull()
                     if (ld != null) (todayDate.toEpochDay() - ld.toEpochDay()).toInt() else 99
                 } ?: 99
-                if (daysSinceLast1600Trial >= 6 && daysRemaining >= 5) {
+                if (daysSinceLast1600Trial >= 6 && (isPastDeadline || daysRemaining >= 5)) {
                     CoachWorkoutKind.NONSTOP_1600M_TEST
                 } else {
                     CoachWorkoutKind.SPEED_400M_REPS
@@ -325,17 +378,17 @@ object CoachBrainEngine {
         // 5. DECIDE 1 SESSION (EVENING) VS MORNING + EVENING (2 SESSIONS)
         val shouldRehearseMorningToday = !todayQualityDone &&
             expectedExamBatch == ExamTimeBatch.MORNING_GROUND &&
-            daysRemaining in 4..24 &&
+            (isPastDeadline || daysRemaining in 4..24) &&
             earlyMorningRuns14d == 0 &&
             workoutKind in setOf(CoachWorkoutKind.EASY_TALK_PACE_JOG, CoachWorkoutKind.NONSTOP_1600M_TEST) &&
-            todayDate.dayOfWeek.value == 7 // Sunday morning rehearsal
+            todayDate.dayOfWeek.value in setOf(6, 7) // Saturday or Sunday morning rehearsal
 
         val canUnlockOptionalLightDouble = !todayQualityDone &&
             runsLast14d >= 8 &&
             legFeel == LegFeelCheckIn.FRESH &&
             !yesterdayWasHard &&
             todayStepsNow < 5500 &&
-            daysRemaining in 7..21 &&
+            (isPastDeadline || daysRemaining in 7..21) &&
             workoutKind == CoachWorkoutKind.SPEED_400M_REPS
 
         val scheduleMode = when {
@@ -352,7 +405,7 @@ object CoachBrainEngine {
             bestSlotText = bestWindowText,
             expectedExamBatch = expectedExamBatch,
             earlyMorningRuns14d = earlyMorningRuns14d,
-            daysRemaining = daysRemaining,
+            daysRemaining = if (isPastDeadline) 14 else daysRemaining,
             typicalWakeHour = typicalWakeHour
         )
 
@@ -363,7 +416,8 @@ object CoachBrainEngine {
             bestTrial = bestTrial,
             targetTimeSec = targetTimeSec,
             typicalWakeHour = typicalWakeHour,
-            runnerHeightCm = runnerHeightCm
+            runnerHeightCm = runnerHeightCm,
+            isHardRun = ::isHardRun
         )
 
         // 7. PERSONALIZED NUTRITION, CARBS, PROTEIN & HYDRATION TIP
@@ -384,23 +438,26 @@ object CoachBrainEngine {
 
         val repLapFmt = TsPoliceBenchmark.formatDuration(recommendedIntervalLapSec)
         val bestRunToday = todayRuns.minByOrNull { it.equiv1600mSec }
+        val postDeadlineNote = if (isPastDeadline) {
+            " (Goal date $deadlineIso has passed — tap ✎ on your Roadmap card anytime to set your next PET batch date.)"
+        } else ""
 
         return when (workoutKind) {
             CoachWorkoutKind.TODAY_DONE_RECOVER_TONIGHT -> {
-                val todayTimeStr = bestRunToday?.let { TsPoliceBenchmark.formatDuration(it.equiv1600mSec) }
+                val todayTimeStr = bestRunToday?.let { TsPoliceBenchmark.formatDurationAgainstCutoff(it.equiv1600mSec, targetTimeSec) }
                 val ranHardToday = todayRuns.any { isHardRun(it) }
-                val headline = if (todayTimeStr != null && abs(bestRunToday.distanceMeters - 1600.0) <= 80.0) {
+                val headline = if (todayTimeStr != null && bestRunToday.isOfficial1600mTrial()) {
                     "Today's $todayTimeStr Run Is Done! Rest Tonight → Slow Jog Tomorrow"
                 } else {
                     "Today's Run Is Done! Recover Tonight"
                 }
-                val why = if (ranHardToday) {
+                val why = (if (ranHardToday) {
                     "You worked your legs hard today${if (todayTimeStr != null) " ($todayTimeStr)" else ""}. " +
                         "Muscles don't get faster during the run — they get faster tonight while repairing! " +
                         "Tomorrow must be a slow, relaxed jog so your shins stay pain-free."
                 } else {
                     "You completed your movement session today. Rest your legs tonight so you have fresh bounce for tomorrow evening's speed session."
-                }
+                }) + postDeadlineNote
                 val tomorrowPreview = if (ranHardToday) {
                     "Tomorrow evening (${bestSlotClockShort(bestSlot)}, 1 session only): Jog slowly for 15–20 mins (~2 km at $easyPaceRangeStr) — slow enough that you can talk in full sentences without gasping."
                 } else {
@@ -543,11 +600,11 @@ object CoachBrainEngine {
             }
 
             CoachWorkoutKind.SPEED_400M_REPS -> {
-                val why = if (qualified) {
+                val why = (if (qualified) {
                     "You already beat $targetFmt! Crisp 400m speed laps keep your legs sharp without wearing you out."
                 } else {
                     "Your legs are fresh after recovery! Running $recommendedIntervalReps separate 400m laps at ~$repLapFmt trains your legs to spin faster (168+ steps/min) toward your $targetFmt ($targetLapFmt/lap) goal without burning out."
-                }
+                }) + postDeadlineNote
                 CoachBrainReport(
                     confidenceLabel = confidenceLabel,
                     dataPointsSummary = dataPointsSummary,
@@ -714,7 +771,8 @@ object CoachBrainEngine {
     private fun analyzeTimeOfDayWindows(
         enrichedRuns: List<EnrichedRun>,
         typicalWakeHour: Int?,
-        expectedExamBatch: ExamTimeBatch
+        expectedExamBatch: ExamTimeBatch,
+        isHardRun: (RunSessionRecord) -> Boolean
     ): TimeWindowEngineResult {
         val bySlot = enrichedRuns.groupBy { it.slot }
 
@@ -723,6 +781,7 @@ object CoachBrainEngine {
             val slot: TimeOfDaySlot,
             val runs: List<EnrichedRun>,
             val trialCount: Int,
+            val hasQualityRun: Boolean,
             val bestSec: Double,
             val avgSec: Double,
             val variationSec: Double?,
@@ -733,14 +792,14 @@ object CoachBrainEngine {
         )
 
         val populatedCalcs = bySlot.map { (slot, list) ->
-            // Prefer exact 1600m trials when computing pace representative of 1.6K performance, falling back to all runs in slot
-            val trials = list.filter {
-                it.record.mode == RunMode.TIMED_1600M ||
-                    it.record.mode == RunMode.MANUAL_LOG ||
-                    abs(it.record.distanceMeters - 1600.0) <= 80.0
+            // Prefer official continuous 1600m trials, then hard/quality runs, falling back to easy jogs only when no quality run exists in slot
+            val trials = list.filter { it.record.isOfficial1600mTrial() }
+            val qualityRuns = list.filter { it.record.isOfficial1600mTrial() || isHardRun(it.record) }
+            val hasQuality = qualityRuns.isNotEmpty()
+            val paceSource = trials.ifEmpty { qualityRuns.ifEmpty { list } }
+            val secs = paceSource.map {
+                if (it.record.mode == RunMode.INTERVAL_400M) it.record.equiv1600mSec * 1.07 else it.record.equiv1600mSec
             }
-            val paceSource = trials.ifEmpty { list }
-            val secs = paceSource.map { it.record.equiv1600mSec }
             val bestSec = secs.minOrNull() ?: 0.0
             val avgSec = secs.average()
             val runSpread = if (secs.size >= 2) (secs.maxOrNull()!! - secs.minOrNull()!!) else null
@@ -748,12 +807,13 @@ object CoachBrainEngine {
             val singleTrialLapSpread = if (runSpread == null) {
                 val splitTrial = trials.firstOrNull { it.record.lapSplits.size >= 3 }
                 splitTrial?.record?.lapSplits?.map { it.lapDurationSec }?.let { laps ->
-                    (laps.maxOrNull()!! - laps.minOrNull()!!)
+                    val steadyLaps = if (laps.size >= 3) laps.drop(1) else laps
+                    (steadyLaps.maxOrNull()!! - steadyLaps.minOrNull()!!)
                 }
             } else null
             val variation = runSpread ?: singleTrialLapSpread
 
-            val avgStop = list.map { it.record.pausedDurationSec }.average()
+            val avgStop = list.map { if (it.record.mode == RunMode.INTERVAL_400M) 0.0 else it.record.pausedDurationSec }.average()
             val preStepsList = list.mapNotNull { it.preRunSteps }
             val avgPreSteps = if (preStepsList.isNotEmpty()) preStepsList.average().roundToInt() else null
 
@@ -769,6 +829,7 @@ object CoachBrainEngine {
                 slot = slot,
                 runs = list,
                 trialCount = trials.size,
+                hasQualityRun = hasQuality,
                 bestSec = bestSec,
                 avgSec = avgSec,
                 variationSec = variation,
@@ -779,7 +840,9 @@ object CoachBrainEngine {
             )
         }
 
-        val winnerSlot = populatedCalcs.minByOrNull { it.rankMetricSec }?.slot
+        val qualityCalcs = populatedCalcs.filter { it.hasQualityRun }
+        val rankingPool = qualityCalcs.ifEmpty { populatedCalcs }
+        val winnerSlot = rankingPool.minByOrNull { it.rankMetricSec }?.slot
         val calcMap = populatedCalcs.associateBy { it.slot }
 
         // Always include the 4 core comparison slots the runner cares about (Early Morning, 5 PM, 6 PM, 7+ PM)
@@ -839,6 +902,7 @@ object CoachBrainEngine {
 
                 val badge = when {
                     isBest -> "★ BEST SLOT"
+                    !c.hasQualityRun && qualityCalcs.isNotEmpty() -> "EASY JOGS ONLY"
                     diffVsWinnerSec >= 60 || c.avgStopSec >= 45.0 -> "SLOWER (+${TsPoliceBenchmark.formatDuration(diffVsWinnerSec.toDouble())})"
                     diffVsWinnerSec > 0 -> "+${diffVsWinnerSec}s VS BEST"
                     else -> "STEADY"
@@ -880,7 +944,7 @@ object CoachBrainEngine {
             }
         }
 
-        val ranked = populatedCalcs.sortedBy { it.rankMetricSec }
+        val ranked = rankingPool.sortedBy { it.rankMetricSec }
         val variationSummary = when {
             ranked.isEmpty() -> {
                 "No clock-timed runs yet. Start around 5:30–6:30 PM when body warmth peaks, and the Brain will compare your pace across Early Morning, 5:00 PM, and 6:00 PM!"
@@ -889,7 +953,7 @@ object CoachBrainEngine {
                 val only = ranked.first()
                 val bestFmt = TsPoliceBenchmark.formatDuration(only.bestSec)
                 val otherEvening = if (only.slot == TimeOfDaySlot.SIX_PM) "5:00 PM" else "6:00 PM"
-                "All ${only.runs.size} run${if (only.runs.size == 1) "" else "s"} so far are in the ${only.slot.title} (best $bestFmt). Try 1 run around $otherEvening this week so the Brain can see which hour gives you steadier, faster splits!"
+                "All quality runs so far (${only.runs.size} logged) are in the ${only.slot.title} (best $bestFmt). Try 1 run around $otherEvening this week so the Brain can see which hour gives you steadier, faster splits!"
             }
             else -> {
                 val top = ranked.first()
@@ -898,16 +962,16 @@ object CoachBrainEngine {
                 val topBest = TsPoliceBenchmark.formatDuration(top.bestSec)
                 val slowBest = TsPoliceBenchmark.formatDuration(slowest.bestSec)
                 val gapSlow = (slowest.bestSec - top.bestSec).roundToInt()
-                val fiveVsSixNote = if (calcMap.containsKey(TimeOfDaySlot.FIVE_PM) && calcMap.containsKey(TimeOfDaySlot.SIX_PM)) {
-                    val c5 = calcMap.getValue(TimeOfDaySlot.FIVE_PM)
-                    val c6 = calcMap.getValue(TimeOfDaySlot.SIX_PM)
+                val c5 = calcMap[TimeOfDaySlot.FIVE_PM]
+                val c6 = calcMap[TimeOfDaySlot.SIX_PM]
+                val fiveVsSixNote = if (c5 != null && c6 != null && (c5.hasQualityRun == c6.hasQualityRun)) {
                     val d = (c5.avgSec - c6.avgSec).roundToInt()
                     when {
                         abs(d) <= 4 -> " Both 5:00 PM and 6:00 PM perform nearly identically (${abs(d)}s apart)."
                         d > 0 -> " 6:00 PM beats 5:00 PM by ~${d}s on average."
                         else -> " 5:00 PM beats 6:00 PM by ~${abs(d)}s on average."
                     }
-                } else if (!calcMap.containsKey(TimeOfDaySlot.FIVE_PM) && calcMap.containsKey(TimeOfDaySlot.SIX_PM)) {
+                } else if (c5 == null && c6 != null) {
                     " (5:00 PM not tested yet — try 1 run at 5:00–5:30 PM to compare with 6:00 PM!)"
                 } else ""
 
@@ -969,19 +1033,18 @@ object CoachBrainEngine {
         bestTrial: RunSessionRecord?,
         targetTimeSec: Double,
         typicalWakeHour: Int?,
-        runnerHeightCm: Int
+        runnerHeightCm: Int,
+        isHardRun: (RunSessionRecord) -> Boolean
     ): List<String> {
         val insights = mutableListOf<String>()
 
-        // 1. Time-of-day comparison insight (5 PM vs 6 PM vs Late Evening vs Morning)
+        // 1. Time-of-day comparison insight (5 PM vs 6 PM vs Late Evening vs Morning — strictly across comparable quality/trial runs)
         if (enrichedRuns.isNotEmpty()) {
-            val bySlot = enrichedRuns.groupBy { it.slot }
+            val qualityRuns = enrichedRuns.filter { it.record.isOfficial1600mTrial() || isHardRun(it.record) }
+            val sourcePool = qualityRuns.ifEmpty { enrichedRuns }
+            val bySlot = sourcePool.groupBy { it.slot }
             val slotBests = bySlot.mapValues { (_, list) ->
-                val trials = list.filter {
-                    it.record.mode == RunMode.TIMED_1600M ||
-                        it.record.mode == RunMode.MANUAL_LOG ||
-                        abs(it.record.distanceMeters - 1600.0) <= 80.0
-                }
+                val trials = list.filter { it.record.isOfficial1600mTrial() }
                 (trials.ifEmpty { list }).minBy { it.record.equiv1600mSec }
             }
             val fastestEntry = slotBests.minByOrNull { it.value.record.equiv1600mSec }
@@ -1030,8 +1093,9 @@ object CoachBrainEngine {
             }
         }
 
-        // 3. Step Rate (Cadence) Biomechanics Unlock
-        val refRun = bestTrial ?: enrichedRuns.lastOrNull()?.record
+        // 3. Step Rate (Cadence) Biomechanics Unlock (skips manual stopwatch logs with 0.0 spm)
+        val refRun = bestTrial?.takeIf { it.avgCadenceSpm > 100.0 }
+            ?: enrichedRuns.lastOrNull { it.record.avgCadenceSpm > 100.0 }?.record
         if (refRun != null && refRun.avgCadenceSpm > 100.0) {
             val cad = refRun.avgCadenceSpm.roundToInt()
             if (cad < 164) {
@@ -1045,15 +1109,16 @@ object CoachBrainEngine {
             }
         }
 
-        // 4. Daytime Walking Step Fatigue Correlation
-        val runsWithSteps = enrichedRuns.filter { (it.dayTotalSteps ?: 0) > 0 }
+        // 4. Daytime Walking Pre-Run Step Fatigue Correlation
+        fun preRunLoad(r: EnrichedRun): Int = r.preRunSteps ?: r.dayTotalSteps ?: 0
+        val runsWithSteps = enrichedRuns.filter { preRunLoad(it) > 0 }
         if (runsWithSteps.size >= 2) {
             val freshest = runsWithSteps.minByOrNull { it.record.equiv1600mSec }
-            val highStepRuns = runsWithSteps.filter { (it.dayTotalSteps ?: 0) >= 8000 && it != freshest }
-            if (freshest != null && highStepRuns.isNotEmpty() && (freshest.dayTotalSteps ?: 99999) <= 6500) {
-                val highMax = highStepRuns.maxOf { it.dayTotalSteps ?: 0 }
+            val highStepRuns = runsWithSteps.filter { preRunLoad(it) >= 5500 && it != freshest }
+            if (freshest != null && highStepRuns.isNotEmpty() && preRunLoad(freshest) <= 4500) {
+                val highMax = highStepRuns.maxOf { preRunLoad(it) }
                 insights.add(
-                    "Daytime Walking Fatigue Rule: You ran your best (${TsPoliceBenchmark.formatDuration(freshest.record.equiv1600mSec)}) on a ~${freshest.dayTotalSteps}-step day vs slower runs on ${highMax}-step days. Keep daytime walking under ~5,500 steps before speed sessions!"
+                    "Daytime Walking Fatigue Rule: You ran your best (${TsPoliceBenchmark.formatDuration(freshest.record.equiv1600mSec)}) after ~${preRunLoad(freshest)} pre-run steps vs slower runs after ~${highMax} pre-run steps. Keep daytime walking under ~5,500 steps before speed sessions!"
                 )
             }
         }
@@ -1077,7 +1142,7 @@ object CoachBrainEngine {
         val dailyProteinG = (weightKg * 1.6).roundToInt()
         val postRunCarbsG = (weightKg * 1.15).roundToInt()
         val postRunProtG = (weightKg * 0.45).roundToInt().coerceIn(25, 42)
-        val waterLiters = String.format("%.1fL", (weightKg * 0.042).coerceIn(2.4, 4.0))
+        val waterLiters = String.format(Locale.US, "%.1fL", (weightKg * 0.042).coerceIn(2.4, 4.0))
 
         return when (workoutKind) {
             CoachWorkoutKind.TODAY_DONE_RECOVER_TONIGHT -> {
@@ -1113,7 +1178,7 @@ object CoachBrainEngine {
             hour24 > 12 -> hour24 - 12
             else -> hour24
         }
-        return String.format("%d:%02d %s", h12, minute, amPm)
+        return String.format(Locale.US, "%d:%02d %s", h12, minute, amPm)
     }
 
     private fun formatHourOnly(hour24: Int): String {
@@ -1128,6 +1193,6 @@ object CoachBrainEngine {
 
     private fun formatMinSecPlain(sec: Double): String {
         val r = sec.roundToInt().coerceAtLeast(0)
-        return String.format("%d:%02d", r / 60, r % 60)
+        return String.format(Locale.US, "%d:%02d", r / 60, r % 60)
     }
 }

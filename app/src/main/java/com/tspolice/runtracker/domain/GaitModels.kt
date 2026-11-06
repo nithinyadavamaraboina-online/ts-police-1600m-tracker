@@ -1,6 +1,8 @@
 package com.tspolice.runtracker.domain
 
+import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
@@ -18,42 +20,42 @@ enum class MotionState(
     STANDING(
         label = "Standing (Auto-Pause)",
         badgeText = "AUTO-PAUSED • STANDING",
-        colorArgb = 0xFF64748B.toInt(),
+        colorArgb = 0xFF6E7180.toInt(),
         countsAsActiveMovement = false,
         intensityRank = 0
     ),
     VEHICLE(
         label = "Bike / Vehicle (Ignored)",
         badgeText = "AUTO-PAUSED • BIKE / VEHICLE",
-        colorArgb = 0xFF8B5CF6.toInt(),
+        colorArgb = 0xFFBB97FF.toInt(),
         countsAsActiveMovement = false,
         intensityRank = 0
     ),
     WALKING(
         label = "Walking",
         badgeText = "AUTO-DETECTED • WALKING",
-        colorArgb = 0xFF38BDF8.toInt(),
+        colorArgb = 0xFF9D6BFF.toInt(),
         countsAsActiveMovement = true,
         intensityRank = 1
     ),
     JOGGING(
         label = "Jogging",
         badgeText = "AUTO-DETECTED • JOGGING",
-        colorArgb = 0xFFF59E0B.toInt(),
+        colorArgb = 0xFFFF9F1C.toInt(),
         countsAsActiveMovement = true,
         intensityRank = 2
     ),
     RUNNING(
         label = "Running",
         badgeText = "AUTO-DETECTED • RUNNING",
-        colorArgb = 0xFF22C55E.toInt(),
+        colorArgb = 0xFFC6F432.toInt(),
         countsAsActiveMovement = true,
         intensityRank = 3
     ),
     TARGET_PACE(
         label = "TS Police Target Pace",
         badgeText = "TS POLICE 7:15 PACE • RUNNING",
-        colorArgb = 0xFF10B981.toInt(),
+        colorArgb = 0xFFDAFF5E.toInt(),
         countsAsActiveMovement = true,
         intensityRank = 4
     );
@@ -237,7 +239,44 @@ data class RunSessionRecord(
     val lapSplits: List<LapSplit> = emptyList(),
     val notes: String = "",
     val isDemo: Boolean = false
-)
+) {
+    /**
+     * Pure moving duration excluding standing/paused breaks.
+     * Only [RunMode.TIMED_1600M] embeds [pausedDurationSec] inside [activeDurationSec];
+     * [RunMode.INTERVAL_400M] and [RunMode.OPEN_PRACTICE] store pure active movement in [activeDurationSec].
+     */
+    fun netMovingDurationSec(): Double =
+        if (mode == RunMode.TIMED_1600M) {
+            (activeDurationSec - pausedDurationSec).coerceAtLeast(activeDurationSec * 0.55)
+        } else {
+            activeDurationSec
+        }
+
+    /**
+     * Gun-to-finish elapsed time including mid-workout rest/pause breaks.
+     */
+    fun gunElapsedDurationSec(): Double =
+        if (mode == RunMode.TIMED_1600M || mode == RunMode.MANUAL_LOG) {
+            activeDurationSec
+        } else {
+            activeDurationSec + pausedDurationSec
+        }
+
+    /**
+     * True strictly for continuous 1,600m time-trial efforts — never fragmented 4x400m interval
+     * sessions or multi-stop open jogs.
+     */
+    fun isOfficial1600mTrial(): Boolean =
+        mode != RunMode.INTERVAL_400M && (
+            mode == RunMode.TIMED_1600M ||
+                (mode == RunMode.MANUAL_LOG &&
+                    abs(distanceMeters - TsPoliceBenchmark.TARGET_DISTANCE_M) <= TsPoliceBenchmark.OFFICIAL_1600M_TOLERANCE_M) ||
+                (mode == RunMode.OPEN_PRACTICE &&
+                    abs(distanceMeters - TsPoliceBenchmark.TARGET_DISTANCE_M) <= TsPoliceBenchmark.OFFICIAL_1600M_TOLERANCE_M &&
+                    pausedDurationSec < 15.0 &&
+                    walkingSec < 20.0)
+            )
+}
 
 /**
  * Benchmarks & pacing mathematics for Telangana State Police (TSLPRB) 1600m PET.
@@ -247,6 +286,9 @@ object TsPoliceBenchmark {
     const val TARGET_DISTANCE_M = 1600.0
     const val DEFAULT_TARGET_TIME_SEC = 435.0 // 7 min 15 sec
     const val LAP_DISTANCE_M = 400.0
+    const val MIN_SESSION_DISTANCE_M = 400.0
+    const val MIN_FORECAST_DISTANCE_M = 600.0
+    const val OFFICIAL_1600M_TOLERANCE_M = 50.0
 
     fun targetPaceSecPerKm(targetTimeSec: Double = DEFAULT_TARGET_TIME_SEC): Double =
         targetTimeSec / (TARGET_DISTANCE_M / 1000.0)
@@ -320,17 +362,41 @@ object TsPoliceBenchmark {
             val mins = totalTenths / 600
             val secs = (totalTenths % 600) / 10
             val tenths = totalTenths % 10
-            return String.format("%d:%02d.%d", mins, secs, tenths)
+            return String.format(Locale.US, "%d:%02d.%d", mins, secs, tenths)
         }
         val rounded = seconds.roundToInt()
         val hours = rounded / 3600
         val mins = (rounded % 3600) / 60
         val secs = rounded % 60
         return if (hours > 0) {
-            String.format("%d:%02d:%02d", hours, mins, secs)
+            String.format(Locale.US, "%d:%02d:%02d", hours, mins, secs)
         } else {
-            String.format("%d:%02d", mins, secs)
+            String.format(Locale.US, "%d:%02d", mins, secs)
         }
+    }
+
+    /**
+     * Formats a 1,600m time against [cutoffSec] so a non-qualifying fractional finish like `435.3s`
+     * against `435.0s` renders `"7:16"` instead of `"7:15 — Not Qualified"`.
+     */
+    fun formatDurationAgainstCutoff(
+        seconds: Double,
+        cutoffSec: Double = DEFAULT_TARGET_TIME_SEC,
+        includeTenths: Boolean = false
+    ): String {
+        if (!seconds.isFinite() || seconds < 0.0) return "--:--"
+        if (!includeTenths && seconds > cutoffSec && seconds.roundToInt() <= cutoffSec.roundToInt()) {
+            return formatDuration(ceil(seconds), includeTenths = false)
+        }
+        return formatDuration(seconds, includeTenths = includeTenths)
+    }
+
+    /**
+     * Whole seconds strictly above [cutoffSec], rounding fractional excesses up (`435.2s` -> `1s`).
+     */
+    fun secondsAboveCutoff(seconds: Double, cutoffSec: Double = DEFAULT_TARGET_TIME_SEC): Int {
+        if (!seconds.isFinite() || seconds <= cutoffSec) return 0
+        return ceil(seconds - cutoffSec).toInt().coerceAtLeast(1)
     }
 
     fun formatPacePerKm(speedMps: Double): String {
@@ -338,24 +404,29 @@ object TsPoliceBenchmark {
         val secPerKm = (1000.0 / speedMps).roundToInt()
         val mins = secPerKm / 60
         val secs = secPerKm % 60
-        return String.format("%d:%02d /km", mins, secs)
+        return String.format(Locale.US, "%d:%02d /km", mins, secs)
     }
 
     fun formatPaceFromSecPerKm(secPerKm: Double): String {
         if (!secPerKm.isFinite() || secPerKm <= 0.0) return "--:-- /km"
         val rounded = secPerKm.roundToInt()
-        return String.format("%d:%02d /km", rounded / 60, rounded % 60)
+        return String.format(Locale.US, "%d:%02d /km", rounded / 60, rounded % 60)
     }
 
     fun formatSignedDelta(deltaSec: Double): String {
-        val sign = if (deltaSec <= 0.0) "-" else "+"
-        val absRounded = abs(deltaSec).roundToInt()
+        if (!deltaSec.isFinite() || abs(deltaSec) < 0.05) return "0s"
+        val sign = if (deltaSec < 0.0) "-" else "+"
+        val absRounded = if (deltaSec > 0.0) {
+            ceil(deltaSec).toInt().coerceAtLeast(1)
+        } else {
+            abs(deltaSec).roundToInt().coerceAtLeast(1)
+        }
         val mins = absRounded / 60
         val secs = absRounded % 60
         return if (mins > 0) {
-            String.format("%s%d:%02d", sign, mins, secs)
+            String.format(Locale.US, "%s%d:%02d", sign, mins, secs)
         } else {
-            String.format("%s%ds", sign, absRounded)
+            String.format(Locale.US, "%s%ds", sign, absRounded)
         }
     }
 
@@ -417,7 +488,7 @@ object TsPoliceBenchmark {
         return MeritEvaluation(
             qualified = false,
             points = 0,
-            tierLabel = "${(equiv1600mSec - targetTimeSec).roundToInt()}s Above Cutoff",
+            tierLabel = "${secondsAboveCutoff(equiv1600mSec, targetTimeSec)}s Above Cutoff",
             nextTierTimeSec = targetTimeSec,
             nextTierPoints = 40
         )
@@ -437,7 +508,8 @@ object MotionStateAudioCue {
         previousState: MotionState,
         newState: MotionState,
         isRecording: Boolean,
-        targetTimeSec: Double = TsPoliceBenchmark.DEFAULT_TARGET_TIME_SEC
+        targetTimeSec: Double = TsPoliceBenchmark.DEFAULT_TARGET_TIME_SEC,
+        clockContinuesOnStop: Boolean = false
     ): String {
         return when (newState) {
             MotionState.TARGET_PACE -> {
@@ -465,10 +537,18 @@ object MotionStateAudioCue {
             }
             MotionState.WALKING -> "Walking."
             MotionState.VEHICLE -> {
-                if (isRecording) "Vehicle detected. Run paused." else "Bike or vehicle. Ignored."
+                when {
+                    isRecording && clockContinuesOnStop -> "Vehicle detected. Distance paused, trial clock running."
+                    isRecording -> "Vehicle detected. Run paused."
+                    else -> "Bike or vehicle. Ignored."
+                }
             }
             MotionState.STANDING -> {
-                if (isRecording) "Standing. Auto paused." else "Standing."
+                when {
+                    isRecording && clockContinuesOnStop -> "Stopped. Trial clock still running."
+                    isRecording -> "Standing. Auto paused."
+                    else -> "Standing."
+                }
             }
         }
     }

@@ -29,6 +29,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
 
@@ -389,11 +390,11 @@ class SamsungHealthSyncManager(
                 }
 
                 for (w in candidateWorkouts) {
-                    if (w.distanceMeters >= 600.0 &&
+                    if (w.distanceMeters >= TsPoliceBenchmark.MIN_FORECAST_DISTANCE_M &&
                         !repository.isExternalWorkoutImported(w.externalId) &&
                         !repository.hasSessionNear(w.startedAtEpochMs)
                     ) {
-                        val is1600 = kotlin.math.abs(w.distanceMeters - 1600.0) <= 45.0
+                        val is1600 = kotlin.math.abs(w.distanceMeters - 1600.0) <= TsPoliceBenchmark.OFFICIAL_1600M_TOLERANCE_M
                         repository.insertSession(
                             RunSessionRecord(
                                 startedAtEpochMs = w.startedAtEpochMs,
@@ -830,7 +831,7 @@ class SamsungHealthSyncManager(
                 val hStartMs = date.atTime(hr, 0).atZone(zone).toInstant().toEpochMilli()
                 val hEndMs = date.atTime(hr, 0).plusHours(1).atZone(zone).toInstant().toEpochMilli()
                 if (hStartMs >= safeNow.toEpochMilli()) {
-                    hourlyMap[String.format("%sT%02d", dIso, hr)] = SamsungHourlyBucket(dateIso = dIso, hourOfDay = hr)
+                    hourlyMap[String.format(Locale.US, "%sT%02d", dIso, hr)] = SamsungHourlyBucket(dateIso = dIso, hourOfDay = hr)
                     continue
                 }
 
@@ -921,7 +922,7 @@ class SamsungHealthSyncManager(
                     }
                 }
 
-                hourlyMap[String.format("%sT%02d", dIso, hr)] = SamsungHourlyBucket(
+                hourlyMap[String.format(Locale.US, "%sT%02d", dIso, hr)] = SamsungHourlyBucket(
                     dateIso = dIso,
                     hourOfDay = hr,
                     steps = kotlin.math.round(hSteps).toInt(),

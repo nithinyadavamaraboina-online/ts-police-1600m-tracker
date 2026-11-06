@@ -1,6 +1,7 @@
 package com.tspolice.runtracker.domain
 
 import java.time.LocalDate
+import java.util.Locale
 import kotlin.math.ceil
 import kotlin.math.exp
 import kotlin.math.max
@@ -54,8 +55,16 @@ data class TargetForecast(
  */
 object ProgressionForecaster {
 
-    const val MIN_VALID_DISTANCE_M = 600.0
+    const val MIN_VALID_DISTANCE_M = TsPoliceBenchmark.MIN_FORECAST_DISTANCE_M
     const val MIN_VALID_DURATION_SEC = 90.0
+
+    private fun continuousEquivSecForForecast(r: RunSessionRecord): Double =
+        if (r.mode == RunMode.INTERVAL_400M) {
+            // 400m interval reps include 90s recovery breaks; apply 1.07x endurance translation
+            r.equiv1600mSec * 1.07
+        } else {
+            r.equiv1600mSec
+        }
 
     fun analyze(
         sessions: List<RunSessionRecord>,
@@ -64,6 +73,12 @@ object ProgressionForecaster {
     ): TargetForecast {
         val todayEpoch = runCatching { LocalDate.parse(todayIso).toEpochDay() }
             .getOrElse { LocalDate.now().toEpochDay() }
+        val targetFmt = TsPoliceBenchmark.formatDuration(targetTimeSec)
+        val targetLap = TsPoliceBenchmark.targetLap400mSec(targetTimeSec)
+        val targetLapFmt = TsPoliceBenchmark.formatDuration(targetLap)
+        val openerLapFmt = TsPoliceBenchmark.formatDuration(targetLap + 1.0)
+        val closerLapFmt = TsPoliceBenchmark.formatDuration((targetLap - 3.0).coerceAtLeast(65.0))
+        val intervalLapFmt = TsPoliceBenchmark.formatDuration((targetLap - 2.0).coerceAtLeast(65.0))
 
         val valid = sessions.filter {
             it.distanceMeters >= MIN_VALID_DISTANCE_M &&
@@ -91,7 +106,7 @@ object ProgressionForecaster {
                 projectedTargetDateIso = null,
                 practiceDaysPerWeek = 0.0,
                 qualifiedRunCount = 0,
-                coachSummary = "Complete your first 1.6 km run (or load demo data) to establish your baseline and unlock your target-date forecast.",
+                coachSummary = "Complete your first 1.6 km run (or load demo data) to establish your baseline and unlock your $targetFmt target-date forecast.",
                 workoutPrescription = "Day 1 Goal: Run 1.6 km at a steady sustainable effort to record your true baseline split."
             )
         }
@@ -101,17 +116,14 @@ object ProgressionForecaster {
             .mapNotNull { (dateIso, dayRuns) ->
                 val epochDay = runCatching { LocalDate.parse(dateIso).toEpochDay() }.getOrNull()
                     ?: return@mapNotNull null
-                val bestRun = dayRuns.minByOrNull { it.equiv1600mSec } ?: return@mapNotNull null
+                val bestRun = dayRuns.minByOrNull { continuousEquivSecForForecast(it) } ?: return@mapNotNull null
                 val totalActive = dayRuns.sumOf { it.runningSec + it.joggingSec + it.walkingSec }.coerceAtLeast(1.0)
                 val runPct = ((dayRuns.sumOf { it.runningSec } / totalActive) * 100.0).roundToInt().coerceIn(0, 100)
-                val isExactTrial = bestRun.mode == RunMode.TIMED_1600M ||
-                    bestRun.mode == RunMode.MANUAL_LOG ||
-                    bestRun.first1600mSplitSec != null ||
-                    kotlin.math.abs(bestRun.distanceMeters - 1600.0) <= 50.0
+                val isExactTrial = bestRun.isOfficial1600mTrial()
                 DailyProgressPoint(
                     dateIso = dateIso,
                     epochDay = epochDay,
-                    bestEquiv1600mSec = bestRun.equiv1600mSec,
+                    bestEquiv1600mSec = continuousEquivSecForForecast(bestRun),
                     bestDistanceMeters = bestRun.distanceMeters,
                     isExact1600mTrial = isExactTrial,
                     totalDistanceMeters = dayRuns.sumOf { it.distanceMeters },
@@ -121,13 +133,16 @@ object ProgressionForecaster {
             }
             .sortedBy { it.epochDay }
 
-        val pbSec = dailyPoints.minOf { it.bestEquiv1600mSec }
+        val continuousPbSec = valid
+            .filter { it.mode != RunMode.INTERVAL_400M }
+            .minOfOrNull { it.equiv1600mSec }
+        val pbSec = continuousPbSec ?: dailyPoints.minOf { it.bestEquiv1600mSec }
         val initialSec = dailyPoints.first().bestEquiv1600mSec
         // Current capability uses the best of the most recent 3 practice days so an easy recovery jog day doesn't penalize ETA
         val recentWindow = dailyPoints.takeLast(3)
         val currentCapabilitySec = recentWindow.minOf { it.bestEquiv1600mSec }
         val totalImproved = initialSec - pbSec
-        val qualifiedRuns = valid.count { it.equiv1600mSec <= targetTimeSec }
+        val qualifiedRuns = valid.count { it.mode != RunMode.INTERVAL_400M && it.equiv1600mSec <= targetTimeSec }
 
         val spanDays = max(1L, dailyPoints.last().epochDay - dailyPoints.first().epochDay + 1L)
         val observedFreqPerWeek = if (spanDays >= 5L) {
@@ -136,17 +151,22 @@ object ProgressionForecaster {
             5.0 // sensible training assumption during week 1
         }
 
-        // Already achieved target!
-        if (pbSec <= targetTimeSec) {
-            val margin = targetTimeSec - pbSec
-            val slope = if (dailyPoints.size >= 2) computeWeightedImprovementRatePerDay(dailyPoints, pbSec) else null
+        // Already achieved target on a continuous run! (Fragmented 400m interval reps never auto-qualify.)
+        if (qualifiedRuns > 0 && continuousPbSec != null && continuousPbSec <= targetTimeSec) {
+            val margin = (targetTimeSec - continuousPbSec).coerceAtLeast(0.0)
+            val slope = if (dailyPoints.size >= 2) computeWeightedImprovementRatePerDay(dailyPoints, continuousPbSec) else null
+            val qualDateIso = valid
+                .filter { it.mode != RunMode.INTERVAL_400M && it.equiv1600mSec <= targetTimeSec }
+                .minByOrNull { it.startedAtEpochMs }
+                ?.dateIso
+                ?: dailyPoints.first().dateIso
             return TargetForecast(
                 status = ForecastStatus.QUALIFIED,
                 targetTimeSec = targetTimeSec,
                 dailyPoints = dailyPoints,
-                personalBestSec = pbSec,
+                personalBestSec = continuousPbSec,
                 initialBaselineSec = initialSec,
-                currentCapabilitySec = currentCapabilitySec,
+                currentCapabilitySec = minOf(currentCapabilitySec, continuousPbSec),
                 gapToTargetSec = 0.0,
                 totalImprovementSec = totalImproved,
                 improvementSecPerDay = slope,
@@ -156,19 +176,22 @@ object ProgressionForecaster {
                 optimisticDaysToTarget = 0,
                 conservativeDaysToTarget = 0,
                 estimatedSessionsToTarget = 0,
-                projectedTargetDateIso = dailyPoints.first { it.bestEquiv1600mSec <= targetTimeSec }.dateIso,
+                projectedTargetDateIso = qualDateIso,
                 practiceDaysPerWeek = observedFreqPerWeek,
                 qualifiedRunCount = qualifiedRuns,
-                coachSummary = "QUALIFIED! Personal best ${TsPoliceBenchmark.formatDuration(pbSec)} beats the 7:15 cutoff by ${String.format("%.0fs", margin)} ($qualifiedRuns qualifying session${if (qualifiedRuns == 1) "" else "s"}).",
-                workoutPrescription = "Lock in consistency: practice negative splits (Lap 1-2 at 1:49, Lap 3-4 at 1:45) so race-day heat or wind never threatens your 7:15 margin."
+                coachSummary = "QUALIFIED! Personal best ${TsPoliceBenchmark.formatDuration(continuousPbSec)} beats the $targetFmt cutoff by ${String.format(Locale.US, "%.0fs", margin)} ($qualifiedRuns qualifying session${if (qualifiedRuns == 1) "" else "s"}).",
+                workoutPrescription = "Lock in consistency: practice negative splits (Lap 1-2 at $openerLapFmt, Lap 3-4 at $closerLapFmt) so race-day heat or wind never threatens your $targetFmt margin."
             )
         }
 
         val gapSec = (currentCapabilitySec - targetTimeSec).coerceAtLeast(0.1)
+        val gapDisplaySec = TsPoliceBenchmark.secondsAboveCutoff(currentCapabilitySec, targetTimeSec)
+        val pbFmt = TsPoliceBenchmark.formatDurationAgainstCutoff(pbSec, targetTimeSec)
+        val capFmt = TsPoliceBenchmark.formatDurationAgainstCutoff(currentCapabilitySec, targetTimeSec)
 
         // Single practice day logged so far
         if (dailyPoints.size == 1) {
-            val neededPerWeek4w = gapSec / 4.0
+            val neededPerWeek4w = ceil(gapSec / 4.0).toInt().coerceAtLeast(1)
             return TargetForecast(
                 status = ForecastStatus.SINGLE_DAY_BASELINE,
                 targetTimeSec = targetTimeSec,
@@ -188,8 +211,8 @@ object ProgressionForecaster {
                 projectedTargetDateIso = null,
                 practiceDaysPerWeek = observedFreqPerWeek,
                 qualifiedRunCount = 0,
-                coachSummary = "Baseline recorded: ${TsPoliceBenchmark.formatDuration(pbSec)} (${String.format("%.0fs", gapSec)} above 7:15). Log 1 more practice day to calculate your personal improvement speed & target date!",
-                workoutPrescription = "Shaving ${String.format("%.0fs", neededPerWeek4w)}/week hits 7:15 in 4 weeks. Next workout: 5 × 400m intervals at 1:48 with 90s walk recovery."
+                coachSummary = "Baseline recorded: $pbFmt (${gapDisplaySec}s above $targetFmt). Log 1 more practice day to calculate your personal improvement speed & target date!",
+                workoutPrescription = "Shaving ${neededPerWeek4w}s/week hits $targetFmt in 4 weeks. Next workout: 5 × 400m intervals at $targetLapFmt with 90s walk recovery."
             )
         }
 
@@ -198,6 +221,8 @@ object ProgressionForecaster {
         val rateSecPerSession = rateSecPerWeek / observedFreqPerWeek
 
         if (rateSecPerDay <= 0.08) {
+            val trendWkRounded = (-rateSecPerWeek).roundToInt()
+            val trendWkStr = if (trendWkRounded == 0) "0s/wk" else String.format(Locale.US, "%+ds/wk", trendWkRounded)
             return TargetForecast(
                 status = ForecastStatus.PLATEAU_OR_SLOWER,
                 targetTimeSec = targetTimeSec,
@@ -217,8 +242,8 @@ object ProgressionForecaster {
                 projectedTargetDateIso = null,
                 practiceDaysPerWeek = observedFreqPerWeek,
                 qualifiedRunCount = 0,
-                coachSummary = "Recent pace trend is flat (${String.format("%+.0fs/wk", -rateSecPerWeek)}); ${String.format("%.0fs", gapSec)} left to reach 7:15 from your ${TsPoliceBenchmark.formatDuration(currentCapabilitySec)} capability.",
-                workoutPrescription = "Plateau breaker: alternate 1 interval day (6 × 400m @ 1:46) with 1 easy 3 km aerobic jog (keep Running share >75% on trial days)."
+                coachSummary = "Recent pace trend is flat ($trendWkStr); ${gapDisplaySec}s left to reach $targetFmt from your $capFmt capability.",
+                workoutPrescription = "Plateau breaker: alternate 1 interval day (6 × 400m @ $intervalLapFmt) with 1 easy 2.4 km talk-pace jog (keep Running share >75% on trial days)."
             )
         }
 
@@ -227,8 +252,8 @@ object ProgressionForecaster {
         val effectiveRatePerWeek = effectiveRatePerDay * 7.0
         val effectiveRatePerSession = effectiveRatePerWeek / observedFreqPerWeek
         val linearDays = gapSec / effectiveRatePerDay
-        // Physiological taper multiplier: shaving the final seconds near 7:15 takes ~18% more time than linear extrapolation
-        val taperMultiplier = if (currentCapabilitySec < 470.0) 1.22 else 1.15
+        // Physiological taper multiplier: shaving the final seconds near target takes ~18% more time than linear extrapolation
+        val taperMultiplier = if (currentCapabilitySec < targetTimeSec + 35.0) 1.22 else 1.15
         val realisticDays = ceil(linearDays * taperMultiplier).toInt().coerceIn(1, 730)
         val optimisticDays = ceil(linearDays).toInt().coerceIn(1, realisticDays)
         val conservativeDays = ceil(linearDays * 1.32).toInt().coerceIn(realisticDays, 900)
@@ -237,7 +262,6 @@ object ProgressionForecaster {
         val anchorDay = max(todayEpoch, dailyPoints.last().epochDay)
         val targetDateIso = LocalDate.ofEpochDay(anchorDay + realisticDays).toString()
 
-        val targetLap = TsPoliceBenchmark.targetLap400mSec(targetTimeSec)
         val currentLap = currentCapabilitySec / 4.0
 
         return TargetForecast(
@@ -259,8 +283,8 @@ object ProgressionForecaster {
             projectedTargetDateIso = targetDateIso,
             practiceDaysPerWeek = observedFreqPerWeek,
             qualifiedRunCount = 0,
-            coachSummary = "Improving by ${String.format("%.0fs/week", effectiveRatePerWeek)} (${String.format("%.0fs", gapSec)} left). At this practice pace, you'll break 7:15 in ~$realisticDays days ($optimisticDays–$conservativeDays days, ~$estSessions sessions) around $targetDateIso.",
-            workoutPrescription = "Current 400m lap avg is ${TsPoliceBenchmark.formatDuration(currentLap)} vs ${TsPoliceBenchmark.formatDuration(targetLap)} target. Focus next track session on holding 1:48/lap through 1,200m."
+            coachSummary = "Improving by ${String.format(Locale.US, "%.0fs/week", effectiveRatePerWeek)} (${gapDisplaySec}s left). At this practice pace, you'll break $targetFmt in ~$realisticDays days ($optimisticDays–$conservativeDays days, ~$estSessions sessions) around $targetDateIso.",
+            workoutPrescription = "Current 400m lap avg is ${TsPoliceBenchmark.formatDuration(currentLap)} vs $targetLapFmt target. Focus next track session on holding $targetLapFmt/lap through 1,200m."
         )
     }
 
@@ -372,7 +396,7 @@ data class DeadlineGoalPlan(
 object DeadlineGoalCoach {
 
     private fun formatShortDate(date: LocalDate): String {
-        val m = date.month.name.take(3).lowercase().replaceFirstChar { it.uppercase() }
+        val m = date.month.name.take(3).lowercase(Locale.US).replaceFirstChar { it.titlecase(Locale.US) }
         return "$m ${date.dayOfMonth}"
     }
 
@@ -386,30 +410,42 @@ object DeadlineGoalCoach {
     ): DeadlineGoalPlan {
         val todayDate = runCatching { LocalDate.parse(todayIso) }.getOrElse { LocalDate.now() }
         val deadlineDate = runCatching { LocalDate.parse(deadlineIso) }.getOrElse { LocalDate.of(2026, 11, 30) }
-        val daysRemaining = (deadlineDate.toEpochDay() - todayDate.toEpochDay()).toInt().coerceAtLeast(0)
-        val deadlineLabel = formatShortDate(deadlineDate)
+        val rawDaysToDeadline = (deadlineDate.toEpochDay() - todayDate.toEpochDay()).toInt()
+        val isPastDeadline = rawDaysToDeadline < 0
+        val daysRemaining = rawDaysToDeadline.coerceAtLeast(0)
+        val rawDeadlineLabel = formatShortDate(deadlineDate)
+        val deadlineLabel = if (isPastDeadline) "$rawDeadlineLabel Passed • Tap ✎" else rawDeadlineLabel
         val targetFmt = TsPoliceBenchmark.formatDuration(targetTimeSec)
         val targetLapSec = TsPoliceBenchmark.targetLap400mSec(targetTimeSec)
 
         val validRuns = sessions.filter {
-            it.distanceMeters >= 500.0 &&
-                it.activeDurationSec >= 75.0 &&
+            it.distanceMeters >= TsPoliceBenchmark.MIN_SESSION_DISTANCE_M &&
+                it.activeDurationSec >= 60.0 &&
                 it.equiv1600mSec in 180.0..1800.0
         }
 
-        val officialBestSec = validRuns.minOfOrNull { it.equiv1600mSec }
-        val trials1600 = validRuns.filter {
-            it.mode == RunMode.TIMED_1600M || kotlin.math.abs(it.distanceMeters - 1600.0) <= 60.0
-        }
+        val continuousRuns = validRuns.filter { it.mode != RunMode.INTERVAL_400M }
+        val officialBestSec = continuousRuns.minOfOrNull { it.equiv1600mSec }
+        val trials1600 = validRuns.filter { it.isOfficial1600mTrial() }
         val bestTrial = trials1600.minByOrNull { it.equiv1600mSec }
         val stoppedPenaltySec = bestTrial?.pausedDurationSec ?: 0.0
         val hasCleanNonstop1600m = trials1600.any { it.pausedDurationSec < 15.0 && it.walkingSec < 30.0 }
 
-        val bestMovingEquivSec = validRuns.mapNotNull { s ->
-            val movSec = (s.activeDurationSec - s.pausedDurationSec).coerceAtLeast(s.activeDurationSec * 0.55)
+        val continuousMovingEquivSec = continuousRuns.mapNotNull { s ->
+            val movSec = s.netMovingDurationSec()
             val eq = TsPoliceBenchmark.computeEquiv1600mSec(s.distanceMeters, movSec, null)
             eq.takeIf { it in 180.0..1800.0 }
         }.minOrNull()
+
+        val intervalEstEquivSec = validRuns
+            .filter { it.mode == RunMode.INTERVAL_400M }
+            .mapNotNull { s -> (s.equiv1600mSec * 1.07).takeIf { it in 180.0..1800.0 } }
+            .minOrNull()
+            ?.let { intEst ->
+                if (continuousMovingEquivSec != null) max(intEst, continuousMovingEquivSec - 18.0) else intEst
+            }
+
+        val bestMovingEquivSec = listOfNotNull(continuousMovingEquivSec, intervalEstEquivSec).minOrNull()
 
         val movingCapSec = when {
             officialBestSec != null && bestMovingEquivSec != null -> minOf(officialBestSec, bestMovingEquivSec)
@@ -419,7 +455,7 @@ object DeadlineGoalCoach {
         val anchorStartSec = (movingCapSec ?: 720.0).coerceIn(targetTimeSec, 840.0)
         val weeksLeft = (daysRemaining / 7.0).coerceAtLeast(0.5)
         val effectiveGapSec = ((movingCapSec ?: anchorStartSec) - targetTimeSec).coerceAtLeast(0.0)
-        val requiredCutPerWeek = if (movingCapSec != null && effectiveGapSec > 0.0 && daysRemaining > 0) {
+        val requiredCutPerWeek = if (movingCapSec != null && effectiveGapSec > 0.0 && rawDaysToDeadline > 0) {
             effectiveGapSec / weeksLeft
         } else {
             null
@@ -445,27 +481,38 @@ object DeadlineGoalCoach {
             }
         }
 
+        fun isHardEffort(r: RunSessionRecord): Boolean {
+            if (r.mode == RunMode.TIMED_1600M || r.mode == RunMode.INTERVAL_400M) return true
+            val movSec = r.netMovingDurationSec()
+            if (r.runningSec >= 120.0 && (movSec <= 0.0 || r.runningSec >= movSec * 0.25)) return true
+            if (r.distanceMeters >= 4500.0) return true
+            if (movingCapSec != null && movSec > 0.0) {
+                val runSpeed = r.distanceMeters / movSec
+                val capSpeed = TsPoliceBenchmark.TARGET_DISTANCE_M / movingCapSec
+                if (runSpeed >= maxOf(capSpeed * 0.90, 3.05)) return true
+            } else if (r.avgCadenceSpm >= 160.0 && r.mode != RunMode.MANUAL_LOG) {
+                return true
+            }
+            return false
+        }
+
         // Inspect today's & yesterday's workload for smart Hard/Easy push modulation
         val yesterdayIso = todayDate.minusDays(1).toString()
-        val todayRuns = sessions.filter { it.dateIso == todayIso && it.distanceMeters >= 300.0 }
-        val yesterdayRuns = sessions.filter { it.dateIso == yesterdayIso && it.distanceMeters >= 400.0 }
+        val todayRuns = sessions.filter { it.dateIso == todayIso && it.distanceMeters >= TsPoliceBenchmark.MIN_SESSION_DISTANCE_M }
+        val yesterdayRuns = sessions.filter { it.dateIso == yesterdayIso && it.distanceMeters >= TsPoliceBenchmark.MIN_SESSION_DISTANCE_M }
 
         val todayQualityDone = todayRuns.any {
-            it.mode == RunMode.TIMED_1600M || it.mode == RunMode.INTERVAL_400M || it.distanceMeters >= 900.0
+            it.mode == RunMode.TIMED_1600M || it.mode == RunMode.INTERVAL_400M || it.distanceMeters >= TsPoliceBenchmark.MIN_FORECAST_DISTANCE_M
         } || todaySummary.jogRunCombinedMeters >= 1100.0
 
-        val yesterdayWasHard = yesterdayRuns.any {
-            it.mode == RunMode.TIMED_1600M ||
-                it.mode == RunMode.INTERVAL_400M ||
-                it.runningSec >= 120.0 ||
-                it.distanceMeters >= 1500.0
-        } || (yesterdaySummary?.runningSec ?: 0.0) >= 150.0
+        val yesterdayWasHard = yesterdayRuns.any { isHardEffort(it) } ||
+            (yesterdaySummary?.runningSec ?: 0.0) >= 150.0
 
         val qualified = officialBestSec != null && officialBestSec <= targetTimeSec
-        val headline = if (daysRemaining == 0) {
-            "Goal Day ($deadlineLabel)  •  Sub-$targetFmt Test!"
-        } else {
-            "$daysRemaining Days to $deadlineLabel  •  $targetFmt Goal"
+        val headline = when {
+            isPastDeadline -> "Goal Date ($rawDeadlineLabel) Passed  •  Tap ✎ to Set Next PET Date"
+            rawDaysToDeadline == 0 -> "Goal Day ($rawDeadlineLabel)  •  Sub-$targetFmt Test!"
+            else -> "$daysRemaining Days to $rawDeadlineLabel  •  $targetFmt Goal"
         }
 
         val statusSummary = when {
@@ -473,15 +520,18 @@ object DeadlineGoalCoach {
                 "QUALIFIED! Personal best ${TsPoliceBenchmark.formatDuration(officialBestSec!!)} is already faster than $targetFmt."
             }
             bestTrial != null && stoppedPenaltySec >= 30.0 && !hasCleanNonstop1600m -> {
-                "PB ${TsPoliceBenchmark.formatDuration(officialBestSec ?: bestTrial.equiv1600mSec)} " +
+                "PB ${TsPoliceBenchmark.formatDurationAgainstCutoff(officialBestSec ?: bestTrial.equiv1600mSec, targetTimeSec)} " +
                     "(your 1.6K trial had ${TsPoliceBenchmark.formatDuration(stoppedPenaltySec)} stopped — " +
-                    "moving pace was ${TsPoliceBenchmark.formatDuration(movingCapSec ?: bestTrial.equiv1600mSec)}). " +
+                    "moving pace was ${TsPoliceBenchmark.formatDurationAgainstCutoff(movingCapSec ?: bestTrial.equiv1600mSec, targetTimeSec)}). " +
                     "Week 1 target: ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)} nonstop."
             }
             movingCapSec != null -> {
-                "Current capability ${TsPoliceBenchmark.formatDuration(movingCapSec)}  •  " +
+                "Current capability ${TsPoliceBenchmark.formatDurationAgainstCutoff(movingCapSec, targetTimeSec)}  •  " +
                     "This week's target: ${TsPoliceBenchmark.formatDuration(thisWeekTargetSec)}  •  " +
                     "$deadlineLabel goal: $targetFmt (${TsPoliceBenchmark.formatDuration(targetLapSec)}/lap)."
+            }
+            isPastDeadline -> {
+                "No 1.6 km baseline yet  •  Tap ✎ to pick your upcoming PET batch date for $targetFmt (${TsPoliceBenchmark.formatDuration(targetLapSec)}/400m lap)."
             }
             else -> {
                 "No 1.6 km baseline yet  •  $daysRemaining days left to build to $targetFmt (${TsPoliceBenchmark.formatDuration(targetLapSec)}/400m lap)."
@@ -518,7 +568,7 @@ object DeadlineGoalCoach {
                 recommendedActionLabel = "Run Sharpener 4 × 400m Laps  →"
             )
 
-            daysRemaining == 0 -> DeadlineGoalPlan(
+            rawDaysToDeadline == 0 -> DeadlineGoalPlan(
                 deadlineIso = deadlineIso,
                 deadlineLabel = deadlineLabel,
                 daysRemaining = 0,
@@ -536,14 +586,14 @@ object DeadlineGoalCoach {
                 pushAccentKind = PushAccentKind.LIME_GO,
                 headlineTitle = headline,
                 statusSummary = statusSummary,
-                todayPushDirective = "Exam Day Game Plan: Start Lap 1 controlled at 1:49 (do NOT sprint the first 200m!), keep quick 170+ steps/min on Laps 2–3, and sprint all-out in the final 250m!",
+                todayPushDirective = "Exam Day Game Plan: Start Lap 1 controlled at ${TsPoliceBenchmark.formatDuration(targetLapSec)} (do NOT sprint the first 200m!), keep quick 170+ steps/min on Laps 2–3, and sprint all-out in the final 250m!",
                 weeklyStructureHint = weeklyStructureHint,
                 checkpoints = checkpoints,
                 recommendedAction = RecommendedWorkoutAction.ARM_1600M_TRIAL,
                 recommendedActionLabel = "Launch Official 1.6 km Trial  →"
             )
 
-            daysRemaining in 1..2 -> DeadlineGoalPlan(
+            rawDaysToDeadline in 1..2 -> DeadlineGoalPlan(
                 deadlineIso = deadlineIso,
                 deadlineLabel = deadlineLabel,
                 daysRemaining = daysRemaining,
@@ -674,7 +724,7 @@ object DeadlineGoalCoach {
     }
 
     private fun formatShortDist(m: Double): String =
-        if (m >= 1000.0) String.format("%.2f km", m / 1000.0) else "${m.toInt()} m"
+        if (m >= 1000.0) String.format(Locale.US, "%.2f km", m / 1000.0) else "${m.toInt()} m"
 
     private fun buildCheckpoints(
         todayDate: LocalDate,

@@ -44,7 +44,7 @@ if (-not $env:JAVA_HOME -and (Test-Path "C:\Program Files\Java\jdk-21")) {
     $env:JAVA_HOME = "C:\Program Files\Java\jdk-21"
 }
 
-& ".\gradlew.bat" testDebugUnitTest assembleRelease --console=plain
+& ".\gradlew.bat" testDebugUnitTest assembleRelease -PrequireReleaseKeystore=true --console=plain
 if ($LASTEXITCODE -ne 0) { throw "Gradle build failed" }
 
 New-Item -ItemType Directory -Force -Path "dist" | Out-Null
@@ -67,16 +67,31 @@ $ManifestJson = $ManifestObj | ConvertTo-Json -Depth 4
 $ManifestPath = Join-Path $RepoRoot "version.json"
 [System.IO.File]::WriteAllText($ManifestPath, $ManifestJson, $Utf8NoBom)
 
-git add -A
+git add app scripts README.md version.json
 git commit -m "feat(release): v$VersionName - $Notes"
 git tag "v$VersionName"
 git push origin HEAD --tags
+if ($LASTEXITCODE -ne 0) { throw "Git push failed" }
 
-# Publish GitHub Release & upload APK + version.json via Git Credential Manager token
+# Publish GitHub Release & upload APK + version.json via Git Credential Manager token (safe env-var passing)
+$env:OTA_VER_NAME = $VersionName
+$env:OTA_VER_CODE = "$NewCode"
+$env:OTA_SHA256 = $Sha256
+$env:OTA_NOTES = $Notes
+$env:OTA_APK_PATH = $ApkDest
+$env:OTA_MANIFEST_PATH = $ManifestPath
+
 python -c "
-import subprocess, urllib.request, json, pathlib
+import os, subprocess, urllib.request, json, pathlib
 
-p = subprocess.run(['git', 'credential', 'fill'], input='protocol=https\nhost=github.com\n\n', capture_output=True, text=True)
+ver_name = os.environ['OTA_VER_NAME']
+ver_code = os.environ['OTA_VER_CODE']
+sha256 = os.environ['OTA_SHA256']
+notes = os.environ['OTA_NOTES']
+apk_path = os.environ['OTA_APK_PATH']
+manifest_path = os.environ['OTA_MANIFEST_PATH']
+
+p = subprocess.run(['git', 'credential', 'fill'], input='protocol=https\nhost=github.com\n\n', capture_output=True, text=True, check=True)
 token = dict(l.split('=', 1) for l in p.stdout.splitlines() if '=' in l)['password']
 headers = {
     'Authorization': 'Bearer ' + token,
@@ -85,9 +100,9 @@ headers = {
     'Content-Type': 'application/json'
 }
 payload = json.dumps({
-    'tag_name': 'v$VersionName',
-    'name': 'TS Police 1.6K Tracker v$VersionName',
-    'body': '''$Notes\n\n[versionCode:$NewCode]\nSHA-256: $Sha256''',
+    'tag_name': f'v{ver_name}',
+    'name': f'TS Police 1.6K Tracker v{ver_name}',
+    'body': f'{notes}\n\n[versionCode:{ver_code}]\nSHA-256: {sha256}',
     'draft': False,
     'prerelease': False
 }).encode('utf-8')
@@ -97,7 +112,7 @@ with urllib.request.urlopen(req, timeout=30) as resp:
     rel = json.loads(resp.read().decode())
 
 upload_base = rel['upload_url'].split('{')[0]
-for path_str, ctype in [(r'$ApkDest', 'application/vnd.android.package-archive'), (r'$ManifestPath', 'application/json')]:
+for path_str, ctype in [(apk_path, 'application/vnd.android.package-archive'), (manifest_path, 'application/json')]:
     fpath = pathlib.Path(path_str)
     up_req = urllib.request.Request(
         f'{upload_base}?name={fpath.name}',
@@ -114,5 +129,6 @@ for path_str, ctype in [(r'$ApkDest', 'application/vnd.android.package-archive')
         asset = json.loads(uresp.read().decode())
         print('Uploaded asset:', asset['browser_download_url'])
 "
+if ($LASTEXITCODE -ne 0) { throw "GitHub Release upload failed" }
 
 Write-Host "`nPublished OTA update v$VersionName! Installed apps will auto-detect and prompt to install."

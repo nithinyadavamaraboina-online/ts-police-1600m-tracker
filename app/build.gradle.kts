@@ -21,8 +21,8 @@ android {
         applicationId = "com.tspolice.runtracker"
         minSdk = 26
         targetSdk = 34
-        versionCode = 29
-        versionName = "1.0.28"
+        versionCode = 30
+        versionName = "1.0.29"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -48,8 +48,12 @@ android {
         release {
             isMinifyEnabled = false
             val otaConfig = signingConfigs.getByName("otaRelease")
+            val requireReleaseSigning = System.getenv("CI") == "true" ||
+                project.findProperty("requireReleaseKeystore") == "true"
             signingConfig = if (otaConfig.storeFile != null && otaConfig.storeFile!!.exists()) {
                 otaConfig
+            } else if (requireReleaseSigning) {
+                throw GradleException("Release keystore missing! Configure keystore.properties or OTA_KEYSTORE_PATH.")
             } else {
                 signingConfigs.getByName("debug")
             }
@@ -84,4 +88,5 @@ dependencies {
     implementation("com.google.android.material:material:1.11.0")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

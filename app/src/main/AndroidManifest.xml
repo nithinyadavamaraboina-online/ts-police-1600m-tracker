@@ -17,6 +17,7 @@
 
     <!-- Pocket-safe foreground tracking & screen-off audio on Android 14+ (SDK 34) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_HEALTH" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -30,7 +31,6 @@
     <uses-permission android:name="android.permission.health.READ_EXERCISE" />
     <uses-permission android:name="android.permission.health.READ_SPEED" />
     <uses-permission android:name="android.permission.health.READ_STEPS_CADENCE" />
-    <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND" />
 
     <!-- Package visibility for Samsung Health & Android Health Connect -->
     <queries>
@@ -53,6 +53,8 @@
 
     <application
         android:allowBackup="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="TS Police 1.6K"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -90,7 +92,7 @@
             android:name=".service.RunTrackingService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="location|mediaPlayback" />
+            android:foregroundServiceType="health|location|mediaPlayback" />
 
         <service
             android:name=".update.UpdateCheckJobService"

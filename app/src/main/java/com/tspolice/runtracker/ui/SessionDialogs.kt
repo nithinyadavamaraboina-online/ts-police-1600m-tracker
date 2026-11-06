@@ -17,7 +17,6 @@ import com.tspolice.runtracker.data.RunRepository
 import com.tspolice.runtracker.domain.CoachBrainReport
 import com.tspolice.runtracker.domain.DailyActivitySummary
 import com.tspolice.runtracker.domain.ExamTimeBatch
-import com.tspolice.runtracker.domain.LegFeelCheckIn
 import com.tspolice.runtracker.domain.RunMode
 import com.tspolice.runtracker.domain.RunSessionRecord
 import com.tspolice.runtracker.domain.SamsungDailySnapshot
@@ -25,7 +24,9 @@ import com.tspolice.runtracker.domain.SamsungHealthComparator
 import com.tspolice.runtracker.domain.TsPoliceBenchmark
 import com.tspolice.runtracker.telemetry.TuningPullAndUploadResult
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.ZoneId
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -43,6 +44,7 @@ object SessionDialogs {
         targetSec: Double,
         deadlineIso: String = "2026-11-30",
         isPersonalBest: Boolean = false,
+        readinessPercent: Int? = null,
         onDeleteConfirmed: () -> Unit
     ) {
         val scroll = ScrollView(ctx)
@@ -58,7 +60,7 @@ object SessionDialogs {
             gravity = Gravity.CENTER_VERTICAL
         }
         headerRow.addView(TextView(ctx).apply {
-            text = "${session.mode.title.uppercase()}  •  ${session.dateIso}"
+            text = "${session.mode.title.uppercase(Locale.US)}  •  ${session.dateIso}"
             textSize = 11f
             typeface = AthleticTheme.FONT_SANS_BOLD
             setTextColor(AthleticColors.CYAN_BRIGHT)
@@ -69,9 +71,10 @@ object SessionDialogs {
 
         // Big 1.6K Time + Merit Pill
         root.addView(TextView(ctx).apply {
-            val isExact = abs(session.distanceMeters - 1600.0) <= 50.0
+            val isExact = session.isOfficial1600mTrial()
             val suffix = if (isExact) "Official 1.6K" else "1.6K Equiv"
-            text = "${TsPoliceBenchmark.formatDuration(session.equiv1600mSec)}  ($suffix)"
+            val dispTime = TsPoliceBenchmark.formatDurationAgainstCutoff(session.equiv1600mSec, targetSec)
+            text = "$dispTime  ($suffix)"
             textSize = 26f
             typeface = AthleticTheme.FONT_TABULAR_BOLD
             setTextColor(if (merit.qualified) AthleticColors.EMERALD_BRIGHT else AthleticColors.TEXT_PRIMARY)
@@ -106,11 +109,17 @@ object SessionDialogs {
         }
         val avgSpd = if (session.activeDurationSec > 1.0) session.distanceMeters / session.activeDurationSec else 0.0
         val statLines = buildList {
-            add("Distance" to String.format("%.2f km (%d m)", session.distanceMeters / 1000.0, session.distanceMeters.toInt()))
+            add("Distance" to String.format(Locale.US, "%.2f km (%d m)", session.distanceMeters / 1000.0, session.distanceMeters.toInt()))
             add("Elapsed Clock" to TsPoliceBenchmark.formatDuration(session.activeDurationSec))
             add("Average Pace" to TsPoliceBenchmark.formatPacePerKm(avgSpd))
-            add("Peak Speed" to String.format("%.1f km/h (%s)", session.maxSpeedMps * 3.6, TsPoliceBenchmark.formatPacePerKm(session.maxSpeedMps)))
-            add("Avg Cadence" to "${session.avgCadenceSpm.toInt()} spm")
+            add("Peak Speed" to String.format(Locale.US, "%.1f km/h (%s)", session.maxSpeedMps * 3.6, TsPoliceBenchmark.formatPacePerKm(session.maxSpeedMps)))
+            add(
+                "Avg Cadence" to if (session.avgCadenceSpm > 1.0) {
+                    "${session.avgCadenceSpm.roundToInt()} spm"
+                } else {
+                    "— (Stopwatch)"
+                }
+            )
             if (session.pausedDurationSec >= 1.0) {
                 val label = if (session.mode == RunMode.INTERVAL_400M) "Total Recovery Rest" else "Stopped / Standing Time"
                 add(label to TsPoliceBenchmark.formatDuration(session.pausedDurationSec))
@@ -200,7 +209,8 @@ object SessionDialogs {
                     session = session,
                     targetSec = targetSec,
                     deadlineIso = deadlineIso,
-                    isPersonalBest = isPersonalBest
+                    isPersonalBest = isPersonalBest,
+                    readinessPercent = readinessPercent
                 )
             }
             .setNeutralButton("Delete Run") { _, _ ->
@@ -218,7 +228,7 @@ object SessionDialogs {
         AlertDialog.Builder(ctx)
             .setTitle("Delete Run Session?")
             .setMessage(
-                "Remove ${session.dateIso} (${String.format("%.2f km", session.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(session.activeDurationSec)}) from your training log?"
+                "Remove ${session.dateIso} (${String.format(Locale.US, "%.2f km", session.distanceMeters / 1000.0)} in ${TsPoliceBenchmark.formatDuration(session.activeDurationSec)}) from your training log?"
             )
             .setPositiveButton("Delete") { _, _ -> onDeleteConfirmed() }
             .setNegativeButton("Keep Run", null)
@@ -230,6 +240,7 @@ object SessionDialogs {
         repository: RunRepository,
         onSaved: () -> Unit
     ) {
+        val scroll = ScrollView(ctx)
         val form = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(ctx, 20f), dp(ctx, 14f), dp(ctx, 20f), dp(ctx, 6f))
@@ -254,6 +265,61 @@ object SessionDialogs {
             setText("35")
         }
 
+        // Time-of-day slot selector so Coach Brain attributes manual track stopwatch runs accurately
+        val timeSlots = listOf(
+            Triple("6:30 AM", 6, 30),
+            Triple("8:30 AM", 8, 30),
+            Triple("5:15 PM", 17, 15),
+            Triple("6:15 PM", 18, 15),
+            Triple("7:15 PM", 19, 15)
+        )
+        val nowHour = LocalTime.now().hour
+        var selectedSlotIdx = when {
+            nowHour < 8 -> 0
+            nowHour in 8..14 -> 1
+            nowHour in 15..17 -> 2
+            nowHour == 18 -> 3
+            else -> 4
+        }
+        val slotBtns = mutableListOf<TextView>()
+        val slotRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(ctx, 4f), 0, dp(ctx, 4f))
+        }
+        fun refreshSlotSelection() {
+            slotBtns.forEachIndexed { idx, tv ->
+                val sel = idx == selectedSlotIdx
+                tv.background = AthleticTheme.solidPill(
+                    ctx,
+                    if (sel) AthleticColors.CYAN_BRIGHT else AthleticColors.SURFACE_RECESSED,
+                    if (sel) AthleticColors.CYAN_BRIGHT else AthleticColors.BORDER_SUBTLE,
+                    8f
+                )
+                tv.setTextColor(if (sel) AthleticColors.TEXT_ON_DARK_ACCENT else AthleticColors.TEXT_PRIMARY)
+            }
+        }
+        timeSlots.forEachIndexed { idx, (label, _, _) ->
+            val pill = TextView(ctx).apply {
+                text = label
+                gravity = Gravity.CENTER
+                textSize = 10.5f
+                typeface = AthleticTheme.FONT_SANS_BOLD
+                setPadding(dp(ctx, 4f), dp(ctx, 7f), dp(ctx, 4f), dp(ctx, 7f))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (idx > 0) marginStart = dp(ctx, 4f)
+                }
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    selectedSlotIdx = idx
+                    refreshSlotSelection()
+                }
+            }
+            slotBtns.add(pill)
+            slotRow.addView(pill)
+        }
+        refreshSlotSelection()
+
         fun lbl(t: String) = TextView(ctx).apply {
             text = t
             textSize = 12f
@@ -262,16 +328,19 @@ object SessionDialogs {
         }
         form.addView(lbl("Run Date (YYYY-MM-DD)"))
         form.addView(dateInput)
+        form.addView(lbl("Run Time Window (for Coach Brain Timing Analysis)"))
+        form.addView(slotRow)
         form.addView(lbl("Distance (meters)"))
         form.addView(distInput)
         form.addView(lbl("Minutes"))
         form.addView(minInput)
         form.addView(lbl("Seconds"))
         form.addView(secInput)
+        scroll.addView(form)
 
         AlertDialog.Builder(ctx)
             .setTitle("Log Track Stopwatch Run")
-            .setView(form)
+            .setView(scroll)
             .setPositiveButton("Save Run") { _, _ ->
                 val dateIso = runCatching { LocalDate.parse(dateInput.text.toString().trim()).toString() }
                     .getOrDefault(LocalDate.now().toString())
@@ -280,12 +349,13 @@ object SessionDialogs {
                 val secs = secInput.text.toString().toDoubleOrNull() ?: 0.0
                 val totalSec = mins * 60.0 + secs
                 if (distM >= 200.0 && totalSec >= 30.0) {
+                    val chosenSlot = timeSlots[selectedSlotIdx]
                     val epochMs = LocalDate.parse(dateIso)
-                        .atTime(6, 30)
+                        .atTime(chosenSlot.second, chosenSlot.third)
                         .atZone(ZoneId.systemDefault())
                         .toInstant()
                         .toEpochMilli()
-                    val is1600 = abs(distM - 1600.0) <= 25.0
+                    val is1600 = abs(distM - TsPoliceBenchmark.TARGET_DISTANCE_M) <= TsPoliceBenchmark.OFFICIAL_1600M_TOLERANCE_M
                     repository.insertSession(
                         RunSessionRecord(
                             startedAtEpochMs = epochMs,
@@ -300,12 +370,12 @@ object SessionDialogs {
                                 totalSec,
                                 if (is1600) totalSec else null
                             ),
-                            avgCadenceSpm = 168.0,
+                            avgCadenceSpm = 0.0,
                             maxSpeedMps = distM / totalSec,
                             runningSec = totalSec,
                             joggingSec = 0.0,
                             walkingSec = 0.0,
-                            notes = "Manual track stopwatch",
+                            notes = "Manual track stopwatch (${chosenSlot.first})",
                             isDemo = false
                         )
                     )
@@ -325,7 +395,7 @@ object SessionDialogs {
     ) {
         AlertDialog.Builder(ctx)
             .setTitle("Backup & Restore Training Log")
-            .setMessage("Export your 1.6 km runs & daily stats to WhatsApp/Drive/Clipboard, or paste a backup JSON to restore on a new phone.")
+            .setMessage("Export your complete training backup (1.6 km runs, all-day steps/distance, hourly history, Samsung calibration & Coach profile) to WhatsApp/Drive/Clipboard, or paste a backup JSON to restore on a new phone.")
             .setPositiveButton("Export / Share Backup") { _, _ ->
                 val json = repository.exportBackupJson()
                 runCatching {
@@ -350,13 +420,17 @@ object SessionDialogs {
                     addView(input)
                 }
                 AlertDialog.Builder(ctx)
-                    .setTitle("Restore Runs from Backup JSON")
+                    .setTitle("Restore Runs & History from Backup JSON")
                     .setView(wrap)
                     .setPositiveButton("Restore") { _, _ ->
                         val raw = input.text.toString().trim()
                         val count = runCatching { repository.importBackupJson(raw) }.getOrDefault(-1)
                         if (count >= 0) {
-                            Toast.makeText(ctx, "Restored $count run session(s)!", Toast.LENGTH_LONG).show()
+                            Toast.makeText(
+                                ctx,
+                                "Restored backup ($count run session(s) + daily history & profile)!",
+                                Toast.LENGTH_LONG
+                            ).show()
                             onRestored()
                         } else {
                             Toast.makeText(ctx, "Invalid backup JSON format.", Toast.LENGTH_SHORT).show()
@@ -397,7 +471,7 @@ object SessionDialogs {
             setPadding(0, dp(ctx, 5f), 0, dp(ctx, 2f))
         })
         root.addView(TextView(ctx).apply {
-            text = String.format("Calibrated Personal Stride Scale: %.2fx", strideScale)
+            text = String.format(Locale.US, "Calibrated Personal Stride Scale: %.2fx", strideScale)
             textSize = 12f
             setTextColor(AthleticColors.EMERALD_BRIGHT)
             setPadding(0, 0, 0, dp(ctx, 10f))
@@ -430,7 +504,7 @@ object SessionDialogs {
             if (sam == null) {
                 box.addView(topRow)
                 box.addView(TextView(ctx).apply {
-                    text = "Tracker: ${trk.totalSteps} steps • ${String.format("%.2f km", trk.totalDistanceMeters / 1000.0)}\nSamsung Health: Not synced yet for this date."
+                    text = "Tracker: ${trk.totalSteps} steps • ${String.format(Locale.US, "%.2f km", trk.totalDistanceMeters / 1000.0)}\nSamsung Health: Not synced yet for this date."
                     textSize = 12f
                     setTextColor(AthleticColors.TEXT_SECONDARY)
                 })
@@ -438,8 +512,8 @@ object SessionDialogs {
                 return
             }
 
-            val rep = SamsungHealthComparator.compare(trk, sam, strideScale, title.lowercase())
-            val pctText = rep.overallMatchPercent?.let { String.format("%.1f%% MATCH", it) } ?: "SYNCED"
+            val rep = SamsungHealthComparator.compare(trk, sam, strideScale, title.lowercase(Locale.US))
+            val pctText = rep.overallMatchPercent?.let { String.format(Locale.US, "%.1f%% MATCH", it) } ?: "SYNCED"
             val high = (rep.overallMatchPercent ?: 100.0) >= 88.0
             topRow.addView(TextView(ctx).apply {
                 text = pctText
@@ -487,7 +561,7 @@ object SessionDialogs {
                 box.addView(r)
             }
 
-            fun fmtDist(m: Double) = if (m >= 1000.0) String.format("%.2f km", m / 1000.0) else "${m.toInt()} m"
+            fun fmtDist(m: Double) = if (m >= 1000.0) String.format(Locale.US, "%.2f km", m / 1000.0) else "${m.toInt()} m"
             val stSign = if (rep.stepsDelta >= 0) "+${rep.stepsDelta}" else "${rep.stepsDelta}"
             val dm = rep.distanceDeltaMeters.roundToInt()
             val dmSign = if (dm >= 0) "+${dm}m" else "${dm}m"
@@ -500,9 +574,9 @@ object SessionDialogs {
             addLine("Max Cad.", "${trk.maxCadenceSpm.roundToInt()} spm", "${sam.maxCadenceSpm.roundToInt()} spm", "")
             addLine(
                 "Stride",
-                rep.trackerStrideM?.let { String.format("%.2fm", it) } ?: "--",
-                rep.samsungStrideM?.let { String.format("%.2fm", it) } ?: "--",
-                String.format("%.2fx", strideScale)
+                rep.trackerStrideM?.let { String.format(Locale.US, "%.2fm", it) } ?: "--",
+                rep.samsungStrideM?.let { String.format(Locale.US, "%.2fm", it) } ?: "--",
+                String.format(Locale.US, "%.2fx", strideScale)
             )
             root.addView(box)
         }
@@ -545,8 +619,8 @@ object SessionDialogs {
     }
 
     /**
-     * Displays the result of pulling & uploading the 7-day + 48h intraday fine-tuning telemetry bundle,
-     * with 1-tap Sync Code copy and raw JSON share fallback.
+     * Displays the result of pulling & exporting/uploading the 7-day + 48h intraday fine-tuning telemetry bundle,
+     * with 1-tap Sync Code / JSON copy and raw JSON share.
      */
     fun showTuningUploadResultDialog(
         ctx: Context,
@@ -559,11 +633,11 @@ object SessionDialogs {
             setPadding(dp(ctx, 20f), dp(ctx, 18f), dp(ctx, 20f), dp(ctx, 12f))
         }
 
-        val accentCol = if (result.uploadedToCloud) AthleticColors.EMERALD_BRIGHT else AthleticColors.AMBER_BRIGHT
+        val accentCol = if (result.uploadedToCloud) AthleticColors.EMERALD_BRIGHT else AthleticColors.CYAN_BRIGHT
         root.addView(
             AthleticTheme.sectionLabel(
                 ctx,
-                if (result.uploadedToCloud) "FINE-TUNING BUNDLE UPLOADED ✓" else "FINE-TUNING BUNDLE SAVED LOCALLY",
+                if (result.uploadedToCloud) "FINE-TUNING BUNDLE UPLOADED ✓" else "DIAGNOSTICS BUNDLE SAVED ON DEVICE",
                 accentCol
             )
         )
@@ -577,10 +651,13 @@ object SessionDialogs {
         })
 
         root.addView(TextView(ctx).apply {
-            text = if (result.uploadedToCloud) {
-                "Sync Code: ${result.syncCode}\nReply 'uploaded' (or paste this code) so we can pull your 7-day Samsung + 48h hourly sensor logs and fine-tune thresholds."
-            } else {
-                "No internet connection reached cloud relay — saved locally to:\n${result.localFilePath}\nTap 'Share JSON' below or retry on Wi-Fi/Mobile Data."
+            text = when {
+                result.uploadedToCloud ->
+                    "Sync Code: ${result.syncCode}\nCloud diagnostics sync is enabled — copy or share this code to inspect your 7-day Samsung + 48h sensor bundle."
+                result.headline.contains("Cloud Upload Off") ->
+                    "Cloud upload is OFF by default for privacy — saved locally on your phone:\n${result.localFilePath}\nTap 'Share JSON' or 'Copy JSON' below to export manually, or enable 'Developer Remote Diagnostics' in Coach & Lab."
+                else ->
+                    "No internet connection reached cloud relay — saved locally to:\n${result.localFilePath}\nTap 'Share JSON' below or retry on Wi-Fi/Mobile Data."
             }
             textSize = 12f
             typeface = AthleticTheme.FONT_SANS_MEDIUM
@@ -588,8 +665,8 @@ object SessionDialogs {
             setPadding(dp(ctx, 11f), dp(ctx, 8f), dp(ctx, 11f), dp(ctx, 8f))
             background = AthleticTheme.solidPill(
                 ctx,
-                if (result.uploadedToCloud) 0x22C6F432 else 0x22FF9F1C,
-                if (result.uploadedToCloud) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.HERO_AMBER_BORDER,
+                if (result.uploadedToCloud) 0x22C6F432 else 0x229D6BFF,
+                if (result.uploadedToCloud) AthleticColors.HERO_EMERALD_BORDER else AthleticColors.HERO_CYAN_BORDER,
                 10f
             )
         })
@@ -625,7 +702,7 @@ object SessionDialogs {
                 val toastMsg = if (result.uploadedToCloud) {
                     "Copied Sync Code: ${result.syncCode}"
                 } else {
-                    "Copied Fine-Tuning JSON to clipboard"
+                    "Copied Diagnostics JSON to clipboard"
                 }
                 Toast.makeText(ctx, toastMsg, Toast.LENGTH_LONG).show()
             }

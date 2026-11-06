@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <include domain="database" path="ts_police_1600m.db" />
+    <include domain="sharedpref" path="ts_police_prefs.xml" />
+</full-backup-content>

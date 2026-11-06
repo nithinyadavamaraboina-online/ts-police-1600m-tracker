@@ -454,17 +454,23 @@ class GaitClassifier(
                 dynamicAccelRms in 0.70..5.8 &&
                 (!hasGps || gps in 0.45..2.12) &&
                 noEngineDominance
+            val hasJogAerialOrBounce = (minRawNorm != null && minRawNorm <= 6.8) ||
+                (dynamicAccelRms >= 2.65 && (peakToTroughNorm == null || peakToTroughNorm >= 5.0))
             val plausibleDismountJog = raw.isJogOrRun() &&
-                cadenceSpm in 135.0..195.0 &&
-                dynamicAccelRms >= 2.8 &&
-                (!hasGps || gps in 0.50..4.50) &&
-                (minRawNorm != null && minRawNorm <= 6.8) &&
+                cadenceSpm in 134.0..208.0 &&
+                dynamicAccelRms >= 2.65 &&
+                (!hasGps || gps in 0.50..5.20) &&
+                hasJogAerialOrBounce &&
                 noEngineDominance
 
             if (plausibleDismountWalk || plausibleDismountJog) {
                 dismountFootConfirmMs += dtMs
                 if (dismountFootConfirmMs >= DISMOUNT_FOOT_CONFIRM_MS) {
-                    val unlockedState = if (plausibleDismountJog) MotionState.JOGGING else MotionState.WALKING
+                    val unlockedState = if (plausibleDismountJog) {
+                        if (raw == MotionState.RUNNING || raw == MotionState.TARGET_PACE) raw else MotionState.JOGGING
+                    } else {
+                        MotionState.WALKING
+                    }
                     vehicleLatchActive = false
                     vehicleCooldownActive = false
                     parkedStopCompleted = false
@@ -752,7 +758,7 @@ class MotionSignalProcessor {
 
         val gaitDelta = gaitNorm2 - baselineNorm
         val mag = if (includesGravity) abs(gaitDelta) else gaitNorm2.coerceAtLeast(0.0)
-        val hfResidual = if (includesGravity) abs(rawNorm - gaitNorm2) else 0.0
+        val hfResidual = abs(rawNorm - gaitNorm2)
 
         accelSamples.addLast(
             AccelFrame(
